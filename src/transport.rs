@@ -40,10 +40,10 @@ const MAX_PACKET_SIZE: usize = 1452;
 
 /// Packet ready for UDP transmission with metadata for error reporting and redundancy.
 #[derive(Debug, Clone)]
-struct SendablePacket {
-    id: PacketId,
-    data: Vec<u8>,
-    duplicate_count: usize,
+pub struct SendablePacket {
+    pub id: PacketId,
+    pub data: Vec<u8>,
+    pub duplicate_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -181,7 +181,7 @@ pub async fn init(
 ///
 /// This function is designed to be forcefully aborted by the supervisor on shutdown,
 /// as it has no mechanism for graceful termination.
-pub async fn recv(
+async fn recv(
     port: u16,
     sender: Sender<Result<ReceivedPacket, TransportError>>,
 ) -> Result<(), TransportError> {
@@ -233,7 +233,7 @@ pub async fn recv(
 /// * `Ok(())` - Packet successfully queued
 /// * `Err(ChannelClosed)` - Channel was already closed (checked before send)
 /// * `Err(ChannelFailed)` - Send operation failed
-pub async fn send_to_processing_layer(
+async fn send_to_processing_layer(
     sender: Sender<Result<ReceivedPacket, TransportError>>,
     res: ReceivedPacket,
 ) -> Result<(), InternalError> {
@@ -337,7 +337,7 @@ async fn initialize_send(
 /// * `Ok(())` - All packets sent successfully
 /// * `Err(FailedToBind)` - Could not create outbound socket
 /// * `Err(CouldNotSend)` - Some packets failed; contains their IDs
-pub async fn send(buffer: Vec<ProcessedPacket>) -> Result<(), TransportError> {
+async fn send(buffer: Vec<ProcessedPacket>) -> Result<(), TransportError> {
     let mut sessions: HashMap<u128, Vec<SendablePacket>> = HashMap::new();
     for packet in buffer {
         let tok = packet.packet_id.session_token;
