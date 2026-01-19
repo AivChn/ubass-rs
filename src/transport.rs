@@ -81,37 +81,54 @@ pub async fn init(
     let mut send_handle = tokio::spawn(initialize_send(receiver));
 
     loop {
-        if recv_handle.is_finished() {
-            if let Ok(res) = recv_handle.await {
-                match res {
-                    Ok(_) => {
-                        _ = send_handle.await;
-                        return Ok(());
-                    }
-                    Err(err) => sender.send(Err(err)),
-                };
-            };
-            recv_handle = tokio::spawn(recv(port, sender.clone()));
-        }
-        if send_handle.is_finished() {
-            if let Ok(res) = send_handle.await {
-                match res {
-                    Ok(_) => {
-                        recv_handle.abort();
-                        return Ok(());
-                    }
-                    Err((err, returned_receiver)) => {
-                        if err != TransportError::FaildToBind {
-                            sender.send(Err(err));
+        let res = tokio::select! {
+            res = &mut recv_handle, if recv_handle.is_finished() => {
+                if let Ok(result) = recv_handle.await {
+                    match result {
+                        Ok(_) => {
+                            send_handle.await;
+                            return Ok(());
+                        },
+                        Err(err) => match err {
+                            TransportError::
                         }
-                        receiver = returned_receiver;
                     }
                 }
-                send_handle = tokio::spawn(initialize_send(receiver));
-            } else {
-                return Err(TransportError::Internal(InternalError::TaskFailed));
-            }
+            },
+        _ = &mut send_handle => {}
         }
+
+        //if recv_handle.is_finished() {
+        //    if let Ok(res) = recv_handle.await {
+        //        match res {
+        //            Ok(_) => {
+        //                _ = send_handle.await;
+        //                return Ok(());
+        //            }
+        //            Err(err) => sender.send(Err(err)),
+        //        };
+        //    };
+        //    recv_handle = tokio::spawn(recv(port, sender.clone()));
+        //}
+        //if send_handle.is_finished() {
+        //    if let Ok(res) = send_handle.await {
+        //        match res {
+        //            Ok(_) => {
+        //                recv_handle.abort();
+        //                return Ok(());
+        //            }
+        //            Err((err, returned_receiver)) => {
+        //                if err != TransportError::FaildToBind {
+        //                    sender.send(Err(err));
+        //                }
+        //                receiver = returned_receiver;
+        //            }
+        //        }
+        //        send_handle = tokio::spawn(initialize_send(receiver));
+        //    } else {
+        //        return Err(TransportError::Internal(InternalError::TaskFailed));
+        //    }
+        //}
     }
 
     Ok(())

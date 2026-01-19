@@ -1,12 +1,10 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use ubass_rs::packet_processor::{PacketId, ProcessedPacket};
 use ubass_rs::packetizer::PacketType;
+use ubass_rs::packet_processor::TransportSendMessage;
 use ubass_rs::transport::{
-    SendablePacket, TransportError, get_addr, get_session_token, recv, send,
-    send_to_processing_layer,
+    SendablePacket, get_addr, get_session_token, init, recv, send, send_to_processing_layer,
 };
-
-/// There are a few useless tests to be removed.
 
 #[test]
 fn sendable_packet_from_processed_packet() {
@@ -26,41 +24,6 @@ fn sendable_packet_from_processed_packet() {
     assert_eq!(sendable.id.session_token, 123456);
     assert_eq!(sendable.data, vec![1, 2, 3, 4, 5]);
     assert_eq!(sendable.duplicate_count, 3);
-}
-
-/// Remove - no shit? its a static definition, this is basically just saying what the compiler
-/// already confirmed.
-#[test]
-fn transport_error_equality_could_not_send() {
-    let err1 = TransportError::CouldNotSend(vec![PacketId {
-        timestamp: 1,
-        session_token: 100,
-    }]);
-    let err2 = TransportError::CouldNotSend(vec![PacketId {
-        timestamp: 2,
-        session_token: 200,
-    }]);
-
-    // CouldNotSend variants are equal regardless of contents
-    assert_eq!(err1, err2);
-}
-
-/// do i even need to explain? yes, 1+1 does indeed equal to 2.
-#[test]
-fn transport_error_equality_faild_to_bind() {
-    let err1 = TransportError::FaildToBind;
-    let err2 = TransportError::FaildToBind;
-
-    assert_eq!(err1, err2);
-}
-
-/// same here. the definition is static in code and is not affected by the runtime.
-#[test]
-fn transport_error_inequality_different_variants() {
-    let err1 = TransportError::FaildToBind;
-    let err2 = TransportError::CouldNotSend(vec![]);
-
-    assert_ne!(err1, err2);
 }
 
 /// testing blackbox functions. these will be replaced anyways
@@ -244,93 +207,101 @@ async fn send_transmits_packets_over_udp() {
     }
 }
 
-// Integration test: both send and recv work together in the same test
-// - recv listens on one port, forwards incoming packets to channel
-// - send transmits packets out to a different port (to avoid conflict with other tests)
-// - verifies both directions work independently
-//
-// == Editors Note ==
-// I have a few issues with this test. First, it doesnt utilize the API that is given to it. the
-// original code had only one public function - init. init receives all the information needed to
-// get the transport going, and provides the send/recv functions with their channels. An end to end
-// test of the transport should simulate the processor layer by calling the init function and
-// communicating through the opaque channels with either.
-// In addition, this test is doomed to fail since there is a 2 second timout set for *receiving a
-// UDP packet*. it will surely get dropped by then, since UDP does not care about reliability. My
-// suggestion would be to run everything through init() as intended and run a client on a seperate
-// thread to simulate real world conditions.
+// Integration test using init() API as intended.
+// Simulates the processor layer by communicating through opaque channels.
+// Uses a separate thread for the simulated client to avoid async runtime issues.
 #[tokio::test]
 async fn send_and_recv_full_integration() {
-    use std::process::Command;
-    use tokio::net::UdpSocket;
+    use std::net::UdpSocket as StdUdpSocket;
+    use std::time::Duration as StdDuration;
     use tokio::time::{Duration, timeout};
 
-    let recv_port: u16 = 29879;
-    let send_dest_port: u16 = 6970; // Different from send_transmits_packets_over_udp test
-    let session_token = (send_dest_port as u128) * 12 * 100_000_012;
+    let transport_port: u16 = 29880;
+    let client_port: u16 = 29881;
+    let session_token = get_session_token(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)),
+        client_port,
+    ));
 
-    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    // Create channels for communication with transport layer
+    // to_transport: processor -> transport (send commands)
+    // from_transport: transport -> processor (received packets)
+    let (to_transport_tx, to_transport_rx) = tokio::sync::mpsc::channel(10);
+    let (from_transport_tx, mut from_transport_rx) = tokio::sync::mpsc::channel(10);
 
-    // Start recv task
-    let recv_handle = tokio::spawn(async move { recv(recv_port, tx).await });
-
-    // Start listener for outgoing packets
-    let outgoing_listener = UdpSocket::bind(format!("127.0.0.1:{}", send_dest_port))
-        .await
-        .unwrap();
-
-    // Give sockets time to bind
-    tokio::time::sleep(Duration::from_millis(150)).await;
-
-    // === Test recv path: send packet via netcat, verify it arrives on channel ===
-    let recv_test_msg = "incoming_packet";
-    let port_clone = recv_port;
-    let msg_clone = recv_test_msg.to_string();
-    std::thread::spawn(move || {
-        let _ = Command::new("netcat")
-            .args(["127.0.0.1", &port_clone.to_string(), &msg_clone, "udp"])
-            .output();
+    // Start transport layer via init()
+    let init_handle = tokio::spawn(async move {
+        init(transport_port, to_transport_rx, from_transport_tx).await
     });
 
-    let incoming = timeout(Duration::from_secs(2), rx.recv()).await;
+    // Give transport time to bind sockets
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // === Test recv path ===
+    // Spawn a client thread that sends UDP packets to the transport layer
+    let test_message = b"hello_from_client";
+    let client_handle = std::thread::spawn(move || {
+        let client_socket = StdUdpSocket::bind(format!("127.0.0.1:{}", client_port))
+            .expect("Failed to bind client socket");
+        client_socket
+            .set_read_timeout(Some(StdDuration::from_secs(5)))
+            .unwrap();
+
+        // Send packet to transport layer
+        client_socket
+            .send_to(test_message, format!("127.0.0.1:{}", transport_port))
+            .expect("Failed to send to transport");
+
+        // Wait for response from transport layer
+        let mut buf = vec![0u8; 1024];
+        match client_socket.recv_from(&mut buf) {
+            Ok((len, _addr)) => Some(buf[..len].to_vec()),
+            Err(_) => None,
+        }
+    });
+
+    // Verify packet arrived on the from_transport channel
+    let incoming = timeout(Duration::from_secs(2), from_transport_rx.recv()).await;
     match incoming {
         Ok(Some(Ok(packet))) => {
-            assert_eq!(
-                packet.data,
-                recv_test_msg.as_bytes(),
-                "recv path: data mismatch"
-            );
+            assert_eq!(packet.data, test_message, "recv path: data mismatch");
         }
-        _ => panic!("recv path: failed to receive incoming packet"),
+        Ok(Some(Err(e))) => panic!("recv path: received error: {:?}", e),
+        Ok(None) => panic!("recv path: channel closed unexpectedly"),
+        Err(_) => panic!("recv path: timeout waiting for packet"),
     }
 
-    // === Test send path: call send(), verify packet arrives at listener ===
-    let outgoing_packets = vec![ProcessedPacket {
+    // === Test send path ===
+    // Send a packet through the transport layer to the client
+    let outgoing_packet = ProcessedPacket {
         packet_id: PacketId {
             timestamp: 200,
             session_token,
         },
         packet_type: PacketType::Data,
-        data: b"outgoing_packet".to_vec(),
-        duplicate_count: 0,
-    }];
+        data: b"hello_from_transport".to_vec(),
+        duplicate_count: 1,
+    };
 
-    let send_result = send(outgoing_packets).await;
-    assert!(send_result.is_ok(), "send path: send() failed");
+    to_transport_tx
+        .send(TransportSendMessage::Data(vec![outgoing_packet]))
+        .await
+        .expect("Failed to send to transport");
 
-    let mut buf = vec![0u8; 1024];
-    let outgoing = timeout(
-        Duration::from_secs(2),
-        outgoing_listener.recv_from(&mut buf),
-    )
-    .await;
-    match outgoing {
-        Ok(Ok((len, _addr))) => {
-            assert_eq!(&buf[..len], b"outgoing_packet", "send path: data mismatch");
-        }
-        _ => panic!("send path: failed to receive outgoing packet"),
-    }
+    // Verify client received the packet
+    let client_received = client_handle.join().expect("Client thread panicked");
+    assert_eq!(
+        client_received,
+        Some(b"hello_from_transport".to_vec()),
+        "send path: client did not receive expected data"
+    );
 
-    // Cleanup
-    recv_handle.abort();
+    // Clean shutdown via Close message
+    to_transport_tx
+        .send(TransportSendMessage::Close)
+        .await
+        .expect("Failed to send Close");
+
+    // Wait for init to complete
+    let _ = timeout(Duration::from_secs(1), init_handle).await;
 }
