@@ -1,35 +1,44 @@
-#![allow(warnings)]
+//! Transport Layer for UBASS (UDP Audio Streaming System)
+//!
+//! This module implements the lowest layer of the protocol stack, responsible for:
+//! - Binding and managing UDP sockets for sending and receiving packets
+//! - Multiplexing packets across multiple sessions (identified by session tokens)
+//! - Providing redundancy through configurable duplicate packet transmission
+//! - Error recovery with automatic task restart on recoverable failures
+//!
+//! # Architecture
+//!
+//! The transport layer runs two concurrent tasks supervised by [`init()`]:
+//! - **recv task**: Listens for incoming UDP packets and forwards them up to the packet processor
+//! - **send task**: Receives outbound packets from the packet processor and transmits them via UDP
+//!
+//! Communication with the packet processor layer occurs through two MPSC channels:
+//! - `Receiver<TransportSendMessage>`: Commands and packets to send (from processor)
+//! - `Sender<Result<SendablePacket, TransportError>>`: Received packets and errors (to processor)
+//!
+//! # Error Handling
+//!
+//! Errors are categorized as:
+//! - **Recoverable** (`FailedToBind`, `CouldNotSend`): Task is restarted automatically
+//! - **Unrecoverable** (`Internal`): Supervisor shuts down both tasks and propagates error
+
+//#![allow(warnings)]
 
 use crate::{
     InternalError,
     packet_processor::{PacketId, ProcessedPacket, TransportSendMessage},
 };
-use futures::{FutureExt, future};
-use std::{
-    collections::HashMap,
-    fmt::format,
-    net::SocketAddr,
-    ops::Index,
-    sync::Arc,
-    time::{Duration, Instant},
-    vec,
-};
+use std::{collections::HashMap, net::SocketAddr, vec};
 use tokio::{
     net::UdpSocket,
-    runtime::Handle,
-    sync::{
-        Mutex,
-        mpsc::{Receiver, Sender},
-    },
-    task::JoinError,
+    sync::mpsc::{Receiver, Sender},
+    time::{Duration, Instant, timeout},
 };
 
-/// defines the max size a packet can be total
+/// Maximum UDP packet size in bytes (1452).
 const MAX_PACKET_SIZE: usize = 1452;
 
-/// a struct representing a packet that has only information needed for it to be sent directly to
-/// the udp socket, with id to be able to report back failures, and duplicate count to send
-/// multiple times in case of a control packet needing of redundancy
+/// Packet ready for UDP transmission with metadata for error reporting and redundancy.
 #[derive(Debug, Clone)]
 pub struct SendablePacket {
     pub id: PacketId,
@@ -38,7 +47,6 @@ pub struct SendablePacket {
 }
 
 impl From<ProcessedPacket> for SendablePacket {
-    /// simply copy the or move the needed values and discard those that are not relavent.
     fn from(value: ProcessedPacket) -> Self {
         Self {
             id: value.packet_id,
@@ -48,111 +56,145 @@ impl From<ProcessedPacket> for SendablePacket {
     }
 }
 
-// Enum of errors that can occure relating to transport. includes internal for ergonomics.
+/// Errors that can occur in the transport layer.
+///
+/// These errors are used both internally for task supervision and externally
+/// to communicate failures to the packet processor layer.
 #[derive(Debug, Clone)]
 pub enum TransportError {
+    /// One or more packets failed to send. Contains the IDs of failed packets
+    /// so they can be retried or reported by upper layers.
     CouldNotSend(Vec<PacketId>),
-    FaildToBind,
+    /// Failed to bind a UDP socket to the requested address/port.
+    FailedToBind,
+    RecvFailedTooManyTimes,
+    /// Internal protocol error (task failure, channel issues).
+    /// Wraps [`InternalError`] for ergonomic error propagation.
     Internal(InternalError),
 }
 
-/// This might get more complex in the future. for now, checking this should be enough
 impl PartialEq for TransportError {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::CouldNotSend(_), Self::CouldNotSend(_)) => true,
-            (Self::FaildToBind, Self::FaildToBind) => true,
+            (Self::FailedToBind, Self::FailedToBind) => true,
             _ => false,
         }
     }
 }
 
-/// The initializing function for the transport layer.
-/// gets a reciver and sender for two seperate channels, one for receiving packets and commands from the packet
-/// processor, and one for sending the packet processor received packets or propegating errors up.
-/// also receives the port to bind the listening socket to.
-/// The function returns only upon cleanup or if an error occured during setup.
+/// Initializes and supervises the transport layer.
+///
+/// This is the main entry point for the transport layer. It spawns two concurrent tasks
+/// (recv and send) and supervises them in a loop, handling restarts on recoverable errors.
+///
+/// # Arguments
+///
+/// * `port` - The UDP port to bind the listening socket to
+/// * `receiver` - Channel for receiving send commands from the packet processor
+/// * `sender` - Channel for forwarding received packets to the packet processor
+///
+/// # Returns
+///
+/// * `Ok(())` - Graceful shutdown (received `Close` message)
+/// * `Err(TransportError)` - Unrecoverable error occurred
+///
+/// # Supervisor Behavior
+///
+/// The supervisor loop uses `tokio::select!` to monitor both tasks:
+/// - Guards (`!is_finished()`) prevent polling already-completed handles
+/// - On recoverable errors, the failed task is restarted
+/// - On unrecoverable errors or graceful shutdown, both tasks are cleaned up
 pub async fn init(
     port: u16,
-    mut receiver: Receiver<TransportSendMessage>,
-    mut sender: Sender<Result<SendablePacket, TransportError>>,
+    receiver: Receiver<TransportSendMessage>,
+    sender: Sender<Result<SendablePacket, TransportError>>,
 ) -> Result<(), TransportError> {
     let mut recv_handle = tokio::spawn(recv(port, sender.clone()));
     let mut send_handle = tokio::spawn(initialize_send(receiver));
 
-    loop {
-        let res = tokio::select! {
-            res = &mut recv_handle, if recv_handle.is_finished() => {
-                if let Ok(result) = recv_handle.await {
-                    match result {
-                        Ok(_) => {
-                            send_handle.await;
-                            return Ok(());
-                        },
-                        Err(err) => match err {
-                            TransportError::
-                        }
-                    }
+    'supervisor: loop {
+        _ = tokio::select! {
+            res = &mut recv_handle, if !recv_handle.is_finished() => {
+                let Ok(result) = res else {
+                    break 'supervisor Err(TransportError::Internal(InternalError::TaskFailed));
+                };
+
+                match result {
+                    Err(TransportError::RecvFailedTooManyTimes) |
+                    Err(TransportError::FailedToBind) |
+                    Err(TransportError::CouldNotSend(_)) => recv_handle = tokio::spawn(recv(port, sender.clone())),
+                    Err(TransportError::Internal(internal)) => {send_handle.abort(); break 'supervisor Err(TransportError::Internal(internal));},
+                    Ok(()) => break 'supervisor Ok(()),
                 }
             },
-        _ = &mut send_handle => {}
-        }
+            res = &mut send_handle, if !send_handle.is_finished() => {
+                let Ok(result) = res else {
+                    break 'supervisor Err(TransportError::Internal(InternalError::TaskFailed));
+                };
 
-        //if recv_handle.is_finished() {
-        //    if let Ok(res) = recv_handle.await {
-        //        match res {
-        //            Ok(_) => {
-        //                _ = send_handle.await;
-        //                return Ok(());
-        //            }
-        //            Err(err) => sender.send(Err(err)),
-        //        };
-        //    };
-        //    recv_handle = tokio::spawn(recv(port, sender.clone()));
-        //}
-        //if send_handle.is_finished() {
-        //    if let Ok(res) = send_handle.await {
-        //        match res {
-        //            Ok(_) => {
-        //                recv_handle.abort();
-        //                return Ok(());
-        //            }
-        //            Err((err, returned_receiver)) => {
-        //                if err != TransportError::FaildToBind {
-        //                    sender.send(Err(err));
-        //                }
-        //                receiver = returned_receiver;
-        //            }
-        //        }
-        //        send_handle = tokio::spawn(initialize_send(receiver));
-        //    } else {
-        //        return Err(TransportError::Internal(InternalError::TaskFailed));
-        //    }
-        //}
+                match result {
+                    Err((TransportError::FailedToBind, returned_receiver)) |
+                    Err((TransportError::RecvFailedTooManyTimes, returned_receiver))=> send_handle = tokio::spawn(initialize_send(returned_receiver)),
+                    Err((TransportError::CouldNotSend(packets), returned_receiver)) => {
+                        if sender.send(Err(TransportError::CouldNotSend(packets))).await.is_err() {
+                            break 'supervisor Err(TransportError::Internal(InternalError::ChannelClosed));
+                        }
+                        send_handle = tokio::spawn(initialize_send(returned_receiver));
+                    },
+                    Err((TransportError::Internal(internal), _)) => {recv_handle.abort(); break 'supervisor Err(TransportError::Internal(internal));},
+                    Ok(()) => { recv_handle.abort(); break 'supervisor Ok(())},
+                }
+            }
+        };
     }
-
-    Ok(())
 }
 
-/// this function is responsible for creating and maintaining the listening socket.
-/// it gets as parameters the port to bind to, and a sender of a channel.
-/// It should never realistically return Ok(()), but might return an error upon unrecoverable
-/// failure.
-/// This function will be forcefully aborted upon cleanup
+/// Listens for incoming UDP packets and forwards them to the packet processor.
+///
+/// This function runs an infinite loop, receiving packets and sending them up
+/// through the provided channel. It only exits on unrecoverable errors.
+///
+/// # Arguments
+///
+/// * `port` - The UDP port to listen on (binds to `0.0.0.0:{port}`)
+/// * `sender` - Channel to forward received packets to the packet processor
+///
+/// # Returns
+///
+/// * `Ok(())` - Never returns this in practice (loops forever)
+/// * `Err(FailedToBind)` - Could not bind to the specified port
+/// * `Err(Internal)` - Channel to packet processor closed
+///
+/// # Note
+///
+/// This function is designed to be forcefully aborted by the supervisor on shutdown,
+/// as it has no mechanism for graceful termination.
 pub async fn recv(
     port: u16,
-    mut sender: Sender<Result<SendablePacket, TransportError>>,
+    sender: Sender<Result<SendablePacket, TransportError>>,
 ) -> Result<(), TransportError> {
-    let socket = Arc::new(
-        UdpSocket::bind(format!("0.0.0.0:{port}"))
-            .await
-            .map_err(|_| TransportError::FaildToBind)?,
-    );
+    let socket = UdpSocket::bind(format!("0.0.0.0:{port}"))
+        .await
+        .map_err(|_| TransportError::FailedToBind)?;
+    let mut fail_count = 0;
 
     loop {
         let mut buffer = vec![0u8; MAX_PACKET_SIZE];
+
         let (addr, stripped_buffer) = loop {
+            match socket.recv_from(&mut buffer).await {
+                Ok((read, addr)) => break (addr, &buffer[..read]),
+                Err(_) => {
+                    if fail_count >= 25 {
+                        return Err(TransportError::RecvFailedTooManyTimes);
+                    } else {
+                        fail_count += 1;
+                    }
+                }
+            }
             if let Ok((read, addr)) = socket.recv_from(&mut buffer).await {
+                fail_count = 0;
                 break (addr, &buffer[..read]);
             }
         };
@@ -165,16 +207,28 @@ pub async fn recv(
             data: Vec::from(stripped_buffer),
             duplicate_count: 0,
         };
+
         if let Err(intern) = send_to_processing_layer(sender.clone(), packet).await {
             return Err(TransportError::Internal(intern));
         }
     }
 }
 
-/// responsible for sending to the packet processor layer asyncronously.
-/// gets as parameters a mutable reference to the sender and the packet to send up.
-/// if the channel is closed, returns error immediately without blocking.
-/// otherwise blocks until the data is sent on the channel or an error is returned.
+/// Sends a received packet to the packet processor layer via channel.
+///
+/// This is a helper function that wraps channel send operations with
+/// appropriate error handling.
+///
+/// # Arguments
+///
+/// * `sender` - The channel sender to the packet processor
+/// * `res` - The packet to send
+///
+/// # Returns
+///
+/// * `Ok(())` - Packet successfully queued
+/// * `Err(ChannelClosed)` - Channel was already closed (checked before send)
+/// * `Err(ChannelFailed)` - Send operation failed
 pub async fn send_to_processing_layer(
     sender: Sender<Result<SendablePacket, TransportError>>,
     res: SendablePacket,
@@ -192,41 +246,58 @@ pub async fn send_to_processing_layer(
     }
 }
 
-/// starts the send process, this will keep waiting until the channel raises an error or the Close
-/// message is received.
-/// it gets the receiver as an argument, and returns Ok(()) or Err((TransportError,
-/// Receiver<...>)), the receiver cannot be borrowed or clones so it is moved back to the caller to
-/// make sure the connection is not lost.
+/// Manages outbound packet transmission from the packet processor.
+///
+/// This function receives send commands via the channel, spawns send tasks,
+/// and periodically collects results. It batches operations in 25ms windows
+/// for efficiency.
+///
+/// # Arguments
+///
+/// * `receiver` - Channel for receiving [`TransportSendMessage`] commands
+///
+/// # Returns
+///
+/// * `Ok(())` - Graceful shutdown (`Close` message received)
+/// * `Err((TransportError, Receiver))` - Error occurred; receiver is returned
+///   so the supervisor can restart with the same channel (preserves connection)
+///
+/// # Batching Behavior
+///
+/// Messages are processed in 25ms batches:
+/// 1. Spawn send tasks as `Data` messages arrive
+/// 2. After 25ms, join all tasks and collect any errors
+/// 3. If errors occurred, return them (supervisor may restart)
+/// 4. Otherwise, start a new batch
 async fn initialize_send(
     mut receiver: Receiver<TransportSendMessage>,
 ) -> Result<(), (TransportError, Receiver<TransportSendMessage>)> {
-    // loop forever
     loop {
-        // buffer of tasks, processed periodically
         let mut tasks = vec![];
-        let mut now = Instant::now();
-        // exit this loop every 25 millis
+        let now = Instant::now();
+
         while now.elapsed() < Duration::from_millis(25) {
-            // block until message received
-            let Some(message) = receiver.recv().await else {
-                return Err((
-                    TransportError::Internal(InternalError::ChannelFailed),
-                    receiver,
-                ));
+            let remaining = Duration::from_millis(25) - now.elapsed();
+            let message = match timeout(remaining, receiver.recv()).await {
+                Ok(Some(msg)) => msg,
+                Err(_) => break,
+                Ok(None) => {
+                    return Err((
+                        TransportError::Internal(InternalError::ChannelFailed),
+                        receiver,
+                    ));
+                }
             };
 
-            // act based on message
             match message {
                 TransportSendMessage::Data(buffer) => tasks.push(tokio::spawn(send(buffer))),
                 TransportSendMessage::Close => {
-                    // ignore erros, just make sure to clean up
-                    _ = futures::future::join_all(tasks);
+                    _ = futures::future::join_all(tasks).await;
                     return Ok(());
                 }
             }
         }
 
-        // periodic join to collect errors
         let results: Vec<_> = futures::future::join_all(tasks)
             .await
             .iter()
@@ -248,11 +319,21 @@ async fn initialize_send(
     }
 }
 
-/// internal send function, executed per buffer received.
-/// it takes a buffer of ProcessedPackets, sorts by session, and sends concurrently with a task per session.
-/// All tasks are joined in the end and any failed packets are collected to one TransportError.
+/// Sends a batch of packets, multiplexed across sessions.
+///
+/// This function groups packets by session token, then sends to each session
+/// concurrently. A single ephemeral socket is used for all outbound traffic.
+///
+/// # Arguments
+///
+/// * `buffer` - Packets to send, potentially to multiple different sessions
+///
+/// # Returns
+///
+/// * `Ok(())` - All packets sent successfully
+/// * `Err(FailedToBind)` - Could not create outbound socket
+/// * `Err(CouldNotSend)` - Some packets failed; contains their IDs
 pub async fn send(buffer: Vec<ProcessedPacket>) -> Result<(), TransportError> {
-    // sort packets by session
     let mut sessions: HashMap<u128, Vec<SendablePacket>> = HashMap::new();
     for packet in buffer {
         let tok = packet.packet_id.session_token;
@@ -260,23 +341,18 @@ pub async fn send(buffer: Vec<ProcessedPacket>) -> Result<(), TransportError> {
         sessions.entry(tok).or_default().push(converted_packet);
     }
 
-    // try to create socket
     let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
-        return Err(TransportError::FaildToBind);
+        return Err(TransportError::FailedToBind);
     };
 
-    // initiate futures
     let mut futures: Vec<_> = Vec::new();
     for (session, buffer) in sessions {
         futures.push(send_to(&socket, session, buffer));
     }
 
-    // await all futures and save errors
     let results = futures::future::join_all(futures).await;
     let errors: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
 
-    // return Ok(()) if no errors occured
-    // otherwise flat_map errors to one vector and return
     if errors.is_empty() {
         Ok(())
     } else {
@@ -295,7 +371,21 @@ pub async fn send(buffer: Vec<ProcessedPacket>) -> Result<(), TransportError> {
     }
 }
 
-/// atomic send operation
+/// Sends all packets for a single session to its destination.
+///
+/// Each packet is sent `duplicate_count` times to provide redundancy
+/// for unreliable networks (useful for control packets).
+///
+/// # Arguments
+///
+/// * `socket` - The UDP socket to send from
+/// * `session_token` - Identifies the destination (decoded via [`get_addr`])
+/// * `buffer` - Packets to send to this session
+///
+/// # Returns
+///
+/// * `Ok(())` - All packets sent successfully
+/// * `Err(CouldNotSend)` - Some packets failed; contains their IDs
 async fn send_to(
     socket: &UdpSocket,
     session_token: u128,
@@ -322,13 +412,19 @@ async fn send_to(
     }
 }
 
-/// blackbox placeholder for manage owned functions
+/// Decodes a session token to a destination address string.
+///
+/// **Note:** This is a placeholder implementation that only decodes the port
+/// and assumes localhost. Will be replaced with proper session management.
 pub fn get_addr(session_token: u128) -> String {
     let port = session_token / (12 * 100_000_012);
     format!("127.0.0.1:{port}")
 }
 
-/// blackbox placeholder for manage owned functions
+/// Encodes a socket address into a session token.
+///
+/// **Note:** This is a placeholder implementation that only encodes the port,
+/// ignoring the IP address. Will be replaced with proper session management.
 pub fn get_session_token(addr: SocketAddr) -> u128 {
     (addr.port() as u128) * 12 * 100_000_012
 }
