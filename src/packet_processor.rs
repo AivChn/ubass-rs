@@ -1,11 +1,26 @@
 use crate::packetizer::PacketType;
 
-#[derive(Debug, Clone, Copy)]
+/// Enum used to send messages to the transport send task
+/// currently can either be data or an instruction to close the task gracefully
+/// Upon recieving Close, the task will wait to confirm all packets were sent
+#[derive(Debug, Clone)]
+pub enum TransportSendMessage {
+    Data(Vec<ProcessedPacket>),
+    Close,
+}
+
+// a struct used to identify a packet uniquely, used for resending when necessary mostly.
+// timestamp is taken from the headers of the packet as they are produced from the packetizer
+// layer.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PacketId {
-    pub id: u128,
+    pub timestamp: u128,
     pub session_token: u128,
 }
 
+/// a struct that represents the serialized packet with the minimal data necessary for the
+/// transport layer to process it correctly.
+#[derive(Clone, Debug)]
 pub struct ProcessedPacket {
     pub packet_id: PacketId,
     pub packet_type: PacketType,
