@@ -40,10 +40,21 @@ const MAX_PACKET_SIZE: usize = 1452;
 
 /// Packet ready for UDP transmission with metadata for error reporting and redundancy.
 #[derive(Debug, Clone)]
-pub struct SendablePacket {
-    pub id: PacketId,
+struct SendablePacket {
+    id: PacketId,
+    data: Vec<u8>,
+    duplicate_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReceivedPacket {
     pub data: Vec<u8>,
-    pub duplicate_count: usize,
+}
+
+impl ReceivedPacket {
+    fn new(data: Vec<u8>) -> Self {
+        Self { data }
+    }
 }
 
 impl From<ProcessedPacket> for SendablePacket {
@@ -108,7 +119,7 @@ impl PartialEq for TransportError {
 pub async fn init(
     port: u16,
     receiver: Receiver<TransportSendMessage>,
-    sender: Sender<Result<SendablePacket, TransportError>>,
+    sender: Sender<Result<ReceivedPacket, TransportError>>,
 ) -> Result<(), TransportError> {
     let mut recv_handle = tokio::spawn(recv(port, sender.clone()));
     let mut send_handle = tokio::spawn(initialize_send(receiver));
@@ -172,7 +183,7 @@ pub async fn init(
 /// as it has no mechanism for graceful termination.
 pub async fn recv(
     port: u16,
-    sender: Sender<Result<SendablePacket, TransportError>>,
+    sender: Sender<Result<ReceivedPacket, TransportError>>,
 ) -> Result<(), TransportError> {
     let socket = UdpSocket::bind(format!("0.0.0.0:{port}"))
         .await
@@ -182,9 +193,9 @@ pub async fn recv(
     loop {
         let mut buffer = vec![0u8; MAX_PACKET_SIZE];
 
-        let (addr, stripped_buffer) = loop {
+        let stripped_buffer = loop {
             match socket.recv_from(&mut buffer).await {
-                Ok((read, addr)) => break (addr, &buffer[..read]),
+                Ok((read, _)) => break &buffer[..read],
                 Err(_) => {
                     if fail_count >= 25 {
                         return Err(TransportError::RecvFailedTooManyTimes);
@@ -193,20 +204,13 @@ pub async fn recv(
                     }
                 }
             }
-            if let Ok((read, addr)) = socket.recv_from(&mut buffer).await {
+            if let Ok((read, _)) = socket.recv_from(&mut buffer).await {
                 fail_count = 0;
-                break (addr, &buffer[..read]);
+                break &buffer[..read];
             }
         };
 
-        let packet = SendablePacket {
-            id: PacketId {
-                timestamp: 0,
-                session_token: get_session_token(addr),
-            },
-            data: Vec::from(stripped_buffer),
-            duplicate_count: 0,
-        };
+        let packet = ReceivedPacket::new(stripped_buffer.to_vec());
 
         if let Err(intern) = send_to_processing_layer(sender.clone(), packet).await {
             return Err(TransportError::Internal(intern));
@@ -230,14 +234,14 @@ pub async fn recv(
 /// * `Err(ChannelClosed)` - Channel was already closed (checked before send)
 /// * `Err(ChannelFailed)` - Send operation failed
 pub async fn send_to_processing_layer(
-    sender: Sender<Result<SendablePacket, TransportError>>,
-    res: SendablePacket,
+    sender: Sender<Result<ReceivedPacket, TransportError>>,
+    res: ReceivedPacket,
 ) -> Result<(), InternalError> {
     if sender.is_closed() {
         return Err(InternalError::ChannelClosed);
     }
 
-    let res: Result<SendablePacket, TransportError> = Ok(res);
+    let res: Result<ReceivedPacket, TransportError> = Ok(res);
 
     if sender.send(res.clone()).await.is_err() {
         return Err(InternalError::ChannelFailed);
