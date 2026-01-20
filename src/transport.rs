@@ -122,7 +122,7 @@ pub async fn init(
     sender: Sender<Result<ReceivedPacket, TransportError>>,
 ) -> Result<(), TransportError> {
     let mut recv_handle = tokio::spawn(recv(port, sender.clone()));
-    let mut send_handle = tokio::spawn(initialize_send(receiver));
+    let mut send_handle = tokio::spawn(send(sender.clone(), receiver));
 
     'supervisor: loop {
         _ = tokio::select! {
@@ -146,12 +146,12 @@ pub async fn init(
 
                 match result {
                     Err((TransportError::FailedToBind, returned_receiver)) |
-                    Err((TransportError::RecvFailedTooManyTimes, returned_receiver))=> send_handle = tokio::spawn(initialize_send(returned_receiver)),
+                    Err((TransportError::RecvFailedTooManyTimes, returned_receiver))=> send_handle = tokio::spawn(send(sender.clone(), returned_receiver)),
                     Err((TransportError::CouldNotSend(packets), returned_receiver)) => {
                         if sender.send(Err(TransportError::CouldNotSend(packets))).await.is_err() {
                             break 'supervisor Err(TransportError::Internal(InternalError::ChannelClosed));
                         }
-                        send_handle = tokio::spawn(initialize_send(returned_receiver));
+                        send_handle = tokio::spawn(send(sender.clone(), returned_receiver));
                     },
                     Err((TransportError::Internal(internal), _)) => {recv_handle.abort(); break 'supervisor Err(TransportError::Internal(internal));},
                     Ok(()) => { recv_handle.abort(); break 'supervisor Ok(())},
@@ -194,8 +194,8 @@ async fn recv(
         let mut buffer = vec![0u8; MAX_PACKET_SIZE];
 
         let stripped_buffer = loop {
-            match socket.recv_from(&mut buffer).await {
-                Ok((read, _)) => break &buffer[..read],
+            match socket.recv(&mut buffer).await {
+                Ok(read) => break &buffer[..read],
                 Err(_) => {
                     if fail_count >= 25 {
                         return Err(TransportError::RecvFailedTooManyTimes);
@@ -204,7 +204,7 @@ async fn recv(
                     }
                 }
             }
-            if let Ok((read, _)) = socket.recv_from(&mut buffer).await {
+            if let Ok(read) = socket.recv(&mut buffer).await {
                 fail_count = 0;
                 break &buffer[..read];
             }
@@ -212,7 +212,7 @@ async fn recv(
 
         let packet = ReceivedPacket::new(stripped_buffer.to_vec());
 
-        if let Err(intern) = send_to_processing_layer(sender.clone(), packet).await {
+        if let Err(intern) = send_to_processing_layer(sender.clone(), Ok(packet)).await {
             return Err(TransportError::Internal(intern));
         }
     }
@@ -235,19 +235,27 @@ async fn recv(
 /// * `Err(ChannelFailed)` - Send operation failed
 async fn send_to_processing_layer(
     sender: Sender<Result<ReceivedPacket, TransportError>>,
-    res: ReceivedPacket,
+    res: Result<ReceivedPacket, TransportError>,
 ) -> Result<(), InternalError> {
     if sender.is_closed() {
         return Err(InternalError::ChannelClosed);
     }
 
-    let res: Result<ReceivedPacket, TransportError> = Ok(res);
-
-    if sender.send(res.clone()).await.is_err() {
-        return Err(InternalError::ChannelFailed);
-    } else {
-        return Ok(());
+    match res {
+        Ok(packet) => {
+            if sender.send(Ok(packet)).await.is_err() {
+                return Err(InternalError::ChannelFailed);
+            }
+        }
+        Err(err) => {
+            if sender.send(Err(err)).await.is_err() {
+                return Err(InternalError::ChannelFailed);
+            }
+        }
     }
+
+    Ok(())
+    //
 }
 
 /// Manages outbound packet transmission from the packet processor.
@@ -273,7 +281,8 @@ async fn send_to_processing_layer(
 /// 2. After 25ms, join all tasks and collect any errors
 /// 3. If errors occurred, return them (supervisor may restart)
 /// 4. Otherwise, start a new batch
-async fn initialize_send(
+async fn send(
+    sender: Sender<Result<ReceivedPacket, TransportError>>,
     mut receiver: Receiver<TransportSendMessage>,
 ) -> Result<(), (TransportError, Receiver<TransportSendMessage>)> {
     loop {
@@ -283,18 +292,22 @@ async fn initialize_send(
         while now.elapsed() < Duration::from_millis(25) {
             let remaining = Duration::from_millis(25) - now.elapsed();
             let message = match timeout(remaining, receiver.recv()).await {
-                Ok(Some(msg)) => msg,
+                // timeout reached
                 Err(_) => break,
+                // Channel closed
                 Ok(None) => {
                     return Err((
                         TransportError::Internal(InternalError::ChannelFailed),
                         receiver,
                     ));
                 }
+                Ok(Some(msg)) => msg,
             };
 
             match message {
-                TransportSendMessage::Data(buffer) => tasks.push(tokio::spawn(send(buffer))),
+                TransportSendMessage::Data(buffer) => {
+                    tasks.push(tokio::spawn(send_to_session(buffer)))
+                }
                 TransportSendMessage::Close => {
                     _ = futures::future::join_all(tasks).await;
                     return Ok(());
@@ -318,7 +331,12 @@ async fn initialize_send(
             .collect();
 
         if !results.is_empty() {
-            return Err((TransportError::CouldNotSend(results), receiver));
+            if let Err(err) =
+                send_to_processing_layer(sender.clone(), Err(TransportError::CouldNotSend(results)))
+                    .await
+            {
+                return Err((TransportError::Internal(err), receiver));
+            }
         }
     }
 }
@@ -337,7 +355,7 @@ async fn initialize_send(
 /// * `Ok(())` - All packets sent successfully
 /// * `Err(FailedToBind)` - Could not create outbound socket
 /// * `Err(CouldNotSend)` - Some packets failed; contains their IDs
-async fn send(buffer: Vec<ProcessedPacket>) -> Result<(), TransportError> {
+async fn send_to_session(buffer: Vec<ProcessedPacket>) -> Result<(), TransportError> {
     let mut sessions: HashMap<u128, Vec<SendablePacket>> = HashMap::new();
     for packet in buffer {
         let tok = packet.packet_id.session_token;
