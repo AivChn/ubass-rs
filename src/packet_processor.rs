@@ -15,7 +15,7 @@ pub enum TransportSendMessage {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PacketId {
     pub timestamp: u128,
-    pub session_token: u128,
+    pub session_token: u64,
 }
 
 /// a struct that represents the serialized packet with the minimal data necessary for the

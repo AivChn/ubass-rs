@@ -306,7 +306,7 @@ async fn send(
 
             match message {
                 TransportSendMessage::Data(buffer) => {
-                    tasks.push(tokio::spawn(send_to_session(buffer)))
+                    tasks.push(tokio::spawn(distribute_send_to_session(buffer)))
                 }
                 TransportSendMessage::Close => {
                     _ = futures::future::join_all(tasks).await;
@@ -355,8 +355,8 @@ async fn send(
 /// * `Ok(())` - All packets sent successfully
 /// * `Err(FailedToBind)` - Could not create outbound socket
 /// * `Err(CouldNotSend)` - Some packets failed; contains their IDs
-async fn send_to_session(buffer: Vec<ProcessedPacket>) -> Result<(), TransportError> {
-    let mut sessions: HashMap<u128, Vec<SendablePacket>> = HashMap::new();
+async fn distribute_send_to_session(buffer: Vec<ProcessedPacket>) -> Result<(), TransportError> {
+    let mut sessions: HashMap<u64, Vec<SendablePacket>> = HashMap::new();
     for packet in buffer {
         let tok = packet.packet_id.session_token;
         let converted_packet: SendablePacket = SendablePacket::from(packet);
@@ -410,7 +410,7 @@ async fn send_to_session(buffer: Vec<ProcessedPacket>) -> Result<(), TransportEr
 /// * `Err(CouldNotSend)` - Some packets failed; contains their IDs
 async fn send_to(
     socket: &UdpSocket,
-    session_token: u128,
+    session_token: u64,
     buffer: Vec<SendablePacket>,
 ) -> Result<(), TransportError> {
     let mut errors: Vec<PacketId> = vec![];
@@ -438,7 +438,7 @@ async fn send_to(
 ///
 /// **Note:** This is a placeholder implementation that only decodes the port
 /// and assumes localhost. Will be replaced with proper session management.
-pub fn get_addr(session_token: u128) -> String {
+pub fn get_addr(session_token: u64) -> String {
     let port = session_token / (12 * 100_000_012);
     format!("127.0.0.1:{port}")
 }
