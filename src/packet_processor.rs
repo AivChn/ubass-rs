@@ -1,4 +1,4 @@
-use crate::packetizer::PacketType;
+use crate::packetizer::{Packet, PacketType};
 
 /// Enum used to send messages to the transport send task
 /// currently can either be data or an instruction to close the task gracefully
@@ -14,7 +14,7 @@ pub enum TransportSendMessage {
 // layer.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PacketId {
-    pub timestamp: u128,
+    pub timestamp: u64,
     pub session_token: u64,
 }
 
@@ -26,4 +26,10 @@ pub struct ProcessedPacket {
     pub packet_type: PacketType,
     pub data: Vec<u8>,
     pub duplicate_count: usize,
+}
+
+pub fn process<T>(packet: T)
+where
+    T: Packet,
+{
 }
