@@ -1,14 +1,39 @@
-use aes_gcm_siv::aead::Payload;
-use bincode;
-use core::time;
-use serde::{Deserialize, Serialize};
-use std::{time::Instant, vec};
+use std::fmt::Display;
 
-const MAX_PAYLOAD_LENGTH: usize = 1400;
-const CURRENT_VERSION: usize = (0 << 12) | (0 << 8) | 1;
+use wincode::{SchemaRead, SchemaWrite};
+
+const MAX_PAYLOAD_LENGTH: u16 = 1400;
+
+#[derive(Debug, PartialEq, SchemaWrite, SchemaRead)]
+#[repr(transparent)]
+struct Version(u16);
+
+impl Version {
+    const CURRENT_VERSION: Version = Version::new(0, 0, 1);
+    const MAX_ALLOWED_VERSION: Version = Version::new(0, 0, 1);
+    const MIN_ALLOWED_VERSION: Version = Version::new(0, 0, 1);
+    const fn new(major: u8, minor: u8, patch: u8) -> Self {
+        Self((major as u16) << 12 | (minor as u16) << 8 | patch as u16)
+    }
+    const fn parse(&self) -> (u8, u8, u8) {
+        (
+            (self.0 >> 12) as u8,
+            ((self.0 >> 8) & 0xF) as u8,
+            (self.0 & 0xFF) as u8,
+        )
+    }
+}
+
+impl Display for Version {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (major, minor, patch) = self.parse();
+        f.write_str(&format!("{}.{}.{}", major, minor, patch))
+    }
+}
 
 /// Enum of all possible packet types as of now
-#[derive(Clone, Debug)]
+#[derive(Clone, PartialEq, Debug, SchemaWrite, SchemaRead)]
+#[wincode(tag_encoding = "u8")]
 pub enum PacketType {
     Data,
     Metadata,
@@ -18,74 +43,57 @@ pub enum PacketType {
     ConnectionStat,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[repr(transparent)]
+#[derive(PartialEq, Debug, SchemaRead, SchemaWrite)]
+#[wincode(tag_encoding = "u16")]
+pub enum Options {
+    #[wincode(tag = 0b1000)]
+    RequireAck,
+}
+
+#[repr(C)]
+#[derive(Debug, PartialEq, SchemaWrite, SchemaRead)]
+pub struct FecInfo {
+    batch_size: u8,
+    batch_pos: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
 pub struct DataPacket {
-    version: u16,
-    packet_type: u8,
+    version: Version,
+    opts: Options,
+    packet_type: PacketType,
     reserved: u8,
-    opts: u16,
+    fec_info: FecInfo,
     session_id: u64,
+    // encrypted
     timestamp_ms: u64,
     byte_range_start: u32,
     byte_range_offset: u16,
     payload_length: u16,
-    payload: Vec<u8>,
+    payload: [u8; MAX_PAYLOAD_LENGTH as usize],
 }
 
-impl DataPacket {
-    fn new(
-        opts: u16,
-        session_id: u64,
-        byte_range_start: u32,
-        byte_range_offset: u16,
-        payload_length: u16,
-        payload: &[u8],
-    ) -> Option<Self> {
-        Some(Self {
-            version: CURRENT_VERSION,
-            packet_type: PacketType::Data as u8,
-            reserved: 0,
-            opts,
-            session_id,
-            timestamp_ms: Instant::now().into(),
-            byte_range_start,
-            byte_range_offset,
-            payload_length,
-            payload: if payload_length <= MAX_PAYLOAD_LENGTH {
-                Vec::from(payload[..payload_length])
-            } else {
-                return None;
-            },
-        })
-    }
-}
-
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[repr(C)]
+#[derive(Debug, PartialEq, SchemaWrite, SchemaRead)]
 struct AckPacket {
-    version: u16,
-    packet_type: u8,
+    version: Version,
+    opts: Options,
+    packet_type: PacketType,
     reserved: u8,
-    opts: u16,
     session_id: u64,
+    // encrypted
     timestamp_ms: u64,
     ack_timestamp_ms: u64,
+    ack_opts: Options,
+    ack_packet_type: PacketType,
 }
 
-impl AckPacket {
-    fn new(opts: u16, session_id: u64, ack_timestamp_ms: u64) -> Self {
-        Self {
-            version: CURRENT_VERSION,
-            packet_type: PacketType::Ack as u8,
-            reserved: 0,
-            opts,
-            session_id,
-            timestamp_ms: Instant::now().into(),
-            ack_timestamp_ms,
-        }
-    }
-}
-
+#[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
+#[wincode(tag_encoding = "u8")]
 enum ControlType {
+    Hello,
     Retransmit,
     Play,
     Stop,
@@ -96,39 +104,16 @@ enum ControlType {
     NewEncryptionKey,
 }
 
-#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[repr(C)]
+#[derive(Debug, PartialEq, SchemaWrite, SchemaRead)]
 struct ControlPacket {
-    version: u16,
-    packet_type: u8,
+    version: Version,
+    opts: Options,
+    packet_type: PacketType,
     control_type: ControlType,
-    opts: u16,
     session_id: u64,
-    timestamp_ms: u32,
+    // encrypted
+    timestamp_ms: u64,
     payload_length: u16,
-    payload: Vec<u8>,
-}
-
-impl ControlPacket {
-    fn new(
-        control_type: ControlType,
-        opts: u16,
-        session_id: u64,
-        payload_length: u16,
-        payload: &[u8],
-    ) -> Option<Self> {
-        Some(Self {
-            version: CURRENT_VERSION,
-            packet_type: PacketType::Control as u8,
-            control_type,
-            opts,
-            session_id,
-            timestamp_ms: Instant::now().into(),
-            payload_length,
-            payload: if payload_length <= MAX_PAYLOAD_LENGTH {
-                Vec::from(payload[..payload_length])
-            } else {
-                return None;
-            },
-        })
-    }
+    payload: [u8; MAX_PAYLOAD_LENGTH as usize],
 }
