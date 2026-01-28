@@ -27,6 +27,7 @@
 use crate::{
     InternalError,
     packet_processor::{PacketId, ProcessedPacket, TransportSendMessage},
+    packetizer::SessionId,
 };
 use std::{collections::HashMap, net::SocketAddr, vec};
 use tokio::{
@@ -46,6 +47,7 @@ pub struct SendablePacket {
     pub duplicate_count: usize,
 }
 
+#[repr(transparent)]
 #[derive(Debug, Clone)]
 pub struct ReceivedPacket {
     pub data: Vec<u8>,
@@ -356,9 +358,9 @@ async fn send(
 /// * `Err(FailedToBind)` - Could not create outbound socket
 /// * `Err(CouldNotSend)` - Some packets failed; contains their IDs
 async fn distribute_send_to_session(buffer: Vec<ProcessedPacket>) -> Result<(), TransportError> {
-    let mut sessions: HashMap<u64, Vec<SendablePacket>> = HashMap::new();
+    let mut sessions: HashMap<SessionId, Vec<SendablePacket>> = HashMap::new();
     for packet in buffer {
-        let tok = packet.packet_id.session_token;
+        let tok = packet.packet_id.session_id;
         let converted_packet: SendablePacket = SendablePacket::from(packet);
         sessions.entry(tok).or_default().push(converted_packet);
     }
@@ -410,7 +412,7 @@ async fn distribute_send_to_session(buffer: Vec<ProcessedPacket>) -> Result<(), 
 /// * `Err(CouldNotSend)` - Some packets failed; contains their IDs
 async fn send_to(
     socket: &UdpSocket,
-    session_token: u64,
+    session_token: SessionId,
     buffer: Vec<SendablePacket>,
 ) -> Result<(), TransportError> {
     let mut errors: Vec<PacketId> = vec![];
@@ -438,8 +440,8 @@ async fn send_to(
 ///
 /// **Note:** This is a placeholder implementation that only decodes the port
 /// and assumes localhost. Will be replaced with proper session management.
-pub fn get_addr(session_token: u64) -> String {
-    let port = session_token / (12 * 100_000_012);
+pub fn get_addr(session_token: SessionId) -> String {
+    let port = session_token.0 / (12 * 100_000_012);
     format!("127.0.0.1:{port}")
 }
 
