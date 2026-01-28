@@ -1,29 +1,114 @@
-use std::fmt::Display;
+use std::{fmt::Display, usize};
 
 use wincode::{SchemaRead, SchemaWrite};
 
-const MAX_PAYLOAD_LENGTH: u16 = 1400;
+// =================== DEFINITIONS =================================|
 
-#[repr(C)]
-#[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
-pub struct PacketHeaders {
-    version: Version,
-    opts: Options,
-    packet_type: PacketType,
-    reserved: u8,
-    fec_info: FecInfo,
-    session_id: u64,
-}
+const MAX_PAYLOAD_LENGTH: usize = 1400;
 
-pub trait Packet {
-    pub fn get_headers(&self) -> PacketHeaders;
+#[derive(Debug)]
+pub enum PacketWrapper {
+    DataPacket(DataPacket),
+    AckPacket(AckPacket),
+    ControlPacket(ControlPacket),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, SchemaWrite, SchemaRead)]
 #[repr(transparent)]
 pub struct Version(u16);
 
-pub impl Version {
+/// Enum of all possible packet types as of now
+#[derive(Clone, Copy, PartialEq, Debug, SchemaWrite, SchemaRead)]
+#[wincode(tag_encoding = "u8")]
+pub enum PacketType {
+    Data,
+    Metadata,
+    Parity,
+    Ack,
+    Control,
+    ConnectionStat,
+}
+
+#[repr(transparent)]
+#[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
+pub struct Options(u16);
+
+#[derive(Clone, Copy)]
+enum OptionFlags {
+    RequireAck = 0b1000,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, SchemaWrite, SchemaRead)]
+pub struct FecInfo {
+    batch_size: u8,
+    batch_pos: u8,
+}
+
+#[repr(C)]
+#[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
+pub struct DataPacket {
+    pub version: Version,        // 16
+    pub opts: Options,           // 16
+    pub packet_type: PacketType, // 8
+    reserved: u8,                // 8
+    pub fec_info: FecInfo,       // 16
+    pub session_id: u64,         // 64
+    // encrypted
+    pub timestamp_ms: u64,                 // 64
+    pub byte_range_start: u32,             //32
+    pub byte_range_offset: u16,            //16
+    pub payload_length: u16,               // 16
+    pub payload: [u8; MAX_PAYLOAD_LENGTH], // 1400
+}
+
+#[repr(C)]
+#[derive(Debug, PartialEq, SchemaWrite, SchemaRead)]
+pub struct AckPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    reserved: u8,
+    pub session_id: u64,
+    // encrypted
+    pub timestamp_ms: u64,
+    pub ack_timestamp_ms: u64,
+    pub ack_opts: Options,
+    pub ack_packet_type: PacketType,
+}
+
+#[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
+#[wincode(tag_encoding = "u8")]
+pub enum ControlType {
+    Hello,
+    Retransmit,
+    Play,
+    Stop,
+    Restart,
+    Pause,
+    Seek,
+    SendMetadata,
+    NewEncryptionKey,
+}
+
+#[repr(C)]
+#[derive(Debug, PartialEq, SchemaWrite, SchemaRead)]
+pub struct ControlPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub control_type: ControlType,
+    reserved: u16,
+    pub session_id: u64,
+    // encrypted
+    pub timestamp_ms: u64,
+    pub payload_length: u16,
+    pub payload: [u8; MAX_PAYLOAD_LENGTH],
+}
+
+// ===================== IMPLEMENTATIONS ===================================|
+
+impl Version {
     pub const CURRENT_VERSION: Version = Version::new(0, 0, 1);
     pub const MAX_ALLOWED_VERSION: Version = Version::new(0, 0, 1);
     pub const MIN_ALLOWED_VERSION: Version = Version::new(0, 0, 1);
@@ -46,116 +131,26 @@ impl Display for Version {
     }
 }
 
-/// Enum of all possible packet types as of now
-#[derive(Clone, Copy, PartialEq, Debug, SchemaWrite, SchemaRead)]
-#[wincode(tag_encoding = "u8")]
-pub enum PacketType {
-    Data,
-    Metadata,
-    Parity,
-    Ack,
-    Control,
-    ConnectionStat,
-}
-
-#[repr(transparent)]
-#[derive(Clone, Copy, PartialEq, Debug, SchemaRead, SchemaWrite)]
-#[wincode(tag_encoding = "u16")]
-pub enum Options {
-    #[wincode(tag = 0b1000)]
-    RequireAck,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, SchemaWrite, SchemaRead)]
-pub struct FecInfo {
-    batch_size: u8,
-    batch_pos: u8,
-}
-
-#[repr(C)]
-#[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
-pub struct DataPacket {
-    version: Version,
-    opts: Options,
-    packet_type: PacketType,
-    reserved: u8,
-    fec_info: FecInfo,
-    session_id: u64,
-    // encrypted
-    timestamp_ms: u64,
-    byte_range_start: u32,
-    byte_range_offset: u16,
-    payload_length: u16,
-    payload: [u8; MAX_PAYLOAD_LENGTH as usize],
-}
-
-impl Packet for DataPacket {
-    fn get_headers(&self) -> PacketHeaders {
-        PacketHeaders {
-            version: self.version,
-            opts: self.opts,
-            packet_type: self.packet_type,
-            reserved: 0,
-            fec_info: self.fec_info,
-            session_id: self.session_id,
-        }
+impl Options {
+    pub fn construct(flags: Vec<OptionFlags>) -> Self {
+        Self(
+            flags
+                .iter()
+                .map(|x| *x as u16)
+                .reduce(|f1, f2| f1 | f2)
+                .unwrap_or(0),
+        )
     }
 }
 
-#[repr(C)]
-#[derive(Debug, PartialEq, SchemaWrite, SchemaRead)]
-pub struct AckPacket {
-    pub version: Version,
-    pub opts: Options,
-    pub packet_type: PacketType,
-    pub reserved: u8,
-    pub session_id: u64,
-    // encrypted
-    pub timestamp_ms: u64,
-    pub ack_timestamp_ms: u64,
-    pub ack_opts: Options,
-    pub ack_packet_type: PacketType,
+impl DataPacket {
+    pub const HEADER_SIZE: usize = size_of::<DataPacket>() - MAX_PAYLOAD_LENGTH;
 }
 
-impl Packet for AckPacket {
-    fn get_headers(&self) -> PacketHeaders {
-        PacketHeaders {
-            version: self.version,
-            opts: self.opts,
-            packet_type: self.packet_type,
-            reserved: 0,
-            session_id: self.session_id,
-        }
-    }
+impl AckPacket {
+    pub const HEADER_SIZE: usize = size_of::<AckPacket>();
 }
 
-#[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
-#[wincode(tag_encoding = "u8")]
-pub enum ControlType {
-    Hello,
-    Retransmit,
-    Play,
-    Stop,
-    Restart,
-    Pause,
-    Seek,
-    SendMetadata,
-    NewEncryptionKey,
+impl ControlPacket {
+    pub const HEADER_SIZE: usize = size_of::<ControlPacket>() - MAX_PAYLOAD_LENGTH;
 }
-
-#[repr(C)]
-#[derive(Debug, PartialEq, SchemaWrite, SchemaRead)]
-pub struct ControlPacket {
-    version: Version,
-    opts: Options,
-    packet_type: PacketType,
-    control_type: ControlType,
-    session_id: u64,
-    // encrypted
-    timestamp_ms: u64,
-    payload_length: u16,
-    payload: [u8; MAX_PAYLOAD_LENGTH as usize],
-}
-
-impl Packet for ControlPacket {}
