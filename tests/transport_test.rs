@@ -18,6 +18,7 @@ use ubass_rs::transport::{TransportError, get_session_token, init};
 // Helper Functions
 // ============================================================================
 
+// TODO: fix broken test
 /// Creates a ProcessedPacket with the given parameters
 fn make_processed_packet(
     timestamp: u128,
@@ -28,7 +29,7 @@ fn make_processed_packet(
     ProcessedPacket {
         packet_id: PacketId {
             timestamp,
-            session_token,
+            session_id: session_token,
         },
         packet_type: PacketType::Data,
         data: data.to_vec(),
@@ -315,11 +316,11 @@ async fn init_graceful_shutdown() {
 async fn transport_error_partial_eq() {
     let err1 = TransportError::CouldNotSend(vec![PacketId {
         timestamp: 1,
-        session_token: 1,
+        session_id: 1,
     }]);
     let err2 = TransportError::CouldNotSend(vec![PacketId {
         timestamp: 2,
-        session_token: 2,
+        session_id: 2,
     }]);
 
     // CouldNotSend variants are considered equal regardless of contents
