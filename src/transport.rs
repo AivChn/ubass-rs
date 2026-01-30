@@ -14,7 +14,7 @@
 //!
 //! Communication with the packet processor layer occurs through two MPSC channels:
 //! - `Receiver<TransportSendMessage>`: Commands and packets to send (from processor)
-//! - `Sender<Result<SendablePacket, TransportError>>`: Received packets and errors (to processor)
+//! - `Sender<Result<ReceivedPacket, TransportError>>`: Received packets and errors (to processor)
 //!
 //! # Error Handling
 //!

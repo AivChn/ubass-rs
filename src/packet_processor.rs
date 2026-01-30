@@ -1,12 +1,20 @@
 use std::usize;
 
+use futures::channel::mpsc::Sender;
+use tokio::sync::mpsc::Receiver;
+
 use crate::{
     packetizer::{
         AckPacket, ControlPacket, DataPacket, MAX_PAYLOAD_LENGTH, Options, PacketType,
         PacketWrapper, SessionId, Version,
     },
-    transport::ReceivedPacket,
+    transport::{ReceivedPacket, TransportError},
 };
+
+pub enum PacketProcessingMessage {
+    SendPacket(PacketWrapper),
+    Close,
+}
 
 /// Enum used to send messages to the transport send task
 /// currently can either be data or an instruction to close the task gracefully
@@ -31,18 +39,62 @@ pub struct PacketId {
 #[derive(Clone, Debug)]
 pub struct ProcessedPacket {
     pub packet_id: PacketId,
-    pub packet_type: PacketType,
+    pub packet_type_batch_id: PacketType,
     pub data: Vec<u8>,
     pub duplicate_count: usize,
 }
 
 #[derive(Debug)]
-enum PacketProcessingError {
+pub enum PacketProcessingError {
     PacketTypeNotIMplemented(PacketType),
     IncompatibleVersion(Version),
     WrongHeaderSize(usize),
     InvalidPacketTypeHeader(u8),
     FailedToDeserialize,
+}
+
+pub async fn init(
+    p_receiver: Receiver<PacketProcessingMessage>,
+    p_sender: Sender<Result<ProcessedPacket, PacketProcessingError>>,
+    t_receiver: Receiver<Result<ReceivedPacket, TransportError>>,
+    t_sender: Sender<TransportSendMessage>,
+) -> Result<(), PacketProcessingError> {
+    // TODO: implement send and receive pipeline calls
+    Ok(())
+}
+
+async fn recv(
+    t_receiver: Receiver<Result<ReceivedPacket, TransportError>>,
+    p_sender: Sender<Result<ProcessedPacket, PacketProcessingError>>,
+) -> Result<(), PacketProcessingError> {
+    // TODO: implement recv pipeline
+    todo!("implement recv pipeline")
+}
+
+async fn send(
+    t_sender: Sender<TransportSendMessage>,
+    p_sender: Sender<Result<ProcessedPacket, PacketProcessingError>>,
+    p_receiver: Receiver<PacketProcessingMessage>,
+) -> Result<(), PacketProcessingError> {
+    // TODO: implement send pipeline
+    todo!("implement send pipeline")
+
+    // Wait on receive
+
+    //serialize
+
+    // save copy for parity derivition
+
+    // encrypt
+
+    // send to transport
+
+    // if final packet in batch
+    //  derive parity
+    //  send parity
+    //  calculate new batch size
+
+    // repeat
 }
 
 fn decrypt(packet: Vec<u8>) -> Vec<u8> {
@@ -120,7 +172,7 @@ fn process_serialized(packet: ReceivedPacket) -> Result<ProcessedPacket, PacketP
             timestamp: 0,
             session_id: session_id,
         },
-        packet_type,
+        packet_type_batch_id: packet_type,
         data: packet.data,
         duplicate_count: 0,
     })
@@ -129,7 +181,7 @@ fn process_serialized(packet: ReceivedPacket) -> Result<ProcessedPacket, PacketP
 fn deserialize(packet: ProcessedPacket) -> Result<PacketWrapper, PacketProcessingError> {
     let mut decrypted_data = decrypt(packet.data);
 
-    match packet.packet_type {
+    match packet.packet_type_batch_id {
         PacketType::Data => {
             decrypted_data.resize(DataPacket::HEADER_SIZE + MAX_PAYLOAD_LENGTH, 0);
             let Ok(temp) = wincode::deserialize::<DataPacket>(&decrypted_data) else {
@@ -167,7 +219,7 @@ pub fn process_packet(packet: PacketWrapper) -> ProcessedPacket {
                 timestamp: pack.timestamp_ms,
                 session_id: pack.session_id,
             },
-            packet_type: pack.packet_type,
+            packet_type_batch_id: pack.packet_type_batch_id.0,
             data: wincode::serialize(&pack).expect("I didnt handle this yet")
                 [..pack.payload_length as usize + DataPacket::HEADER_SIZE]
                 .to_vec(),
@@ -178,7 +230,7 @@ pub fn process_packet(packet: PacketWrapper) -> ProcessedPacket {
                 timestamp: pack.timestamp_ms,
                 session_id: pack.session_id,
             },
-            packet_type: pack.packet_type,
+            packet_type_batch_id: pack.packet_type,
             data: wincode::serialize(&pack).expect("I didnt handlet this yet"),
             duplicate_count: 5,
         },
@@ -187,7 +239,7 @@ pub fn process_packet(packet: PacketWrapper) -> ProcessedPacket {
                 timestamp: pack.timestamp_ms,
                 session_id: pack.session_id,
             },
-            packet_type: pack.packet_type,
+            packet_type_batch_id: pack.packet_type,
             data: wincode::serialize(&pack).expect("I didnt handle this yet")
                 [..pack.payload_length as usize + ControlPacket::HEADER_SIZE]
                 .to_vec(),

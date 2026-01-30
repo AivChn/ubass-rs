@@ -1,7 +1,6 @@
 use std::{
-    cmp::Ordering,
     fmt::Display,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
     usize,
 };
 
@@ -40,12 +39,15 @@ pub enum PacketType {
     ConnectionStat = 6,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct PacketTypeFecBatchID(pub PacketType, pub u16);
+
 #[repr(transparent)]
 #[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
 pub struct Options(u16);
 
 #[derive(Clone, Copy)]
-enum OptionFlags {
+pub enum OptionFlags {
     RequireAck = 0b1000,
 }
 
@@ -61,14 +63,13 @@ pub struct FecInfo {
 }
 
 #[repr(C)]
-#[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
+#[derive(Debug, SchemaRead, SchemaWrite)]
 pub struct DataPacket {
-    pub version: Version,        // 16
-    pub opts: Options,           // 16
-    pub packet_type: PacketType, // 8
-    reserved: u8,                // 8
-    pub fec_info: FecInfo,       // 16
-    pub session_id: SessionId,   // 64
+    pub version: Version, // 16
+    pub opts: Options,    // 16
+    pub packet_type_batch_id: PacketTypeFecBatchID,
+    pub fec_info: FecInfo,     // 16
+    pub session_id: SessionId, // 64
     // encrypted
     pub timestamp_ms: u64,                 // 64
     pub byte_range_start: u32,             //32
@@ -186,6 +187,73 @@ impl PacketType {
     }
 }
 
+impl TryFrom<u8> for PacketType {
+    type Error = ();
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        if let Some(val) = PacketType::VARIANTS
+            .iter()
+            .filter(|x| (**x as u8) == value)
+            .collect::<Vec<&PacketType>>()
+            .get(0)
+        {
+            Ok(**val)
+        } else {
+            Err(())
+        }
+    }
+}
+
+impl<'de> SchemaRead<'de> for PacketTypeFecBatchID {
+    type Dst = PacketTypeFecBatchID;
+
+    const TYPE_META: wincode::TypeMeta = wincode::TypeMeta::Static {
+        size: 2,
+        zero_copy: false,
+    };
+
+    fn read(
+        reader: &mut impl wincode::io::Reader<'de>,
+        dst: &mut std::mem::MaybeUninit<Self::Dst>,
+    ) -> wincode::ReadResult<()> {
+        let Ok(bytes) = reader.fill_array::<2>() else {
+            return Err(wincode::ReadError::LengthEncodingOverflow(
+                "not enough bytes to get type and batch ID",
+            ));
+        };
+
+        let Ok(packet_type) = PacketType::try_from((bytes[0] & 0xFC) >> 2) else {
+            return Err(wincode::ReadError::InvalidCharLead(bytes[0]));
+        };
+
+        let batch_id = (((bytes[0] & 3) as u16) << 8) | bytes[1] as u16;
+
+        dst.write(PacketTypeFecBatchID(packet_type, batch_id));
+
+        Ok(())
+    }
+}
+
+impl SchemaWrite for PacketTypeFecBatchID {
+    type Src = PacketTypeFecBatchID;
+
+    const TYPE_META: wincode::TypeMeta = wincode::TypeMeta::Static {
+        size: 2,
+        zero_copy: false,
+    };
+
+    fn size_of(src: &Self::Src) -> wincode::WriteResult<usize> {
+        _ = src;
+        Ok(2)
+    }
+
+    fn write(writer: &mut impl wincode::io::Writer, src: &Self::Src) -> wincode::WriteResult<()> {
+        let serialized = ((src.0 as u16) << 10) | (src.1 & 1023); // 1023 == 10 set bits
+        writer
+            .write(&[(serialized >> 8) as u8, (serialized & 0xFF) as u8])
+            .map_err(|err| wincode::WriteError::Io(err))
+    }
+}
 impl SessionId {
     pub fn new() -> Self {
         Self(
