@@ -291,11 +291,10 @@ async fn send(
     mut receiver: Receiver<TransportSendMessage>,
 ) -> Result<(), (TransportError, Receiver<TransportSendMessage>)> {
     loop {
-        let mut concurrent_sends: usize = 0;
-        let mut tasks = Vec::with_capacity(MAX_PACKET_BUFFER_SIZE);
+        let mut tasks = Vec::with_capacity(MAX_CONCURRENT_SENDS);
         let now = Instant::now();
 
-        while now.elapsed() < Duration::from_millis(25) && concurrent_sends < MAX_CONCURRENT_SENDS {
+        while now.elapsed() < Duration::from_millis(25) && tasks.len() <= MAX_CONCURRENT_SENDS {
             let remaining = Duration::from_millis(25) - now.elapsed();
             let message = match timeout(remaining, receiver.recv()).await {
                 // timeout reached
@@ -312,7 +311,6 @@ async fn send(
 
             match message {
                 TransportSendMessage::Data(buffer) => {
-                    concurrent_sends += 1;
                     tasks.push(tokio::spawn(distribute_send_to_session(buffer)))
                 }
                 TransportSendMessage::Close => {
