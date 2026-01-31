@@ -39,6 +39,9 @@ use tokio::{
 /// Maximum UDP packet size in bytes (1452).
 const MAX_PACKET_SIZE: usize = 1452;
 
+const MAX_PACKET_BUFFER_SIZE: usize = 256;
+const MAX_CONCURRENT_SENDS: usize = 128;
+
 /// Packet ready for UDP transmission with metadata for error reporting and redundancy.
 #[derive(Debug, Clone)]
 pub struct SendablePacket {
@@ -288,10 +291,11 @@ async fn send(
     mut receiver: Receiver<TransportSendMessage>,
 ) -> Result<(), (TransportError, Receiver<TransportSendMessage>)> {
     loop {
-        let mut tasks = vec![];
+        let mut concurrent_sends: usize = 0;
+        let mut tasks = Vec::with_capacity(MAX_PACKET_BUFFER_SIZE);
         let now = Instant::now();
 
-        while now.elapsed() < Duration::from_millis(25) {
+        while now.elapsed() < Duration::from_millis(25) && concurrent_sends < MAX_CONCURRENT_SENDS {
             let remaining = Duration::from_millis(25) - now.elapsed();
             let message = match timeout(remaining, receiver.recv()).await {
                 // timeout reached
@@ -308,6 +312,7 @@ async fn send(
 
             match message {
                 TransportSendMessage::Data(buffer) => {
+                    concurrent_sends += 1;
                     tasks.push(tokio::spawn(distribute_send_to_session(buffer)))
                 }
                 TransportSendMessage::Close => {
