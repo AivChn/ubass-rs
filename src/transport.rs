@@ -39,7 +39,6 @@ use tokio::{
 /// Maximum UDP packet size in bytes (1452).
 const MAX_PACKET_SIZE: usize = 1452;
 
-const MAX_PACKET_BUFFER_SIZE: usize = 256;
 const MAX_CONCURRENT_SENDS: usize = 128;
 
 /// Packet ready for UDP transmission with metadata for error reporting and redundancy.

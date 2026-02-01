@@ -175,16 +175,6 @@ impl PacketType {
         PacketType::Control,
         PacketType::Parity,
     ];
-
-    pub fn from_bytes(byte: u8) -> Option<Self> {
-        for var in PacketType::VARIANTS {
-            if var as u8 == byte {
-                return Some(var);
-            }
-        }
-
-        None
-    }
 }
 
 impl TryFrom<u8> for PacketType {
