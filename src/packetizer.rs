@@ -49,6 +49,7 @@ pub struct Options(u16);
 #[derive(Clone, Copy)]
 pub enum OptionFlags {
     RequireAck = 0b1000,
+    SessionEncrypted = 0b1,
 }
 
 #[repr(transparent)]
@@ -58,8 +59,8 @@ pub struct SessionId(pub u64);
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, SchemaWrite, SchemaRead)]
 pub struct FecInfo {
-    batch_size: u8,
-    batch_pos: u8,
+    pub batch_size: u8,
+    pub batch_pos: u8,
 }
 
 #[repr(C)]
@@ -76,6 +77,20 @@ pub struct DataPacket {
     pub byte_range_offset: u16,            //16
     pub payload_length: u16,               // 16
     pub payload: [u8; MAX_PAYLOAD_LENGTH], // 1400
+}
+
+#[repr(C)]
+#[derive(Debug, SchemaRead, SchemaWrite)]
+pub struct ParityPacket {
+    pub version: Version, // 16
+    pub opts: Options,    // 16
+    pub packet_type_batch_id: PacketTypeFecBatchID,
+    pub fec_info: FecInfo,     // 16
+    pub session_id: SessionId, // 64
+    // encrypted
+    pub timestamp_ms: u64,                                     // 64
+    pub payload_length: u16,                                   // 16
+    pub payload: [u8; ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH], // payload includes data payload and byte range info
 }
 
 #[repr(C)]
@@ -149,8 +164,8 @@ impl Version {
     }
 
     #[inline]
-    pub const fn from_bytes(msb: u8, lsb: u8) -> Self {
-        Self((msb as u16) << 8 | lsb as u16)
+    pub const fn from_bytes(bytes: &[u8; 2]) -> Self {
+        Self((bytes[1] as u16) << 8 | bytes[0] as u16)
     }
 
     #[inline]
@@ -279,6 +294,10 @@ impl Options {
             opts.push(OptionFlags::RequireAck);
         }
 
+        if (OptionFlags::SessionEncrypted as u16) & self.0 != 0 {
+            opts.push(OptionFlags::SessionEncrypted);
+        }
+
         opts
     }
 
@@ -291,6 +310,33 @@ impl Options {
 impl DataPacket {
     pub const HEADER_SIZE: usize = size_of::<DataPacket>() - MAX_PAYLOAD_LENGTH;
     pub const MIN_SIZE: usize = DataPacket::HEADER_SIZE + 1;
+}
+
+impl ParityPacket {
+    pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH + 8;
+    pub const HEADER_SIZE: usize =
+        size_of::<ParityPacket>() - ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH;
+    pub const MIN_SIZE: usize = ParityPacket::HEADER_SIZE + 9;
+
+    pub fn new(
+        payload: [u8; Self::LOCAL_MAX_PAYLOAD_LENGTH],
+        opts: Options,
+        packet_type_batch_id: PacketTypeFecBatchID,
+        fec_info: FecInfo,
+        session_id: SessionId,
+        timestamp_ms: u64,
+    ) -> Self {
+        Self {
+            version: Version::CURRENT_VERSION,
+            opts,
+            packet_type_batch_id,
+            fec_info,
+            session_id,
+            timestamp_ms,
+            payload_length: Self::LOCAL_MAX_PAYLOAD_LENGTH as u16,
+            payload,
+        }
+    }
 }
 
 impl AckPacket {
