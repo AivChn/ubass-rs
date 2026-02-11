@@ -29,7 +29,7 @@ use crate::{
     packet_processor::{PacketId, ProcessedPacket, TransportSendMessage},
     packetizer::SessionId,
 };
-use std::{collections::HashMap, net::SocketAddr, vec};
+use std::{collections::HashMap, fmt::Debug, net::SocketAddr, vec};
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{Receiver, Sender},
