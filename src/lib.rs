@@ -1,5 +1,6 @@
 pub mod packet_processor;
 pub mod packetizer;
+pub mod serialize;
 pub mod transport;
 
 // Enum of possible internal protocol erros.

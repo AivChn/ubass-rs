@@ -10,20 +10,19 @@ use crate::{
     InternalError,
     packetizer::{
         AckPacket, ControlPacket, DataPacket, MAX_PAYLOAD_LENGTH, Options, PacketType,
-        PacketTypeFecBatchID, PacketWrapper, SessionId, Version,
+        PacketWrapper, SessionId, Version,
     },
     transport::{ReceivedPacket, TransportError},
 };
 
-mod ReedSolomonFEC {
+mod reed_solomon_fec {
     use crate::{
-        packet_processor::{Batch, FecPacket, ProcessedPacket},
-        packetizer::{DataPacket, PacketType, PacketWrapper, ParityPacket, SessionId},
+        packet_processor::{Batch, FecPacket},
+        packetizer::{DataPacket, PacketType, ParityPacket, SessionId},
     };
     use reed_solomon_simd;
-    use serde::de::value;
     use std::{
-        collections::{HashMap, HashSet, btree_map::Entry},
+        collections::{HashMap, HashSet},
         sync::LazyLock,
         time::{SystemTime, UNIX_EPOCH},
     };

@@ -6,6 +6,9 @@ use std::{
 
 use wincode::{SchemaRead, SchemaWrite};
 
+use crate::serialize::*;
+use ubass_macros::{self, PacketSerialize};
+
 // =================== DEFINITIONS =================================|
 
 pub const MAX_PAYLOAD_LENGTH: usize = 1400;
@@ -22,20 +25,14 @@ pub enum PacketWrapper {
 pub struct Version(u16);
 
 /// Enum of all possible packet types as of now
-#[derive(Clone, Copy, PartialEq, Debug, SchemaWrite, SchemaRead)]
-#[wincode(tag_encoding = "u8")]
+#[derive(PacketSerialize, Clone, Copy, PartialEq, Debug, SchemaWrite, SchemaRead)]
+#[repr(u8)]
 pub enum PacketType {
-    #[wincode(tag = 1)]
     Data = 1,
-    #[wincode(tag = 2)]
     Metadata = 2,
-    #[wincode(tag = 3)]
     Parity = 3,
-    #[wincode(tag = 4)]
     Ack = 4,
-    #[wincode(tag = 5)]
     Control = 5,
-    #[wincode(tag = 6)]
     ConnectionStat = 6,
 }
 
@@ -255,7 +252,7 @@ impl SchemaWrite for PacketTypeFecBatchID {
     fn write(writer: &mut impl wincode::io::Writer, src: &Self::Src) -> wincode::WriteResult<()> {
         let serialized = ((src.0 as u16) << 10) | (src.1 & 1023); // 1023 == 10 set bits
         writer
-            .write(&[(serialized >> 8) as u8, (serialized & 0xFF) as u8])
+            .write(&[(serialized >> 8) as u8, (serialized & 0xFF) as u8][..])
             .map_err(|err| wincode::WriteError::Io(err))
     }
 }
@@ -272,7 +269,8 @@ impl SessionId {
     }
 
     pub fn from_bytes(bytes: &[u8; 8]) -> Self {
-        let temp: u64 = wincode::deserialize(bytes).expect("8 bytes should be equal to 64 bits");
+        let temp: u64 =
+            wincode::deserialize(&bytes[..]).expect("8 bytes should be equal to 64 bits");
         Self(temp)
     }
 }

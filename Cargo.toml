@@ -8,6 +8,7 @@ name = "ubass"
 path = "src/lib.rs"
 
 [dependencies]
+ubass_macros = { path = "ubass_macros"}
 uniffi = { version = "0.31.0", features = ["cli"]}
 aes-gcm-siv = "0.11.1"
 futures = "0.3.31"
