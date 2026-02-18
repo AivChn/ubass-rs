@@ -131,7 +131,7 @@ mod reed_solomon_fec {
         };
 
         //TODO: FIX EVERYTHING
-        let parity_packets = value.iter().map(|p| ParityPacket::new(p.try_into()));
+        //let parity_packets = value.iter().map(|p| ParityPacket::new(p.try_into()));
 
         None
     }
@@ -377,6 +377,7 @@ async fn process_received_packet(
                 batch_id: pack.packet_type_batch_id.1,
                 batch_size: pack.fec_info.batch_size,
             };
+            // TODO: fix this
             fec_table
                 .entry(batch)
                 .or_insert(HashSet::from([pack.into()]))
@@ -621,21 +622,5 @@ fn deserialize(mut packet: ProcessedPacket) -> Result<PacketWrapper, PacketProce
 impl PartialEq for FecPacket {
     fn eq(&self, other: &Self) -> bool {
         self.batch_pos == other.batch_pos && self.is_data == other.is_data
-    }
-}
-
-impl Into<FecPacket> for DataPacket {
-    fn into(self) -> FecPacket {
-        if self.packet_type_batch_id.0 == PacketType::Data
-            || self.packet_type_batch_id.0 == PacketType::Parity
-        {
-            FecPacket {
-                is_data: self.packet_type_batch_id.0 == PacketType::Data,
-                batch_pos: self.fec_info.batch_pos,
-                data: self.payload,
-            }
-        } else {
-            unreachable!()
-        }
     }
 }

@@ -1,10 +1,9 @@
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream;
+use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
-    Attribute, DataStruct, DeriveInput, Field, Fields, Ident, Type,
+    Attribute, DeriveInput, Expr, ExprConst, Ident, Type, Variant,
     parse::{Parse, ParseStream},
-    punctuated::Punctuated,
 };
 
 struct SerializeAs {
@@ -61,6 +60,35 @@ fn enum_serialization(input: DeriveInput) -> TokenStream {
         panic!("No serialize attribute found");
     };
 
+    let variants: Vec<(Ident, Expr)> = match input.data {
+        syn::Data::Enum(data) => {
+            let mut counter = 1;
+            let mut last_expr: Expr = syn::parse2::<Expr>(quote! { 0 }).unwrap();
+            let mut v = vec![];
+            for variant in data.variants {
+                let ident = variant.ident;
+                let disc: Option<_> = variant.discriminant;
+                let disc = match disc {
+                    Some((_, expr)) => {
+                        counter = 1;
+                        last_expr = expr.clone();
+                        expr
+                    }
+                    None => {
+                        let x = counter;
+                        counter += 1;
+                        syn::parse2::<syn::Expr>(quote! {#last_expr + #x}).unwrap()
+                    }
+                };
+                v.push((ident, disc));
+            }
+            v
+        }
+        _ => unreachable!(),
+    };
+
+    let (variant_idents, variant_discs) = (vec![], vec![]);
+
     let ty = ty.expect("Just checked if it is none");
     let id = input.ident;
 
@@ -69,18 +97,19 @@ fn enum_serialization(input: DeriveInput) -> TokenStream {
             fn serialize(self) -> Vec<u8> {
                 (self as #ty).serialize()
             }
+
+            fn sized(&self) -> usize {
+                std::mem::size_of::<#ty>()
+            }
+        }
+
+        impl PacketDeserialize for #id {
+            fn deserialize(bytes: &[u8]) -> Option<Self> {
+
+            }
         }
     }
     .into();
-}
-
-struct NamedFields {
-    id: Vec<Ident>,
-    ty: Vec<Type>,
-}
-
-struct UnnamedField {
-    ty: Type,
 }
 
 fn struct_serialization(input: DeriveInput) -> TokenStream {
@@ -132,21 +161,19 @@ fn struct_serialization(input: DeriveInput) -> TokenStream {
                 }
             }
             syn::Fields::Unnamed(fields) => {
-                let mut v: Vec<UnnamedField> = vec![];
+                let mut v = vec![];
                 for field in fields.unnamed {
-                    v.push(UnnamedField { ty: field.ty });
+                    v.push(field);
                 }
 
                 quote! {}.into()
             }
             syn::Fields::Unit => panic!("Unit structs not supported"),
         };
-
-        return quote! {}.into();
+        TokenStream::new();
     }
 
     panic!("Somehow a non struct made it to the struct serialize function");
-    quote! {}.into()
 }
 
 #[proc_macro_derive(PacketSerialize)]

@@ -1,5 +1,3 @@
-use serde::{Deserialize, Serialize};
-
 pub trait PacketSerialize {
     fn serialize(self) -> Vec<u8>;
     fn sized(&self) -> usize;
@@ -73,3 +71,9 @@ macro_rules! impl_packet_deserialize_int {
 }
 
 impl_packet_deserialize_int!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
+
+impl PacketDeserialize for Vec<u8> {
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        Some(Vec::from(bytes))
+    }
+}
