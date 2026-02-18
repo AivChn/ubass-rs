@@ -1,48 +1,117 @@
+use std::ops::Deref;
+
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
-    Attribute, DeriveInput, Expr, ExprConst, Ident, Type, Variant,
+    DeriveInput, Expr, Type,
     parse::{Parse, ParseStream},
 };
 
 struct SerializeAs {
-    ty: Type,
+    ty: syn::Ident,
+}
+
+impl SerializeAs {
+    fn find(attrs: Vec<syn::Attribute>) -> Option<Self> {
+        attrs
+            .iter()
+            .filter(|attr| attr.path().is_ident("repr"))
+            .filter_map(|attr| attr.parse_args::<SerializeAs>().ok())
+            .next()
+    }
 }
 
 impl Parse for SerializeAs {
     fn parse(input: ParseStream) -> syn::Result<Self> {
-        _ = input.lookahead1();
-        //if input.peek(syn::Ident) {
-        //    let id: syn::Ident = input.parse()?;
-        //    if id != "as" {
-        //        return Err(input.error("expected `as`"));
-        //    }
-        //}
-
-        //input.parse::<syn::Token![=]>()?;
-
-        let ty: syn::Type = input.parse()?;
-        let syn::Type::Path(p) = &ty else {
-            return Err(input.error("Only integer types allowed"));
-        };
+        let mut idents = vec![];
+        while !input.is_empty() {
+            idents.push(input.parse::<syn::Ident>());
+            _ = input.parse::<syn::Ident>();
+            _ = input.parse::<syn::Expr>();
+            _ = input.parse::<syn::Token![,]>()?;
+        }
 
         let int_types = [
             "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
         ];
 
-        if !int_types.iter().any(|e| p.path.is_ident(e)) {
-            return Err(input.error("Only integer types allowed"));
+        let mut ty = None;
+        for res in idents {
+            let Ok(id) = res else {
+                continue;
+            };
+
+            if int_types.iter().any(|i| i == &id.to_string().as_str()) {
+                ty = Some(id);
+            }
         }
 
+        let ty = ty.unwrap();
         Ok(SerializeAs { ty })
     }
+}
+
+struct EnumRep {
+    ident: syn::Ident,
+    type_representation: Type,
+    variants: EnumVars,
+}
+
+impl EnumRep {
+    fn new(data: syn::DeriveInput) -> Option<Self> {
+        let ident = data.ident;
+
+        None
+    }
+}
+
+struct EnumVars {
+    idents: Vec<syn::Ident>,
+    values: Vec<Expr>,
+}
+
+impl EnumVars {
+    fn new(data: syn::DataEnum) -> Option<Self> {
+        let mut idents = vec![];
+        let mut values = vec![];
+
+        let mut counter = 0;
+        let mut last_expr = syn::parse2::<Expr>(quote! { 0 }).ok()?;
+        for variant in data.variants {
+            idents.push(variant.ident);
+            values.push(match variant.discriminant {
+                Some((_, expr)) => {
+                    counter = 1;
+                    last_expr = expr.clone();
+                    expr
+                }
+                None => syn::parse2(quote! { #last_expr + #counter }).ok()?,
+            });
+        }
+
+        Some(EnumVars { idents, values })
+    }
+}
+
+struct StructRep {
+    ident: syn::Ident,
+    fields: StructFields,
+}
+
+enum StructFields {
+    Named {
+        idents: Vec<syn::Ident>,
+        types: Vec<Type>,
+    },
+    UnNamed {
+        types: Vec<Type>,
+    },
 }
 
 fn enum_serialization(input: DeriveInput) -> TokenStream {
     let mut ty: Option<Type> = None;
     for attr in input.attrs {
-        let attr: Attribute = attr;
         if !attr.path().is_ident("repr") {
             continue;
         }
@@ -67,8 +136,7 @@ fn enum_serialization(input: DeriveInput) -> TokenStream {
             let mut v = vec![];
             for variant in data.variants {
                 let ident = variant.ident;
-                let disc: Option<_> = variant.discriminant;
-                let disc = match disc {
+                let disc = match variant.discriminant {
                     Some((_, expr)) => {
                         counter = 1;
                         last_expr = expr.clone();
@@ -86,8 +154,6 @@ fn enum_serialization(input: DeriveInput) -> TokenStream {
         }
         _ => unreachable!(),
     };
-
-    let (variant_idents, variant_discs) = (vec![], vec![]);
 
     let ty = ty.expect("Just checked if it is none");
     let id = input.ident;
