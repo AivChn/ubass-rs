@@ -1,13 +1,7 @@
 use std::{
     fmt::Display,
     time::{SystemTime, UNIX_EPOCH},
-    usize,
 };
-
-use wincode::{SchemaRead, SchemaWrite};
-
-use crate::serialize::*;
-use ubass_macros::{self, PacketSerialize};
 
 // =================== DEFINITIONS =================================|
 
@@ -20,12 +14,12 @@ pub enum PacketWrapper {
     ControlPacket(ControlPacket),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialOrd, Ord, PartialEq, SchemaWrite, SchemaRead)]
+#[derive(Debug, Clone, Copy, Eq, PartialOrd, Ord, PartialEq)]
 #[repr(transparent)]
 pub struct Version(u16);
 
 /// Enum of all possible packet types as of now
-#[derive(PacketSerialize, Clone, Copy, PartialEq, Debug, SchemaWrite, SchemaRead)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 #[repr(u8)]
 pub enum PacketType {
     Data = 1,
@@ -39,29 +33,29 @@ pub enum PacketType {
 #[derive(Debug, Clone, Copy)]
 pub struct PacketTypeFecBatchID(pub PacketType, pub u16);
 
+#[derive(Debug, PartialEq)]
 #[repr(transparent)]
-#[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
 pub struct Options(u16);
 
 #[derive(Clone, Copy)]
 pub enum OptionFlags {
-    RequireAck = 0b1000,
-    SessionEncrypted = 0b1,
+    SessionEncrypted = 1 << 0,
+    RequireAck = 1 << 1,
 }
 
 #[repr(transparent)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy, SchemaWrite, SchemaRead)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct SessionId(pub u64);
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, SchemaWrite, SchemaRead)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FecInfo {
     pub batch_size: u8,
     pub batch_pos: u8,
 }
 
 #[repr(C)]
-#[derive(Debug, SchemaRead, SchemaWrite)]
+#[derive(Debug)]
 pub struct DataPacket {
     pub version: Version, // 16
     pub opts: Options,    // 16
@@ -69,15 +63,15 @@ pub struct DataPacket {
     pub fec_info: FecInfo,     // 16
     pub session_id: SessionId, // 64
     // encrypted
-    pub timestamp_ms: u64,                 // 64
-    pub byte_range_start: u32,             //32
-    pub byte_range_offset: u16,            //16
-    pub payload_length: u16,               // 16
-    pub payload: [u8; MAX_PAYLOAD_LENGTH], // 1400
+    pub timestamp_ms: u64,                      // 64
+    pub byte_range_start: u32,                  //32
+    pub byte_range_offset: u16,                 //16
+    pub payload_length: u16,                    // 16
+    pub payload: Box<[u8; MAX_PAYLOAD_LENGTH]>, // 1400
 }
 
 #[repr(C)]
-#[derive(Debug, SchemaRead, SchemaWrite)]
+#[derive(Debug)]
 pub struct ParityPacket {
     pub version: Version, // 16
     pub opts: Options,    // 16
@@ -85,13 +79,13 @@ pub struct ParityPacket {
     pub fec_info: FecInfo,     // 16
     pub session_id: SessionId, // 64
     // encrypted
-    pub timestamp_ms: u64,                                     // 64
-    pub payload_length: u16,                                   // 16
-    pub payload: [u8; ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH], // payload includes data payload and byte range info
+    pub timestamp_ms: u64,                                          // 64
+    pub payload_length: u16,                                        // 16
+    pub payload: Box<[u8; ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH]>, // payload includes data payload and byte range inf o
 }
 
 #[repr(C)]
-#[derive(Debug, PartialEq, SchemaWrite, SchemaRead)]
+#[derive(Debug, PartialEq)]
 pub struct AckPacket {
     pub version: Version,
     pub opts: Options,
@@ -105,8 +99,7 @@ pub struct AckPacket {
     pub ack_packet_type: PacketType,
 }
 
-#[derive(Debug, PartialEq, SchemaRead, SchemaWrite)]
-#[wincode(tag_encoding = "u8")]
+#[derive(Debug, PartialEq)]
 pub enum ControlType {
     Hello,
     Retransmit,
@@ -120,7 +113,7 @@ pub enum ControlType {
 }
 
 #[repr(C)]
-#[derive(Debug, PartialEq, SchemaWrite, SchemaRead)]
+#[derive(Debug, PartialEq)]
 pub struct ControlPacket {
     pub version: Version,
     pub opts: Options,
@@ -131,7 +124,7 @@ pub struct ControlPacket {
     // encrypted
     pub timestamp_ms: u64,
     pub payload_length: u16,
-    pub payload: [u8; MAX_PAYLOAD_LENGTH],
+    pub payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
 }
 
 // ===================== IMPLEMENTATIONS ===================================|
@@ -192,7 +185,7 @@ impl PacketType {
 impl TryFrom<u8> for PacketType {
     type Error = ();
 
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
+    fn try_from(value: u8) -> Result<Self, ()> {
         if let Some(val) = PacketType::VARIANTS
             .iter()
             .filter(|x| (**x as u8) == value)
@@ -206,56 +199,6 @@ impl TryFrom<u8> for PacketType {
     }
 }
 
-impl<'de> SchemaRead<'de> for PacketTypeFecBatchID {
-    type Dst = PacketTypeFecBatchID;
-
-    const TYPE_META: wincode::TypeMeta = wincode::TypeMeta::Static {
-        size: 2,
-        zero_copy: false,
-    };
-
-    fn read(
-        reader: &mut impl wincode::io::Reader<'de>,
-        dst: &mut std::mem::MaybeUninit<Self::Dst>,
-    ) -> wincode::ReadResult<()> {
-        let Ok(bytes) = reader.fill_array::<2>() else {
-            return Err(wincode::ReadError::LengthEncodingOverflow(
-                "not enough bytes to get type and batch ID",
-            ));
-        };
-
-        let Ok(packet_type) = PacketType::try_from((bytes[0] & 0xFC) >> 2) else {
-            return Err(wincode::ReadError::InvalidCharLead(bytes[0]));
-        };
-
-        let batch_id = (((bytes[0] & 3) as u16) << 8) | bytes[1] as u16;
-
-        dst.write(PacketTypeFecBatchID(packet_type, batch_id));
-
-        Ok(())
-    }
-}
-
-impl SchemaWrite for PacketTypeFecBatchID {
-    type Src = PacketTypeFecBatchID;
-
-    const TYPE_META: wincode::TypeMeta = wincode::TypeMeta::Static {
-        size: 2,
-        zero_copy: false,
-    };
-
-    fn size_of(src: &Self::Src) -> wincode::WriteResult<usize> {
-        _ = src;
-        Ok(2)
-    }
-
-    fn write(writer: &mut impl wincode::io::Writer, src: &Self::Src) -> wincode::WriteResult<()> {
-        let serialized = ((src.0 as u16) << 10) | (src.1 & 1023); // 1023 == 10 set bits
-        writer
-            .write(&[(serialized >> 8) as u8, (serialized & 0xFF) as u8][..])
-            .map_err(|err| wincode::WriteError::Io(err))
-    }
-}
 impl SessionId {
     pub fn new() -> Self {
         Self(
@@ -266,12 +209,6 @@ impl SessionId {
                 * 32413245
                 % 324987645983276514357846239847) as u64,
         )
-    }
-
-    pub fn from_bytes(bytes: &[u8; 8]) -> Self {
-        let temp: u64 =
-            wincode::deserialize(&bytes[..]).expect("8 bytes should be equal to 64 bits");
-        Self(temp)
     }
 }
 
@@ -306,14 +243,15 @@ impl Options {
 }
 
 impl DataPacket {
-    pub const HEADER_SIZE: usize = size_of::<DataPacket>() - MAX_PAYLOAD_LENGTH;
+    pub const HEADER_SIZE: usize =
+        size_of::<DataPacket>() - size_of::<Box<[u8; MAX_PAYLOAD_LENGTH]>>();
     pub const MIN_SIZE: usize = DataPacket::HEADER_SIZE + 1;
 }
 
 impl ParityPacket {
     pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH + 8;
     pub const HEADER_SIZE: usize =
-        size_of::<ParityPacket>() - ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH;
+        size_of::<ParityPacket>() - size_of::<Box<[u8; ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH]>>();
     pub const MIN_SIZE: usize = ParityPacket::HEADER_SIZE + 9;
 
     pub fn new(
@@ -332,7 +270,7 @@ impl ParityPacket {
             session_id,
             timestamp_ms,
             payload_length: Self::LOCAL_MAX_PAYLOAD_LENGTH as u16,
-            payload,
+            payload: Box::new(payload),
         }
     }
 }
@@ -343,6 +281,7 @@ impl AckPacket {
 }
 
 impl ControlPacket {
-    pub const HEADER_SIZE: usize = size_of::<ControlPacket>() - MAX_PAYLOAD_LENGTH;
+    pub const HEADER_SIZE: usize =
+        size_of::<ControlPacket>() - size_of::<Box<[u8; MAX_PAYLOAD_LENGTH]>>();
     pub const MIN_SIZE: usize = ControlPacket::HEADER_SIZE + 1;
 }
