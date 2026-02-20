@@ -1,10 +1,8 @@
-use std::ops::Deref;
-
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
 use syn::{
-    DeriveInput, Expr, Type,
+    DataStruct, DeriveInput, Expr, Type, Variant,
     parse::{Parse, ParseStream},
 };
 
@@ -54,15 +52,26 @@ impl Parse for SerializeAs {
 
 struct EnumRep {
     ident: syn::Ident,
-    type_representation: Type,
+    type_representation: syn::Ident,
     variants: EnumVars,
 }
 
 impl EnumRep {
     fn new(data: syn::DeriveInput) -> Option<Self> {
         let ident = data.ident;
+        let SerializeAs {
+            ty: type_representation,
+        } = SerializeAs::find(data.attrs)?;
+        let syn::Data::Enum(enum_data) = data.data else {
+            return None;
+        };
+        let variants: EnumVars = EnumVars::new(enum_data)?;
 
-        None
+        Some(EnumRep {
+            ident,
+            type_representation,
+            variants,
+        })
     }
 }
 
@@ -99,6 +108,18 @@ struct StructRep {
     fields: StructFields,
 }
 
+impl StructRep {
+    fn new(data: syn::DeriveInput) -> Option<Self> {
+        let ident = data.ident;
+        let syn::Data::Struct(struct_data) = data.data else {
+            return None;
+        };
+        let fields = StructFields::new(struct_data)?;
+
+        Some(Self { ident, fields })
+    }
+}
+
 enum StructFields {
     Named {
         idents: Vec<syn::Ident>,
@@ -109,8 +130,60 @@ enum StructFields {
     },
 }
 
+impl StructFields {
+    fn new(data: DataStruct) -> Option<Self> {
+        match data.fields {
+            syn::Fields::Named(fields) => {
+                let mut idents = vec![];
+                let mut types = vec![];
+
+                for field in fields.named {
+                    idents.push(field.ident?);
+                    types.push(field.ty);
+                }
+
+                Some(Self::Named { idents, types })
+            }
+            syn::Fields::Unnamed(fields) => {
+                let mut types = vec![];
+
+                for field in fields.unnamed {
+                    types.push(field.ty);
+                }
+
+                Some(Self::UnNamed { types })
+            }
+            syn::Fields::Unit => None,
+        }
+    }
+}
+
+fn enum_ser(input: DeriveInput) -> TokenStream {
+    let EnumRep {
+        ident,
+        type_representation,
+        variants
+    } = EnumRep::new(input).expect("Could not parse Enum");
+
+    let serialize_impl = quote! {
+        impl PacketSerialize for #ident {
+            fn serialize(self) -> Vec<u8> {
+                vec![self as #type_representation]
+            }
+        }
+    }
+
+    quote! {}.into()
+}
+
+fn struct_ser(input: DeriveInput) -> TokenStream {
+    let data = StructRep::new(input).expect("Could not parse Struct");
+
+    quote! {}.into()
+}
+
 fn enum_serialization(input: DeriveInput) -> TokenStream {
-    let mut ty: Option<Type> = None;
+    let mut ty: Option<syn::Ident> = None;
     for attr in input.attrs {
         if !attr.path().is_ident("repr") {
             continue;
@@ -129,7 +202,7 @@ fn enum_serialization(input: DeriveInput) -> TokenStream {
         panic!("No serialize attribute found");
     };
 
-    let variants: Vec<(Ident, Expr)> = match input.data {
+    let variants: Vec<(syn::Ident, Expr)> = match input.data {
         syn::Data::Enum(data) => {
             let mut counter = 1;
             let mut last_expr: Expr = syn::parse2::<Expr>(quote! { 0 }).unwrap();
@@ -183,7 +256,7 @@ fn struct_serialization(input: DeriveInput) -> TokenStream {
     if let syn::Data::Struct(struct_data) = input.data {
         match struct_data.fields {
             syn::Fields::Named(fields) => {
-                let mut id: Vec<Ident> = vec![];
+                let mut id: Vec<syn::Ident> = vec![];
                 let mut ty: Vec<Type> = vec![];
                 for field in fields.named {
                     id.push(field.ident.unwrap());
