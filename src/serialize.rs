@@ -1,5 +1,5 @@
 pub trait PacketSerialize {
-    fn serialize(self) -> Vec<u8>;
+    fn serialize(&self, buf: &mut [u8]) -> bool;
     fn sized(&self) -> usize;
 }
 
@@ -7,8 +7,15 @@ macro_rules! impl_packet_serialize_int {
     ($($t:ty),*) => {
         $(
             impl PacketSerialize for $t {
-                fn serialize(self) -> Vec<u8> {
-                    self.to_be_bytes().to_vec()
+                #[inline]
+                fn serialize(&self, buf: &mut [u8]) -> bool {
+                    let size = std::mem::size_of::<$t>();
+                    if buf.len() < size {
+                        false
+                    } else {
+                        buf[..size].copy_from_slice(&self.to_be_bytes());
+                        true
+                    }
                 }
 
                 #[inline]
@@ -23,8 +30,13 @@ macro_rules! impl_packet_serialize_int {
 impl_packet_serialize_int!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
 
 impl PacketSerialize for Vec<u8> {
-    fn serialize(self) -> Vec<u8> {
-        self
+    fn serialize(&self, buf: &mut [u8]) -> bool {
+        if buf.len() < self.len() {
+            false
+        } else {
+            buf.copy_from_slice(&self);
+            true
+        }
     }
 
     #[inline]
@@ -34,8 +46,15 @@ impl PacketSerialize for Vec<u8> {
 }
 
 impl<T: PacketSerialize + Copy, const N: usize> PacketSerialize for [T; N] {
-    fn serialize(self) -> Vec<u8> {
-        self.iter().flat_map(|e| e.serialize()).collect()
+    fn serialize(&self, buf: &mut [u8]) -> bool {
+        if buf.len() < N * self[0].sized() {
+            false
+        } else {
+            self.iter()
+                .enumerate()
+                .map(|(i, t)| t.serialize(&mut buf[i..]))
+                .all(|e| e)
+        }
     }
 
     #[inline]
@@ -45,8 +64,15 @@ impl<T: PacketSerialize + Copy, const N: usize> PacketSerialize for [T; N] {
 }
 
 impl<T: PacketSerialize + Copy, const N: usize> PacketSerialize for Box<[T; N]> {
-    fn serialize(self) -> Vec<u8> {
-        self.iter().flat_map(|e| e.serialize()).collect()
+    fn serialize(&self, buf: &mut [u8]) -> bool {
+        if buf.len() < N * self[0].sized() {
+            false
+        } else {
+            self.iter()
+                .enumerate()
+                .map(|(i, t)| t.serialize(&mut buf[(i * self[0].sized())..]))
+                .all(|e| e)
+        }
     }
 
     fn sized(&self) -> usize {
@@ -54,7 +80,7 @@ impl<T: PacketSerialize + Copy, const N: usize> PacketSerialize for Box<[T; N]> 
     }
 }
 
-trait PacketDeserialize: Sized {
+pub trait PacketDeserialize: Sized {
     fn deserialize(bytes: &[u8]) -> Option<Self>;
 }
 

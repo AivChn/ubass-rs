@@ -3,6 +3,9 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::serialize::PacketSerialize;
+use ubass_macros::PacketSerialize;
+
 // =================== DEFINITIONS =================================|
 
 pub const MAX_PAYLOAD_LENGTH: usize = 1400;
@@ -14,13 +17,13 @@ pub enum PacketWrapper {
     ControlPacket(ControlPacket),
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialOrd, Ord, PartialEq)]
+#[derive(PacketSerialize, Debug, Clone, Copy, Eq, PartialOrd, Ord, PartialEq)]
 #[repr(transparent)]
 pub struct Version(u16);
 
 /// Enum of all possible packet types as of now
-#[derive(Clone, Copy, PartialEq, Debug)]
-#[repr(u8)]
+#[derive(PacketSerialize, Clone, Copy, PartialEq, Debug)]
+#[repr(u16)]
 pub enum PacketType {
     Data = 1,
     Metadata = 2,
@@ -30,32 +33,33 @@ pub enum PacketType {
     ConnectionStat = 6,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(PacketSerialize, Debug, Clone, Copy)]
 pub struct PacketTypeFecBatchID(pub PacketType, pub u16);
 
-#[derive(Debug, PartialEq)]
+#[derive(PacketSerialize, Debug, PartialEq)]
 #[repr(transparent)]
 pub struct Options(u16);
 
 #[derive(Clone, Copy)]
+#[repr(u8)]
 pub enum OptionFlags {
     SessionEncrypted = 1 << 0,
     RequireAck = 1 << 1,
 }
 
 #[repr(transparent)]
-#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(PacketSerialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct SessionId(pub u64);
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(PacketSerialize, Clone, Copy, Debug, PartialEq)]
 pub struct FecInfo {
     pub batch_size: u8,
     pub batch_pos: u8,
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(PacketSerialize, Debug)]
 pub struct DataPacket {
     pub version: Version, // 16
     pub opts: Options,    // 16
@@ -71,7 +75,7 @@ pub struct DataPacket {
 }
 
 #[repr(C)]
-#[derive(Debug)]
+#[derive(PacketSerialize, Debug)]
 pub struct ParityPacket {
     pub version: Version, // 16
     pub opts: Options,    // 16
@@ -85,7 +89,7 @@ pub struct ParityPacket {
 }
 
 #[repr(C)]
-#[derive(Debug, PartialEq)]
+#[derive(PacketSerialize, Debug, PartialEq)]
 pub struct AckPacket {
     pub version: Version,
     pub opts: Options,
@@ -99,7 +103,8 @@ pub struct AckPacket {
     pub ack_packet_type: PacketType,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(PacketSerialize, Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
 pub enum ControlType {
     Hello,
     Retransmit,
@@ -113,7 +118,7 @@ pub enum ControlType {
 }
 
 #[repr(C)]
-#[derive(Debug, PartialEq)]
+#[derive(PacketSerialize, Debug, PartialEq)]
 pub struct ControlPacket {
     pub version: Version,
     pub opts: Options,

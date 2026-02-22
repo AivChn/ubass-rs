@@ -1,8 +1,10 @@
-use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
+use core::panic;
+use std::vec;
+
+use proc_macro::{Ident, TokenStream};
 use quote::quote;
 use syn::{
-    DataStruct, DeriveInput, Expr, Type, Variant,
+    DataStruct, DeriveInput, Expr,
     parse::{Parse, ParseStream},
 };
 
@@ -25,9 +27,6 @@ impl Parse for SerializeAs {
         let mut idents = vec![];
         while !input.is_empty() {
             idents.push(input.parse::<syn::Ident>());
-            _ = input.parse::<syn::Ident>();
-            _ = input.parse::<syn::Expr>();
-            _ = input.parse::<syn::Token![,]>()?;
         }
 
         let int_types = [
@@ -53,7 +52,7 @@ impl Parse for SerializeAs {
 struct EnumRep {
     ident: syn::Ident,
     type_representation: syn::Ident,
-    variants: EnumVars,
+    variants: Vec<(syn::Ident, Expr)>,
 }
 
 impl EnumRep {
@@ -61,11 +60,11 @@ impl EnumRep {
         let ident = data.ident;
         let SerializeAs {
             ty: type_representation,
-        } = SerializeAs::find(data.attrs)?;
+        } = SerializeAs::find(data.attrs).expect("Failed to find repr type attribute");
         let syn::Data::Enum(enum_data) = data.data else {
             return None;
         };
-        let variants: EnumVars = EnumVars::new(enum_data)?;
+        let variants = enum_variants(enum_data)?;
 
         Some(EnumRep {
             ident,
@@ -75,32 +74,26 @@ impl EnumRep {
     }
 }
 
-struct EnumVars {
-    idents: Vec<syn::Ident>,
-    values: Vec<Expr>,
-}
+fn enum_variants(data: syn::DataEnum) -> Option<Vec<(syn::Ident, Expr)>> {
+    let mut variants = vec![];
 
-impl EnumVars {
-    fn new(data: syn::DataEnum) -> Option<Self> {
-        let mut idents = vec![];
-        let mut values = vec![];
+    let mut counter = 0;
+    let mut last_expr = syn::parse2::<Expr>(quote! { 0 }).ok()?;
+    for variant in data.variants {
+        let ident = variant.ident;
+        let value = match variant.discriminant {
+            Some((_, expr)) => {
+                counter = 1;
+                last_expr = expr.clone();
+                expr
+            }
+            None => syn::parse2(quote! { #last_expr + #counter }).ok()?,
+        };
 
-        let mut counter = 0;
-        let mut last_expr = syn::parse2::<Expr>(quote! { 0 }).ok()?;
-        for variant in data.variants {
-            idents.push(variant.ident);
-            values.push(match variant.discriminant {
-                Some((_, expr)) => {
-                    counter = 1;
-                    last_expr = expr.clone();
-                    expr
-                }
-                None => syn::parse2(quote! { #last_expr + #counter }).ok()?,
-            });
-        }
-
-        Some(EnumVars { idents, values })
+        variants.push((ident, value));
     }
+
+    Some(variants)
 }
 
 struct StructRep {
@@ -121,13 +114,8 @@ impl StructRep {
 }
 
 enum StructFields {
-    Named {
-        idents: Vec<syn::Ident>,
-        types: Vec<Type>,
-    },
-    UnNamed {
-        types: Vec<Type>,
-    },
+    Named { idents: Vec<syn::Ident> },
+    UnNamed { length: usize },
 }
 
 impl StructFields {
@@ -135,197 +123,177 @@ impl StructFields {
         match data.fields {
             syn::Fields::Named(fields) => {
                 let mut idents = vec![];
-                let mut types = vec![];
 
                 for field in fields.named {
                     idents.push(field.ident?);
-                    types.push(field.ty);
                 }
 
-                Some(Self::Named { idents, types })
+                Some(Self::Named { idents })
             }
-            syn::Fields::Unnamed(fields) => {
-                let mut types = vec![];
-
-                for field in fields.unnamed {
-                    types.push(field.ty);
-                }
-
-                Some(Self::UnNamed { types })
-            }
+            syn::Fields::Unnamed(fields) => Some(Self::UnNamed {
+                length: fields.unnamed.len(),
+            }),
             syn::Fields::Unit => None,
         }
     }
 }
 
-fn enum_ser(input: DeriveInput) -> TokenStream {
-    let EnumRep {
-        ident,
-        type_representation,
-        variants
-    } = EnumRep::new(input).expect("Could not parse Enum");
+struct ReprC(bool);
 
-    let serialize_impl = quote! {
-        impl PacketSerialize for #ident {
-            fn serialize(self) -> Vec<u8> {
-                vec![self as #type_representation]
-            }
+impl Parse for ReprC {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        let mut v = vec![];
+        while !input.is_empty() {
+            v.push(input.parse::<syn::Ident>()?);
+            _ = input.parse::<syn::Token![,]>();
         }
-    }
 
-    quote! {}.into()
+        Ok(Self(v.iter().any(|e| "C" == e.to_string().as_str())))
+    }
 }
 
-fn struct_ser(input: DeriveInput) -> TokenStream {
-    let data = StructRep::new(input).expect("Could not parse Struct");
-
-    quote! {}.into()
+fn is_repr_c_found(attrs: &Vec<syn::Attribute>) -> bool {
+    attrs.iter().any(|e| {
+        if e.path().is_ident("repr") {
+            e.parse_args::<ReprC>().expect("Failed to find idents").0
+        } else {
+            false
+        }
+    })
 }
 
 fn enum_serialization(input: DeriveInput) -> TokenStream {
-    let mut ty: Option<syn::Ident> = None;
-    for attr in input.attrs {
-        if !attr.path().is_ident("repr") {
-            continue;
-        }
+    let EnumRep {
+        ident,
+        type_representation,
+        variants: _,
+    } = EnumRep::new(input).unwrap();
 
-        match attr.parse_args::<SerializeAs>() {
-            Ok(ser) => {
-                ty = Some(ser.ty);
-                break;
-            }
-            Err(e) => panic!("{}", e.to_string()),
-        }
-    }
-
-    if ty.is_none() {
-        panic!("No serialize attribute found");
-    };
-
-    let variants: Vec<(syn::Ident, Expr)> = match input.data {
-        syn::Data::Enum(data) => {
-            let mut counter = 1;
-            let mut last_expr: Expr = syn::parse2::<Expr>(quote! { 0 }).unwrap();
-            let mut v = vec![];
-            for variant in data.variants {
-                let ident = variant.ident;
-                let disc = match variant.discriminant {
-                    Some((_, expr)) => {
-                        counter = 1;
-                        last_expr = expr.clone();
-                        expr
-                    }
-                    None => {
-                        let x = counter;
-                        counter += 1;
-                        syn::parse2::<syn::Expr>(quote! {#last_expr + #x}).unwrap()
-                    }
-                };
-                v.push((ident, disc));
-            }
-            v
-        }
-        _ => unreachable!(),
-    };
-
-    let ty = ty.expect("Just checked if it is none");
-    let id = input.ident;
-
-    return quote! {
-        impl PacketSerialize for #id {
-            fn serialize(self) -> Vec<u8> {
-                (self as #ty).serialize()
+    quote! {
+        impl PacketSerialize for #ident {
+            fn serialize(&self, buf: &mut [u8]) -> bool {
+                if buf.len() < self.sized() {
+                    false
+                } else {
+                    (*self as #type_representation).serialize(buf)
+                }
             }
 
+            #[inline]
             fn sized(&self) -> usize {
-                std::mem::size_of::<#ty>()
-            }
-        }
-
-        impl PacketDeserialize for #id {
-            fn deserialize(bytes: &[u8]) -> Option<Self> {
-
+                std::mem::size_of::<#type_representation>()
             }
         }
     }
-    .into();
+    .into()
 }
 
 fn struct_serialization(input: DeriveInput) -> TokenStream {
-    let ident = input.ident;
-    if let syn::Data::Struct(struct_data) = input.data {
-        match struct_data.fields {
-            syn::Fields::Named(fields) => {
-                let mut id: Vec<syn::Ident> = vec![];
-                let mut ty: Vec<Type> = vec![];
-                for field in fields.named {
-                    id.push(field.ident.unwrap());
-                    ty.push(field.ty);
-                }
+    let attrs = &input.attrs.clone();
+    let StructRep { ident, fields } = StructRep::new(input).expect("Could not parse Struct");
 
-                let size_expr = ty
-                    .iter()
-                    .map(|t| {
-                        quote! { #t.sized() }
-                    })
-                    .reduce(|acc, expr| {
-                        quote! {#acc + #expr}
-                    })
-                    .unwrap();
+    let (struct_size, serialize_logic) = match fields {
+        StructFields::Named { idents } => {
+            let mut struct_size = quote! { 0 };
+            let mut serialize_logic = vec![];
 
-                let serialize_fields = id.iter().map(|i| {
-                    quote! { tmp.extend(self.#i.serialize()); }
-                });
+            if !is_repr_c_found(attrs) {
+                panic!("Struct must be repr(C) to be serialized");
+            }
 
-                quote! {
-                    impl PacketSerialize for #ident {
-                        fn serialize(self) -> Vec<u8> {
-                            let mut tmp = Vec::with_capacity(
-                                    #size_expr
-                                );
-                            #(#serialize_fields)*
-                            tmp
-                        }
+            for i in idents {
+                serialize_logic.push(quote! { self.#i.serialize(&mut buf[(#struct_size)..]); });
+                struct_size = quote! { #struct_size + self.#i.sized() };
+            }
 
-                        fn sized(&self) -> usize {
-                            #size_expr
-                        }
-                    }
+            (struct_size, serialize_logic)
+        }
+        StructFields::UnNamed { length } => {
+            let mut struct_size = quote! { 0 };
+            let mut serialize_logic = vec![];
 
-                    impl PacketDeserialize for #ident {
-                        fn deserialize(bytes: &[u8]) -> Option<Self> {
-                            // TODO: finish this
-                        }
-                    }
+            for i in 0..length {
+                let index = syn::Index::from(i);
+                serialize_logic.push(quote! { self.#index.serialize(&mut buf[(#struct_size)..]); });
+                struct_size = quote! { #struct_size + self.#index.sized() };
+            }
+
+            (struct_size, serialize_logic)
+        }
+    };
+
+    quote! {
+        impl PacketSerialize for #ident {
+            fn serialize(&self, buf: &mut [u8]) -> bool {
+                if buf.len() < self.sized() {
+                    false
+                } else {
+                    #(#serialize_logic)*
+                    true
                 }
             }
-            syn::Fields::Unnamed(fields) => {
-                let mut v = vec![];
-                for field in fields.unnamed {
-                    v.push(field);
-                }
 
-                quote! {}.into()
+            #[inline]
+            fn sized(&self) -> usize {
+                #struct_size
             }
-            syn::Fields::Unit => panic!("Unit structs not supported"),
-        };
-        TokenStream::new();
+        }
     }
-
-    panic!("Somehow a non struct made it to the struct serialize function");
+    .into()
 }
 
 #[proc_macro_derive(PacketSerialize)]
 pub fn serialize_derive_macro(item: TokenStream) -> TokenStream {
     match syn::parse::<DeriveInput>(item) {
-        Ok(input) => {
-            let input: DeriveInput = input;
-            match input.data {
-                syn::Data::Enum(_) => enum_serialization(input),
-                syn::Data::Struct(_) => struct_serialization(input),
-                syn::Data::Union(_) => panic!("Unions not supported"),
+        Ok(input) => match input.data {
+            syn::Data::Enum(_) => enum_serialization(input),
+            syn::Data::Struct(_) => struct_serialization(input),
+            syn::Data::Union(_) => panic!("Unions not supported"),
+        },
+        Err(e) => panic!("{}", e.to_string()),
+    }
+}
+
+fn enum_deserialization(input: DeriveInput) -> TokenStream {
+    let EnumRep {
+        ident,
+        type_representation,
+        variants,
+    } = EnumRep::new(input).expect("Could not parse Enum");
+
+    let match_arms: Vec<_> = variants
+        .iter()
+        .map(|(i, e)| quote! { (#e) => Self::#i, })
+        .collect();
+
+    quote! {
+        impl PacketDeserialize for #ident {
+            fn deserialize(self, bytes: &[u8]) -> Option<Self> {
+                let tmp = <#type_representation>::from_be_bytes(bytes.get(..std::mem::size_of<#type_representation>())?.try_into().ok()?);
+
+                match tmp {
+                    #(#match_arms)*
+                    _ => None
+                }
             }
         }
+    }.into()
+}
+
+fn struct_derserialization(input: DeriveInput) -> TokenStream {
+    let StructRep { ident, fields } = StructRep::new(input).expect("Could not parse Struct");
+
+    quote! {}.into()
+}
+
+#[proc_macro_derive(PacketDeserialize)]
+pub fn deserialize_derive_macro(item: TokenStream) -> TokenStream {
+    match syn::parse::<DeriveInput>(item) {
+        Ok(input) => match input.data {
+            syn::Data::Struct(_) => todo!(),
+            syn::Data::Enum(_) => enum_deserialization(input),
+            syn::Data::Union(_) => panic!("unions are not supported"),
+        },
         Err(e) => panic!("{}", e.to_string()),
     }
 }
