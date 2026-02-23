@@ -1,10 +1,10 @@
 use core::panic;
-use std::vec;
+use std::{fmt::write, vec};
 
 use proc_macro::{Ident, TokenStream};
 use quote::quote;
 use syn::{
-    DataStruct, DeriveInput, Expr,
+    DataStruct, DeriveInput, Expr, Type,
     parse::{Parse, ParseStream},
 };
 
@@ -114,8 +114,13 @@ impl StructRep {
 }
 
 enum StructFields {
-    Named { idents: Vec<syn::Ident> },
-    UnNamed { length: usize },
+    Named {
+        idents: Vec<syn::Ident>,
+        types: Vec<syn::Type>,
+    },
+    UnNamed {
+        types: Vec<Type>,
+    },
 }
 
 impl StructFields {
@@ -123,16 +128,24 @@ impl StructFields {
         match data.fields {
             syn::Fields::Named(fields) => {
                 let mut idents = vec![];
+                let mut types = vec![];
 
                 for field in fields.named {
                     idents.push(field.ident?);
+                    types.push(field.ty);
                 }
 
-                Some(Self::Named { idents })
+                Some(Self::Named { idents, types })
             }
-            syn::Fields::Unnamed(fields) => Some(Self::UnNamed {
-                length: fields.unnamed.len(),
-            }),
+            syn::Fields::Unnamed(fields) => {
+                let mut types = vec![];
+
+                for field in fields.unnamed {
+                    types.push(field.ty);
+                }
+
+                Some(Self::UnNamed { types })
+            }
             syn::Fields::Unit => None,
         }
     }
@@ -193,7 +206,7 @@ fn struct_serialization(input: DeriveInput) -> TokenStream {
     let StructRep { ident, fields } = StructRep::new(input).expect("Could not parse Struct");
 
     let (struct_size, serialize_logic) = match fields {
-        StructFields::Named { idents } => {
+        StructFields::Named { idents, types: _ } => {
             let mut struct_size = quote! { 0 };
             let mut serialize_logic = vec![];
 
@@ -208,11 +221,11 @@ fn struct_serialization(input: DeriveInput) -> TokenStream {
 
             (struct_size, serialize_logic)
         }
-        StructFields::UnNamed { length } => {
+        StructFields::UnNamed { types } => {
             let mut struct_size = quote! { 0 };
             let mut serialize_logic = vec![];
 
-            for i in 0..length {
+            for i in 0..types.len() {
                 let index = syn::Index::from(i);
                 serialize_logic.push(quote! { self.#index.serialize(&mut buf[(#struct_size)..]); });
                 struct_size = quote! { #struct_size + self.#index.sized() };
@@ -261,36 +274,82 @@ fn enum_deserialization(input: DeriveInput) -> TokenStream {
         variants,
     } = EnumRep::new(input).expect("Could not parse Enum");
 
-    let match_arms: Vec<_> = variants
+    let if_statements: Vec<_> = variants
         .iter()
-        .map(|(i, e)| quote! { (#e) => Self::#i, })
+        .map(|(i, e)| quote! { if tmp == (#e as #type_representation) { Some(Self::#i) } else })
         .collect();
 
     quote! {
         impl PacketDeserialize for #ident {
-            fn deserialize(self, bytes: &[u8]) -> Option<Self> {
-                let tmp = <#type_representation>::from_be_bytes(bytes.get(..std::mem::size_of<#type_representation>())?.try_into().ok()?);
+            fn deserialize(bytes: &[u8]) -> Option<Self> {
+                let tmp = <#type_representation>::deserialize(bytes)?;
 
-                match tmp {
-                    #(#match_arms)*
-                    _ => None
+                #(#if_statements)* {
+                    None
                 }
             }
         }
-    }.into()
+    }
+    .into()
 }
 
 fn struct_derserialization(input: DeriveInput) -> TokenStream {
     let StructRep { ident, fields } = StructRep::new(input).expect("Could not parse Struct");
 
-    quote! {}.into()
+    // #ident: #value,
+
+    let return_stmt = match fields {
+        StructFields::Named { idents, types } => {
+            let mut size_acc = quote! { 0 };
+            let mut res = vec![];
+
+            for (i, t) in std::iter::zip(idents, types) {
+                size_acc = quote! { #size_acc + std::mem::size_of::<#t>() };
+                res.push(quote! { #i: <#t>::deserialize(&bytes[(#size_acc)..])?, });
+            }
+
+            quote! {
+                Self {
+                    #(#res)*
+                }
+            }
+        }
+        StructFields::UnNamed { types } => {
+            let mut size_acc = quote! { 0 };
+            let mut res = vec![];
+
+            for t in types {
+                size_acc = quote! { #size_acc + std::mem::size_of::<#t>() };
+                res.push(quote! { <#t>::deserialize(&bytes[(#size_acc)..])?, });
+            }
+
+            quote! {
+                Self(
+                    #(#res)*
+                )
+            }
+        }
+    };
+
+    quote! {
+        impl PacketDeserialize for #ident {
+            fn deserialize(bytes: &[u8]) -> Option<Self> {
+                if bytes.len() < std::mem::size_of::<Self>() {
+                    None
+                } else {
+                    Some(#return_stmt)
+                }
+            }
+        }
+    }
+    .into()
 }
 
 #[proc_macro_derive(PacketDeserialize)]
 pub fn deserialize_derive_macro(item: TokenStream) -> TokenStream {
     match syn::parse::<DeriveInput>(item) {
         Ok(input) => match input.data {
-            syn::Data::Struct(_) => todo!(),
+            syn::Data::Struct(_) => struct_derserialization(input),
             syn::Data::Enum(_) => enum_deserialization(input),
             syn::Data::Union(_) => panic!("unions are not supported"),
         },
