@@ -3,7 +3,7 @@ pub trait PacketSerialize {
     fn sized(&self) -> usize;
 }
 
-macro_rules! impl_packet_serialize_int {
+macro_rules! impl_packet_serialization_ints {
     ($($t:ty),*) => {
         $(
             impl PacketSerialize for $t {
@@ -23,11 +23,21 @@ macro_rules! impl_packet_serialize_int {
                     size_of::<$t>()
                 }
             }
+            impl PacketDeserialize for $t {
+                #[inline]
+                fn deserialize(bytes: &[u8]) -> Option<Self> {
+                    Some(unsafe {
+                        std::mem::transmute(
+                            <[u8; size_of::<Self>()]>::try_from(bytes.get(..size_of::<Self>())?).ok()?,
+                        )
+                    })
+                }
+            }
         )*
     };
 }
 
-impl_packet_serialize_int!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
+impl_packet_serialization_ints!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
 
 impl PacketSerialize for Vec<u8> {
     fn serialize(&self, buf: &mut [u8]) -> bool {
@@ -84,22 +94,45 @@ pub trait PacketDeserialize: Sized {
     fn deserialize(bytes: &[u8]) -> Option<Self>;
 }
 
-macro_rules! impl_packet_deserialize_int {
-    ($($t:ty),*) => {
-        $(
-            impl PacketDeserialize for $t {
-                fn deserialize(bytes: &[u8]) -> Option<Self> {
-                    Some(<$t>::from_be_bytes(bytes.get(..size_of::<$t>())?.try_into().ok()?))
-                }
-            }
-        )*
-    };
-}
-
-impl_packet_deserialize_int!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
-
 impl PacketDeserialize for Vec<u8> {
     fn deserialize(bytes: &[u8]) -> Option<Self> {
         Some(Vec::from(bytes))
+    }
+}
+
+impl<T, const N: usize> PacketDeserialize for [T; N]
+where
+    T: PacketDeserialize + Default + Copy + Sized,
+{
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < std::mem::size_of::<Self>() {
+            None
+        } else {
+            let size = std::mem::size_of::<T>();
+            let mut res = Vec::with_capacity(N);
+            let mut acc = Vec::with_capacity(size);
+            let mut i = 0;
+
+            while i < bytes.len() {
+                while acc.len() < size {
+                    acc.push(bytes[i]);
+                    i += 1;
+                }
+
+                res.push(T::deserialize(&acc)?);
+                acc.clear();
+            }
+
+            Some(res.try_into().ok()?)
+        }
+    }
+}
+
+impl<T, const N: usize> PacketDeserialize for Box<[T; N]>
+where
+    T: PacketDeserialize + Default + Copy + Sized,
+{
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        Some(Box::new(<[T; N]>::deserialize(bytes)?))
     }
 }
