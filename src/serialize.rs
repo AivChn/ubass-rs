@@ -37,7 +37,9 @@ macro_rules! impl_packet_serialization_ints {
     };
 }
 
-impl_packet_serialization_ints!(u8, u16, u32, u64, u128, i8, i16, i32, i64, i128);
+impl_packet_serialization_ints!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
+);
 
 impl PacketSerialize for Vec<u8> {
     fn serialize(&self, buf: &mut [u8]) -> bool {

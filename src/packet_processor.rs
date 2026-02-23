@@ -2,7 +2,6 @@ use futures::channel::mpsc::Sender;
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
-    usize,
 };
 use tokio::sync::mpsc::Receiver;
 
@@ -12,6 +11,7 @@ use crate::{
         AckPacket, ControlPacket, DataPacket, MAX_PAYLOAD_LENGTH, Options, PacketType,
         PacketWrapper, SessionId, Version,
     },
+    serialize::{PacketDeserialize, PacketSerialize},
     transport::{ReceivedPacket, TransportError},
 };
 
@@ -68,11 +68,11 @@ mod reed_solomon_fec {
             data.extend(value.byte_range_start.to_be_bytes());
             data.extend(value.byte_range_offset.to_be_bytes());
             data.extend(value.payload_length.to_be_bytes());
-            data.extend(value.payload);
+            data.extend(value.payload.iter());
             Self {
                 is_data: value.packet_type_batch_id.0 == PacketType::Data,
                 batch_pos: value.fec_info.batch_pos,
-                data: value.payload.into(),
+                data: *value.payload,
             }
         }
     }
@@ -90,8 +90,10 @@ mod reed_solomon_fec {
         LazyLock::new(Default::default);
 
     async fn received(batch: Batch, pack: FecPacket) -> Result<(), BatchFull> {
+        // get received table
         let mut table = RECEIVED_PACKETS.lock().await;
         let batch_size = batch.batch_size as usize;
+        // find batch or create
         let entry = table.entry(batch).or_insert(Some(HashSet::new()));
 
         if let Some(entry) = entry {
@@ -105,13 +107,15 @@ mod reed_solomon_fec {
         Ok(())
     }
 
+    // adds the given packet to the batch, if this causes the batch to fill parity will be derived
+    // and returned, otherwise None will be returned
     async fn sent(packet: DataPacket) -> Option<DataPacket> {
         let mut table = TO_SEND.lock().await;
         let entry = table.entry(packet.session_id).or_insert(ToSendBatch::new());
         entry.packets.push(FecPacket::from(packet));
 
         if entry.packets.len() >= entry.batch_size as usize {
-            // TODO: Finsh the sent() function
+            // TODO: implement derive_parity call
             todo!()
         }
 
@@ -124,14 +128,14 @@ mod reed_solomon_fec {
             .sort_by(|p1, p2| p1.batch_pos.cmp(&p2.batch_pos));
         let Ok(value) = reed_solomon_simd::encode(
             entry.batch_size as usize,
-            (entry.batch_size / 3) as usize,
+            (entry.batch_size / 5) as usize,
             entry.packets,
         ) else {
             return None;
         };
 
-        //TODO: FIX EVERYTHING
-        //let parity_packets = value.iter().map(|p| ParityPacket::new(p.try_into()));
+        //TODO: Parity packet will be changed - wait with this until thats done
+        let parity_packets: Vec<FecPacket> = value.iter().map(|p| ParityPacket::new(p.try_into()));
 
         None
     }
@@ -279,7 +283,7 @@ async fn recv(
     loop {
         let packet = match t_receiver.recv().await {
             Some(Ok(packet)) => packet,
-            Some(Err(e)) => todo!("ERROR HANDLING!!!!!"),
+            Some(Err(_)) => todo!("ERROR HANDLING!!!!!"),
             None => {
                 return Err(PacketProcessingError::Internal(
                     InternalError::ChannelClosed,
@@ -287,7 +291,7 @@ async fn recv(
             }
         };
 
-        let data = tokio::spawn(process_received_packet(
+        let _data = tokio::spawn(process_received_packet(
             packet,
             p_sender.clone(),
             fec_table.clone(),
@@ -415,7 +419,6 @@ async fn process_received_packet(
 
     Ok(())
 }
-
 /// Converts a PacketWrapper into a ProcessedPacket ready for transmission.
 ///
 /// Serializes the packet, extracts metadata, and prepares it for the transport layer.
@@ -424,9 +427,14 @@ fn process_packet(packet: PacketWrapper) -> ProcessedPacket {
     match packet {
         PacketWrapper::DataPacket(pack) => {
             // TODO: handle serialization error
-            let data = wincode::serialize(&pack).expect("I didnt handle this yet")
-                [..pack.payload_length as usize + DataPacket::HEADER_SIZE]
-                .to_vec();
+            let mut data = [0u8; DataPacket::HEADER_SIZE + 1400];
+
+            if !pack.serialize(&mut data[..]) {
+                panic!("Have not handled this yet");
+            }
+
+            let size = pack.payload_length as usize + DataPacket::HEADER_SIZE;
+            let data = data[..size].to_vec();
 
             ProcessedPacket {
                 packet_id: PacketId {
@@ -440,7 +448,13 @@ fn process_packet(packet: PacketWrapper) -> ProcessedPacket {
         }
         PacketWrapper::AckPacket(pack) => {
             // TODO: handle serialization error
-            let data = wincode::serialize(&pack).expect("I didnt handlet this yet");
+            let mut data = [0u8; AckPacket::HEADER_SIZE];
+
+            if !pack.serialize(&mut data[..]) {
+                panic!("Have not handled this yet");
+            }
+
+            let data = data.to_vec();
 
             ProcessedPacket {
                 packet_id: PacketId {
@@ -453,6 +467,7 @@ fn process_packet(packet: PacketWrapper) -> ProcessedPacket {
             }
         }
         PacketWrapper::ControlPacket(pack) => {
+            unimplemented!();
             // TODO: handle serialization error
             let data = wincode::serialize(&pack).expect("I didnt handle this yet")
                 [..pack.payload_length as usize + ControlPacket::HEADER_SIZE]
@@ -488,15 +503,15 @@ fn decrypt(packet: Vec<u8>, key: u128) -> Vec<u8> {
 fn serialize_packet(wrapped_packet: PacketWrapper) -> Option<Vec<u8>> {
     match wrapped_packet {
         PacketWrapper::DataPacket(packet) => {
-            if let Ok(serialized) = wincode::serialize(&packet) {
-                Some(
-                    serialized[..packet.payload_length as usize + DataPacket::HEADER_SIZE].to_vec(),
-                )
-            } else {
+            let mut data = [0u8; DataPacket::HEADER_SIZE + 1400];
+            if !packet.serialize(&mut data[..]) {
                 None
+            } else {
+                Some(Vec::from(&data[..packet.payload_length as usize]))
             }
         }
         PacketWrapper::ControlPacket(packet) => {
+            unimplemented!();
             if let Ok(serialized) = wincode::serialize(&packet) {
                 Some(
                     serialized[..packet.payload_length as usize + ControlPacket::HEADER_SIZE]
@@ -506,7 +521,14 @@ fn serialize_packet(wrapped_packet: PacketWrapper) -> Option<Vec<u8>> {
                 None
             }
         }
-        PacketWrapper::AckPacket(packet) => wincode::serialize(&packet).ok(),
+        PacketWrapper::AckPacket(packet) => {
+            let mut data = [0u8; AckPacket::HEADER_SIZE];
+            if !packet.serialize(&mut data[..]) {
+                None
+            } else {
+                Some(Vec::from(&data))
+            }
+        }
     }
 }
 
@@ -562,16 +584,13 @@ fn process_serialized(packet: ReceivedPacket) -> Result<ProcessedPacket, PacketP
         _ => return Err(PacketProcessingError::PacketTypeNotIMplemented(packet_type)),
     };
 
-    let session_id = SessionId::from_bytes(
-        packet.data[6..14]
-            .try_into()
-            .expect("an 8 byte slice is the same as an 8 byte array"),
-    );
+    let session_id = SessionId::deserialize(&packet.data[6..14])
+        .ok_or(PacketProcessingError::FailedToDeserialize)?;
 
     Ok(ProcessedPacket {
         packet_id: PacketId {
             timestamp: 0,
-            session_id: session_id,
+            session_id,
         },
         packet_type,
         data: packet.data,
@@ -589,13 +608,14 @@ fn deserialize(mut packet: ProcessedPacket) -> Result<PacketWrapper, PacketProce
             packet
                 .data
                 .resize(DataPacket::HEADER_SIZE + MAX_PAYLOAD_LENGTH, 0);
-            let Ok(deserialized) = wincode::deserialize::<DataPacket>(&packet.data) else {
-                return Err(PacketProcessingError::FailedToDeserialize);
-            };
 
-            Ok(PacketWrapper::DataPacket(deserialized))
+            let packet = DataPacket::deserialize(&packet.data[..])
+                .ok_or(PacketProcessingError::FailedToDeserialize)?;
+
+            Ok(PacketWrapper::DataPacket(packet))
         }
         PacketType::Control => {
+            unimplemented!();
             packet
                 .data
                 .resize(ControlPacket::HEADER_SIZE + MAX_PAYLOAD_LENGTH, 0);
@@ -607,11 +627,11 @@ fn deserialize(mut packet: ProcessedPacket) -> Result<PacketWrapper, PacketProce
         }
         PacketType::Ack => {
             packet.data.resize(AckPacket::HEADER_SIZE, 0);
-            let Ok(deserialized) = wincode::deserialize::<AckPacket>(&packet.data) else {
-                return Err(PacketProcessingError::FailedToDeserialize);
-            };
 
-            Ok(PacketWrapper::AckPacket(deserialized))
+            let packet = AckPacket::deserialize(&packet.data[..])
+                .ok_or(PacketProcessingError::FailedToDeserialize)?;
+
+            Ok(PacketWrapper::AckPacket(packet))
         }
 
         // TODO: implement the rest after adding the packets
