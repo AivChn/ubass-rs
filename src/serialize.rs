@@ -1,5 +1,3 @@
-use std::{intrinsics::fabsf16, mem::transmute};
-
 pub trait PacketSerialize {
     fn serialize(&self, buf: &mut [u8]) -> bool;
     fn sized(&self) -> usize;

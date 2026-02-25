@@ -53,7 +53,7 @@ pub enum OptionFlags {
 
 #[repr(C)]
 #[derive(PacketSerialize, PacketDeserialize)]
-struct PublicKey(u128, u128);
+struct Key(u128, u128);
 
 #[repr(transparent)]
 #[derive(PacketDeserialize, PacketSerialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
@@ -67,21 +67,7 @@ pub struct FecInfo {
 }
 
 #[repr(C)]
-#[derive(PacketSerialize, PacketDeserialize)]
-struct HelloPacket {
-    pub version: Version = Version::CURRENT_VERSION, // 16
-    pub opts: Options,    // 16
-    pub packet_type: PacketType = PacketType::Host,
-    pub control_type: ControlType = ControlType::Hello,
-    pub reserved: u16 = 0,
-    pub timestamp_ms: u64,
-    pub proposed_session_id: u64,
-    pub encryption_public_key: PublicKey,
-    pub signing_public_key: PublicKey,
-}
-
-#[repr(C)]
-#[derive(PacketDeserialize, PacketSerialize)]
+#[derive(Debug, PacketDeserialize, PacketSerialize)]
 struct ByteRange {
     start: u32,
     length: u16,
@@ -89,15 +75,59 @@ struct ByteRange {
 
 #[repr(C)]
 #[derive(PacketSerialize, PacketDeserialize)]
-struct RetransmitPacket {
-    pub version: Version = Version::CURRENT_VERSION, // 16
+struct HelloPacket {
+    pub version: Version, // 16
     pub opts: Options,    // 16
-    pub packet_type: PacketType = PacketType::Session,
-    pub control_type: ControlType = ControlType::Retransmit,
-    pub reserved: u16 = 0,
+    pub packet_type: PacketType,
+    pub control_type: ControlType,
+    pub reserved: u16,
+    pub timestamp_ms: u64,
+    pub proposed_session_id: u64,
+    pub encryption_public_key: Key,
+    pub signing_public_key: Key,
+}
+
+#[repr(C)]
+#[derive(PacketSerialize, PacketDeserialize)]
+struct RetransmitPacket {
+    pub version: Version, // 16
+    pub opts: Options,    // 16
+    pub packet_type: PacketType,
+    pub control_type: ControlType,
+    pub reserved: u16,
     pub session_id: SessionId,
     pub payload_length: u16,
-    pub payload: [ByteRange; MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()]
+    pub payload: Vec<ByteRange>,
+}
+
+#[repr(C)]
+#[derive(PacketSerialize)]
+struct TrackRequestPacket {
+    pub version: Version, // 16
+    pub opts: Options,    // 16
+    pub packet_type: PacketType,
+    pub control_type: ControlType,
+    pub reserved: u16,
+    pub session_id: SessionId,
+    pub payload_length: u16,
+    pub payload: Vec<u8>,
+}
+
+#[repr(C)]
+#[derive()]
+struct SessionKeyPart {
+    pub version: Version, // 16
+    pub opts: Options,    // 16
+    pub packet_type: PacketType,
+    pub control_type: ControlType,
+    pub reserved: u16,
+    pub session_id: SessionId,
+    pub encryption_n_value: Key,
+    pub encryption_g_value: u128,
+    pub encryption_key_part: Key,
+    pub mac_n_value: Key,
+    pub mac_g_value: u128,
+    pub mac_key_part: Key,
 }
 
 #[repr(C)]
@@ -154,8 +184,8 @@ pub enum ControlType {
     Restart,
     Pause,
     Seek,
-    SendMetadata,
-    NewEncryptionKey,
+    TrackRequest,
+    SessionKeyOffer,
 }
 
 #[repr(C)]
@@ -214,6 +244,44 @@ impl Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (major, minor, patch) = self.parse();
         f.write_str(&format!("{}.{}.{}", major, minor, patch))
+    }
+}
+
+impl PacketSerialize for Vec<ByteRange> {
+    fn serialize(&self, buf: &mut [u8]) -> bool {
+        if buf.len() < self.len() * size_of::<ByteRange>() {
+            false
+        } else {
+            self.iter()
+                .enumerate()
+                .map(|(i, e)| e.serialize(&mut buf[i * size_of::<ByteRange>()..]))
+                .all(|e| e)
+        }
+    }
+
+    fn sized(&self) -> usize {
+        self.len() * size_of::<ByteRange>()
+    }
+}
+
+impl PacketDeserialize for Vec<ByteRange> {
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        const SIZE: usize = size_of::<ByteRange>();
+        if bytes.len() < SIZE {
+            None
+        } else {
+            let mut buf = vec![];
+            let mut result = vec![];
+            for byte in bytes {
+                if buf.len() >= SIZE {
+                    result.push(ByteRange::deserialize(&buf)?);
+                    buf.clear();
+                }
+                buf.push(*byte);
+            }
+
+            Some(result)
+        }
     }
 }
 
