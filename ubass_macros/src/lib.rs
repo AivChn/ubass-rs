@@ -1,7 +1,7 @@
 use core::panic;
-use std::{fmt::write, vec};
+use std::vec;
 
-use proc_macro::{Ident, TokenStream};
+use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
     DataStruct, DeriveInput, Expr, Type,

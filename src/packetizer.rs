@@ -33,6 +33,8 @@ pub enum PacketType {
     Ack = 4,
     Control = 5,
     ConnectionStat = 6,
+    Host = 7,
+    Session = 8,
 }
 
 #[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy)]
@@ -49,6 +51,10 @@ pub enum OptionFlags {
     RequireAck = 1 << 1,
 }
 
+#[repr(C)]
+#[derive(PacketSerialize, PacketDeserialize)]
+struct PublicKey(u128, u128);
+
 #[repr(transparent)]
 #[derive(PacketDeserialize, PacketSerialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct SessionId(pub u64);
@@ -61,6 +67,40 @@ pub struct FecInfo {
 }
 
 #[repr(C)]
+#[derive(PacketSerialize, PacketDeserialize)]
+struct HelloPacket {
+    pub version: Version = Version::CURRENT_VERSION, // 16
+    pub opts: Options,    // 16
+    pub packet_type: PacketType = PacketType::Host,
+    pub control_type: ControlType = ControlType::Hello,
+    pub reserved: u16 = 0,
+    pub timestamp_ms: u64,
+    pub proposed_session_id: u64,
+    pub encryption_public_key: PublicKey,
+    pub signing_public_key: PublicKey,
+}
+
+#[repr(C)]
+#[derive(PacketDeserialize, PacketSerialize)]
+struct ByteRange {
+    start: u32,
+    length: u16,
+}
+
+#[repr(C)]
+#[derive(PacketSerialize, PacketDeserialize)]
+struct RetransmitPacket {
+    pub version: Version = Version::CURRENT_VERSION, // 16
+    pub opts: Options,    // 16
+    pub packet_type: PacketType = PacketType::Session,
+    pub control_type: ControlType = ControlType::Retransmit,
+    pub reserved: u16 = 0,
+    pub session_id: SessionId,
+    pub payload_length: u16,
+    pub payload: [ByteRange; MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()]
+}
+
+#[repr(C)]
 #[derive(PacketDeserialize, PacketSerialize, Debug)]
 pub struct DataPacket {
     pub version: Version, // 16
@@ -69,9 +109,8 @@ pub struct DataPacket {
     pub fec_info: FecInfo,     // 16
     pub session_id: SessionId, // 64
     // encrypted
-    pub timestamp_ms: u64,                      // 64
-    pub byte_range_start: u32,                  //32
-    pub byte_range_offset: u16,                 //16
+    pub timestamp_ms: u64, // 64
+    pub byte_range: ByteRange,
     pub payload_length: u16,                    // 16
     pub payload: Box<[u8; MAX_PAYLOAD_LENGTH]>, // 1400
 }

@@ -1,3 +1,5 @@
+use std::{intrinsics::fabsf16, mem::transmute};
+
 pub trait PacketSerialize {
     fn serialize(&self, buf: &mut [u8]) -> bool;
     fn sized(&self) -> usize;
@@ -23,6 +25,7 @@ macro_rules! impl_packet_serialization_ints {
                     size_of::<$t>()
                 }
             }
+
             impl PacketDeserialize for $t {
                 #[inline]
                 fn deserialize(bytes: &[u8]) -> Option<Self> {
@@ -57,38 +60,35 @@ impl PacketSerialize for Vec<u8> {
     }
 }
 
-impl<T: PacketSerialize + Copy, const N: usize> PacketSerialize for [T; N] {
+impl<const N: usize> PacketSerialize for [u8; N] {
     fn serialize(&self, buf: &mut [u8]) -> bool {
-        if buf.len() < N * self[0].sized() {
+        if buf.len() < N {
             false
         } else {
-            self.iter()
-                .enumerate()
-                .map(|(i, t)| t.serialize(&mut buf[i..]))
-                .all(|e| e)
+            buf.copy_from_slice(self);
+            true
         }
     }
 
     #[inline]
     fn sized(&self) -> usize {
-        N * std::mem::size_of::<T>()
+        N
     }
 }
 
-impl<T: PacketSerialize + Copy, const N: usize> PacketSerialize for Box<[T; N]> {
+impl<const N: usize> PacketSerialize for Box<[u8; N]> {
     fn serialize(&self, buf: &mut [u8]) -> bool {
-        if buf.len() < N * self[0].sized() {
+        if buf.len() < N {
             false
         } else {
-            self.iter()
-                .enumerate()
-                .map(|(i, t)| t.serialize(&mut buf[(i * self[0].sized())..]))
-                .all(|e| e)
+            buf.copy_from_slice(&**self);
+            true
         }
     }
 
+    #[inline]
     fn sized(&self) -> usize {
-        N * std::mem::size_of::<T>()
+        N
     }
 }
 
@@ -102,39 +102,8 @@ impl PacketDeserialize for Vec<u8> {
     }
 }
 
-impl<T, const N: usize> PacketDeserialize for [T; N]
-where
-    T: PacketDeserialize + Default + Copy + Sized,
-{
+impl<const N: usize> PacketDeserialize for Box<[u8; N]> {
     fn deserialize(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < std::mem::size_of::<Self>() {
-            None
-        } else {
-            let size = std::mem::size_of::<T>();
-            let mut res = Vec::with_capacity(N);
-            let mut acc = Vec::with_capacity(size);
-            let mut i = 0;
-
-            while i < bytes.len() {
-                while acc.len() < size {
-                    acc.push(bytes[i]);
-                    i += 1;
-                }
-
-                res.push(T::deserialize(&acc)?);
-                acc.clear();
-            }
-
-            Some(res.try_into().ok()?)
-        }
-    }
-}
-
-impl<T, const N: usize> PacketDeserialize for Box<[T; N]>
-where
-    T: PacketDeserialize + Default + Copy + Sized,
-{
-    fn deserialize(bytes: &[u8]) -> Option<Self> {
-        Some(Box::new(<[T; N]>::deserialize(bytes)?))
+        Some(Box::new(bytes.get(..N)?.try_into().ok()?))
     }
 }
