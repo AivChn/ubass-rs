@@ -1,7 +1,11 @@
+// #![allow(unused)]
+
+pub mod error;
 pub mod packet_processor;
 pub mod packetizer;
-pub mod serialize;
+pub mod prelude;
 pub mod transport;
+pub mod utils;
 
 // Enum of possible internal protocol erros.
 // These errors are specifically:
