@@ -54,6 +54,15 @@ pub enum TaskError {
     TaskFailed,
 }
 
+impl From<TaskError> for Error {
+    fn from(value: TaskError) -> Self {
+        Self {
+            recoverable: Unrecoverable,
+            contents: ErrorContents::Task(value),
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum PipeDirection {
     Inbound,
