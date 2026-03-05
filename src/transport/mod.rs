@@ -26,9 +26,11 @@ mod inbound;
 mod outbound;
 pub mod types;
 
-use crate::InternalError;
+use crate::error::Recoverabilty::*;
+use crate::error::*;
 use tokio::sync::mpsc::Sender;
 
+use crate::prelude::*;
 use types::*;
 
 /// Initializes and supervises the transport layer.
@@ -53,10 +55,7 @@ use types::*;
 /// - Guards (`!is_finished()`) prevent polling already-completed handles
 /// - On recoverable errors, the failed task is restarted
 /// - On unrecoverable errors or graceful shutdown, both tasks are cleaned up
-pub async fn init(
-    port: u16,
-    InboundChannels { receiver, sender }: InboundChannels,
-) -> Result<(), TransportError> {
+pub async fn init(port: u16, InboundChannels { receiver, sender }: InboundChannels) -> ErrResult {
     let mut recv_handle = tokio::spawn(inbound::init(port, sender.clone()));
     let mut send_handle = tokio::spawn(outbound::init(sender.clone(), receiver));
 
@@ -64,33 +63,48 @@ pub async fn init(
         _ = tokio::select! {
             res = &mut recv_handle, if !recv_handle.is_finished() => {
                 let Ok(result) = res else {
-                    break 'supervisor Err(TransportError::Internal(InternalError::TaskFailed));
+                    break 'supervisor Err(Error::new(Unrecoverable, ErrorContents::Task(TaskError::TaskFailed)));
                 };
 
-                match result {
-                    Err(TransportError::RecvFailedTooManyTimes) |
-                    Err(TransportError::FailedToBind) |
-                    Err(TransportError::CouldNotSend(_)) => recv_handle = tokio::spawn(inbound::init(port, sender.clone())),
-                    Err(TransportError::Internal(internal)) => {send_handle.abort(); break 'supervisor Err(TransportError::Internal(internal));},
-                    Ok(()) => break 'supervisor Ok(()),
+                let err = match result {
+                    Ok(()) => {
+                        recv_handle.abort();
+                        break 'supervisor Ok(());
+                    }
+                    Err(err) => err,
+                };
+
+                match err.contents() {
+                    ErrorContents::Transport(TransportError::RecvFailedTooManyTimes) |
+                    ErrorContents::Transport(TransportError::FailedToBind) |
+                    ErrorContents::Transport(TransportError::CouldNotSend(_)) => recv_handle = tokio::spawn(inbound::init(port, sender.clone())),
+                    _ => todo!("Finish the Error match for receive select branch"),
                 }
             },
             res = &mut send_handle, if !send_handle.is_finished() => {
                 let Ok(result) = res else {
-                    break 'supervisor Err(TransportError::Internal(InternalError::TaskFailed));
+                    break 'supervisor Err(Error::new(Recoverable, ErrorContents::Task(TaskError::TaskFailed)));
                 };
 
-                match result {
-                    Err((TransportError::FailedToBind, returned_receiver)) |
-                    Err((TransportError::RecvFailedTooManyTimes, returned_receiver))=> send_handle = tokio::spawn(outbound::init(sender.clone(), returned_receiver)),
-                    Err((TransportError::CouldNotSend(packets), returned_receiver)) => {
-                        if sender.send(Err(TransportError::CouldNotSend(packets))).await.is_err() {
-                            break 'supervisor Err(TransportError::Internal(InternalError::ChannelClosed));
+                let (receiver, result) = result;
+
+                let err = match result {
+                    Ok(()) => {
+                        recv_handle.abort();
+                        break 'supervisor Ok(());
+                    }
+                    Err(err) => err,
+                };
+
+                match TransportError::try_from(err).unwrap() {
+                    TransportError::FailedToBind |
+                    TransportError::RecvFailedTooManyTimes => send_handle = tokio::spawn(outbound::init(sender.clone(), receiver)),
+                    TransportError::CouldNotSend(packets) => {
+                        if sender.send(Err(TransportError::CouldNotSend(packets).into())).await.is_err() {
+                            Err(ChannelError::ChannelClosed(PipeDirection::Outbound))?
                         }
-                        send_handle = tokio::spawn(outbound::init(sender.clone(), returned_receiver));
+                        send_handle = tokio::spawn(outbound::init(sender.clone(), receiver));
                     },
-                    Err((TransportError::Internal(internal), _)) => {recv_handle.abort(); break 'supervisor Err(TransportError::Internal(internal));},
-                    Ok(()) => { recv_handle.abort(); break 'supervisor Ok(())},
                 }
             }
         };
@@ -113,26 +127,15 @@ pub async fn init(
 /// * `Err(ChannelClosed)` - Channel was already closed (checked before send)
 /// * `Err(ChannelFailed)` - Send operation failed
 async fn send_to_processing_layer(
-    sender: Sender<Result<ReceivedPacket, TransportError>>,
-    res: Result<ReceivedPacket, TransportError>,
-) -> Result<(), InternalError> {
+    sender: Sender<Result<ReceivedPacket>>,
+    res: Result<ReceivedPacket>,
+) -> ErrResult {
     if sender.is_closed() {
-        return Err(InternalError::ChannelClosed);
+        Err(ChannelError::ChannelClosed(PipeDirection::Inbound))?
     }
 
-    match res {
-        Ok(packet) => {
-            if sender.send(Ok(packet)).await.is_err() {
-                return Err(InternalError::ChannelFailed);
-            }
-        }
-        Err(err) => {
-            if sender.send(Err(err)).await.is_err() {
-                return Err(InternalError::ChannelFailed);
-            }
-        }
-    }
-
-    Ok(())
-    //
+    sender
+        .send(res)
+        .await
+        .map_err(|_| ChannelError::ChannelFailed(PipeDirection::Inbound).into())
 }

@@ -1,10 +1,11 @@
 use crate::{
-    InternalError,
+    InternalError, dispatch,
+    error::*,
     packet_processor::types::{PacketId, ProcessedPacket, TransportSendMessage},
     packetizer::types::SessionId,
     utils,
 };
-use std::{collections::HashMap, fmt::Result, vec};
+use std::{collections::HashMap, sync::Arc, time::SystemTime, vec};
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{Receiver, Sender},
@@ -13,12 +14,12 @@ use tokio::{
 
 use super::send_to_processing_layer;
 use super::types::*;
+use crate::prelude::*;
 
 /// Manages outbound packet transmission from the packet processor.
 ///
-/// This function receives send commands via the channel, spawns send tasks,
-/// and periodically collects results. It batches operations in 25ms windows
-/// for efficiency.
+/// This function receives send commands via the channel, spawns send tasks.
+/// It batches operations in 25ms windows for efficiency.
 ///
 /// # Arguments
 ///
@@ -37,52 +38,105 @@ use super::types::*;
 /// 2. After 25ms, join all tasks and collect any errors
 /// 3. If errors occurred, return them (supervisor may restart)
 /// 4. Otherwise, start a new batch
-pub async fn init(
-    sender: Sender<Result<ReceivedPacket, TransportError>>,
-    mut receiver: Receiver<TransportSendMessage>,
-) -> Result<(), (TransportError, Receiver<TransportSendMessage>)> {
-    let monitor = utils::HandleMonitor::new();
-    let mut batch_count: u8 = 0;
+//pub async fn init(
+//    sender: Sender<Result<ReceivedPacket>>,
+//    receiver: Arc<Receiver<TransportSendMessage>>,
+//) -> ErrResult {
+//    let monitor = utils::HandleMonitor::new();
+//
+//    let Ok(mut sockets) = OutboundSockets::new().await else {
+//        Err(TransportError::FailedToBind)?
+//    };
+//
+//    loop {
+//        let now = Instant::now();
+//
+//        while now.elapsed() < Duration::from_millis(OutboundSockets::TIMEOUT)
+//            && monitor.size().await <= MAX_CONCURRENT_SENDS
+//        {
+//            let remaining = Duration::from_millis(25) - now.elapsed();
+//            let message = match timeout(remaining, receiver.recv()).await {
+//                // timeout reached
+//                Err(_) => {
+//                    break;
+//                }
+//                // Channel closed
+//                Ok(None) => Err(ChannelError::ChannelClosed(PipeDirection::Outbound))?,
+//                Ok(Some(msg)) => msg,
+//            };
 
-    let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
-        return Err((TransportError::FailedToBind, receiver));
+//            match message {
+//                TransportSendMessage::Data(buffer) => {
+//                    sockets.update(now.elapsed().as_millis() as u64);
+//                    crate::dispatch!(
+//                        distribute_send_to_session(buffer, sockets.retrieve(), sender.clone()),
+//                        monitor
+//                    );
+//                }
+//                TransportSendMessage::Close => {
+//                    monitor.flush().await;
+//                    return Ok(());
+//                }
+//            }
+//        }
+//    }
+//}
+
+pub async fn init(
+    sender: Sender<Result<ReceivedPacket>>,
+    mut receiver: Receiver<TransportSendMessage>,
+) -> (Receiver<TransportSendMessage>, ErrResult) {
+    let monitor = HandleMonitor::new();
+    monitor.init();
+    let Ok(mut sockets) = OutboundSockets::new().await else {
+        return (receiver, Err(TransportError::FailedToBind.into()));
     };
+    let mut buffer = vec![];
 
     loop {
-        let now = Instant::now();
+        let start_time = Instant::now();
 
-        if batch_count == 255 {
-            batch_count = 0;
-        }
-
-        while now.elapsed() < Duration::from_millis(25)
-            && monitor.size().await <= MAX_CONCURRENT_SENDS
+        while start_time.elapsed() < Duration::from_millis(BUFFER_TIMEOUT)
+            && buffer.len() < MAX_PACKET_BUFFER_SIZE
+            && monitor.size().await < MAX_CONCURRENT_SENDS
         {
-            let remaining = Duration::from_millis(25) - now.elapsed();
-            let message = match timeout(remaining, receiver.recv()).await {
-                // timeout reached
+            let remaining = BUFFER_TIMEOUT - start_time.elapsed().as_millis() as u64;
+
+            let data = match timeout(Duration::from_millis(remaining), receiver.recv()).await {
+                // timeout ended
                 Err(_) => break,
-                // Channel closed
+                // channel closed
                 Ok(None) => {
-                    return Err((
-                        TransportError::Internal(InternalError::ChannelFailed),
+                    return (
                         receiver,
-                    ));
+                        Err(ChannelError::ChannelClosed(PipeDirection::Outbound).into()),
+                    );
                 }
-                Ok(Some(msg)) => msg,
+                // close pipeline
+                Ok(Some(TransportSendMessage::Close)) => {
+                    monitor.flush().await;
+                    return (receiver, Ok(()));
+                }
+                // get data
+                Ok(Some(TransportSendMessage::Data(data))) => data,
             };
 
-            match message {
-                TransportSendMessage::Data(buffer) => {
-                    crate::dispatch!(distribute_send_to_session(buffer, sender.clone()), monitor);
-                }
-                TransportSendMessage::Close => {
-                    monitor.flush().await;
-                    return Ok(());
-                }
-            }
+            buffer.extend(data);
         }
+
+        sockets
+            .update(start_time.elapsed().as_millis() as u64)
+            .await;
+        dispatch!(
+            distribute_send_to_session(buffer, sockets.retrieve(), sender.clone()),
+            monitor
+        );
+
+        buffer = vec![];
     }
+
+    todo!("implement this");
+    (receiver, Ok(()))
 }
 
 /// Sends a batch of packets, multiplexed across sessions.
@@ -101,8 +155,9 @@ pub async fn init(
 /// * `Err(CouldNotSend)` - Some packets failed; contains their IDs
 async fn distribute_send_to_session(
     buffer: Vec<ProcessedPacket>,
-    sender: Sender<Result<ReceivedPacket, TransportError>>,
-) -> () {
+    socket: Arc<UdpSocket>,
+    sender: Sender<Result<ReceivedPacket>>,
+) {
     let mut sessions: HashMap<SessionId, Vec<SendablePacket>> = HashMap::new();
     for packet in buffer {
         let tok = packet.packet_id.session_id;
@@ -110,37 +165,34 @@ async fn distribute_send_to_session(
         sessions.entry(tok).or_default().push(converted_packet);
     }
 
-    let Ok(socket) = UdpSocket::bind("0.0.0.0:0").await else {
-        send_to_processing_layer(sender, Err(TransportError::FailedToBind)).await;
-        return;
-    };
-
-    let mut futures: Vec<_> = Vec::new();
+    let mut futures = Vec::new();
     for (session, buffer) in sessions {
         futures.push(send_to(&socket, session, buffer));
     }
 
     let results = futures::future::join_all(futures).await;
-    let errors: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+    let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
 
-    if !errors.is_empty() {
-        send_to_processing_layer(
-            sender,
-            Err(TransportError::CouldNotSend(
-                errors
-                    .iter()
-                    .flat_map(|es| {
-                        if let TransportError::CouldNotSend(val) = es {
-                            val.clone()
-                        } else {
-                            Vec::new()
-                        }
-                    })
-                    .collect::<Vec<PacketId>>(),
-            )),
-        )
-        .await;
+    if errors.is_empty() {
+        return;
     }
+
+    let could_not_send_error = Err(TransportError::CouldNotSend(
+        errors
+            .into_iter()
+            .flat_map(|es| {
+                // TODO: replace this with actual handling
+                if let TransportError::CouldNotSend(val) = es.try_into().unwrap() {
+                    val
+                } else {
+                    Vec::new()
+                }
+            })
+            .collect::<Vec<PacketId>>(),
+    )
+    .into());
+
+    send_to_processing_layer(sender, could_not_send_error).await;
 }
 
 /// Sends all packets for a single session to its destination.
@@ -162,7 +214,7 @@ async fn send_to(
     socket: &UdpSocket,
     session_token: SessionId,
     buffer: Vec<SendablePacket>,
-) -> Result<(), TransportError> {
+) -> ErrResult {
     let mut errors: Vec<PacketId> = vec![];
 
     for packet in buffer {
@@ -180,7 +232,7 @@ async fn send_to(
     if errors.is_empty() {
         Ok(())
     } else {
-        Err(TransportError::CouldNotSend(errors))
+        Err(TransportError::CouldNotSend(errors).into())
     }
 }
 
@@ -188,6 +240,7 @@ async fn send_to(
 ///
 /// **Note:** This is a placeholder implementation that only decodes the port
 /// and assumes localhost. Will be replaced with proper session management.
+#[deprecated]
 pub fn get_addr(session_token: SessionId) -> String {
     let port = session_token.0 / (12 * 100_000_012);
     format!("127.0.0.1:{port}")
