@@ -12,14 +12,14 @@ use tokio::sync::Mutex;
 
 struct BatchFull;
 
-struct ToSendBatch {
+struct OutboundBatch {
     packets: Vec<FecPacket>,
     batch_id: u16,
     batch_size: u8,
     batch_top: u8,
 }
 
-impl ToSendBatch {
+impl OutboundBatch {
     fn new() -> Self {
         Self {
             packets: Vec::new(),
@@ -68,7 +68,8 @@ impl AsRef<[u8]> for FecPacket {
 static RECEIVED_PACKETS: LazyLock<Mutex<HashMap<Batch, Option<HashSet<FecPacket>>>>> =
     LazyLock::new(Default::default);
 
-static TO_SEND: LazyLock<Mutex<HashMap<SessionId, ToSendBatch>>> = LazyLock::new(Default::default);
+static OUTBOUND: LazyLock<Mutex<HashMap<SessionId, OutboundBatch>>> =
+    LazyLock::new(Default::default);
 
 async fn received(batch: Batch, pack: FecPacket) -> Result<(), BatchFull> {
     // get received table
@@ -91,8 +92,10 @@ async fn received(batch: Batch, pack: FecPacket) -> Result<(), BatchFull> {
 // adds the given packet to the batch, if this causes the batch to fill parity will be derived
 // and returned, otherwise None will be returned
 async fn sent(packet: DataPacket) -> Option<DataPacket> {
-    let mut table = TO_SEND.lock().await;
-    let entry = table.entry(packet.session_id).or_insert(ToSendBatch::new());
+    let mut table = OUTBOUND.lock().await;
+    let entry = table
+        .entry(packet.session_id)
+        .or_insert(OutboundBatch::new());
     entry.packets.push(FecPacket::from(packet));
 
     if entry.packets.len() >= entry.batch_size as usize {
@@ -103,7 +106,7 @@ async fn sent(packet: DataPacket) -> Option<DataPacket> {
     None
 }
 
-fn derive_parity(mut entry: ToSendBatch) -> Option<FecPacket> {
+fn derive_parity(mut entry: OutboundBatch) -> Option<FecPacket> {
     entry
         .packets
         .sort_by(|p1, p2| p1.batch_pos.cmp(&p2.batch_pos));
