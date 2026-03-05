@@ -1,6 +1,9 @@
-use crate::packet_processor::types::PacketId;
+use crate::{packet_processor::types::PacketId, packetizer::types::Version};
 pub type Result<T> = core::result::Result<T, Error>;
 pub type ErrResult = Result<()>;
+
+pub use PipeDirection::*;
+pub use Recoverabilty::*;
 
 #[derive(Debug)]
 pub enum Recoverabilty {
@@ -42,6 +45,8 @@ pub enum ErrorContents {
     Task(TaskError),
     #[error("Transport Error: {0:?}")]
     Transport(TransportError),
+    #[error("Packet Processing Error: {0:?}")]
+    PacketProcessor(PacketProcessingError),
 }
 
 #[derive(Debug)]
@@ -68,6 +73,25 @@ impl From<ChannelError> for Error {
                 Self::new(Recoverabilty::Unrecoverable, ErrorContents::Channel(value))
             }
             any => Self::new(Recoverabilty::Recoverable, ErrorContents::Channel(any)),
+        }
+    }
+}
+
+/// Errors that can occur during packet processing operations.
+/// Covers deserialization failures, version incompatibilities, and internal errors.
+#[derive(Debug)]
+pub enum PacketProcessingError {
+    IncompatibleVersion(Version),
+    WrongHeaderSize(usize),
+    InvalidPacketTypeHeader(u8),
+    FailedToDeserialize,
+}
+
+impl From<PacketProcessingError> for Error {
+    fn from(value: PacketProcessingError) -> Self {
+        Self {
+            recoverable: Unrecoverable,
+            contents: ErrorContents::PacketProcessor(value),
         }
     }
 }
