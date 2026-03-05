@@ -58,7 +58,7 @@ impl OutboundSockets {
     }
 
     pub async fn update(&mut self, elapsed: u64) -> ErrResult {
-        let n = min((BUFFER_TIMEOUT as i128 - elapsed as i128), 0) as u64;
+        let n = min(BUFFER_TIMEOUT as i128 - elapsed as i128, 0) as u64;
         if n == 0 {
             self.early_batches = 1;
             self.on_time_batches += 1;

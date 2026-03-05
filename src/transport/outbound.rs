@@ -1,11 +1,10 @@
 use crate::{
-    InternalError, dispatch,
+    dispatch,
     error::*,
     packet_processor::types::{PacketId, ProcessedPacket, TransportSendMessage},
     packetizer::types::SessionId,
-    utils,
 };
-use std::{collections::HashMap, sync::Arc, time::SystemTime, vec};
+use std::{collections::HashMap, sync::Arc, vec};
 use tokio::{
     net::UdpSocket,
     sync::mpsc::{Receiver, Sender},
@@ -134,9 +133,6 @@ pub async fn init(
 
         buffer = vec![];
     }
-
-    todo!("implement this");
-    (receiver, Ok(()))
 }
 
 /// Sends a batch of packets, multiplexed across sessions.
