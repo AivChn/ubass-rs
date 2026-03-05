@@ -14,7 +14,8 @@ pub struct HandleMonitor(pub Mutex<Vec<JoinHandle<()>>>);
 
 impl HandleMonitor {
     pub fn new() -> Self {
-        Self(Mutex::new(Vec::new()))
+        let s = Self(Mutex::new(Vec::new()));
+        s
     }
 
     pub async fn size(&self) -> usize {
