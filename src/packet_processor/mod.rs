@@ -6,10 +6,6 @@ pub mod types;
 
 use crate::prelude::*;
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use types::*;
@@ -29,16 +25,12 @@ pub async fn init(
     p_sender: Sender<Result<PacketWrapper>>,
     t_receiver: Receiver<Result<ReceivedPacket>>,
     t_sender: Sender<TransportMessage>,
-    fec_table: Arc<HashMap<Batch, HashSet<FecPacket>>>,
 ) -> ErrResult {
-    let mut recv_handle = tokio::spawn(inbound::init(
-        InboundChannels {
-            t_receiver,
-            p_sender: p_sender.clone(),
-        },
-        fec_table,
-    ));
-    let mut send_handle = tokio::spawn(outboud::init(OutboundChannels {
+    let mut recv_handle = tokio::spawn(inbound::init(InboundChannels {
+        t_receiver,
+        p_sender: p_sender.clone(),
+    }));
+    let mut send_handle = tokio::spawn(outbound::init(OutboundChannels {
         t_sender: t_sender.clone(),
         p_sender: p_sender.clone(),
         p_receiver,
@@ -48,7 +40,7 @@ pub async fn init(
         _ = tokio::select! {
             res = &mut recv_handle, if !recv_handle.is_finished() => {
                 let Ok(result) = res else {
-                    break 'supervisor Err(PacketProcessingError::Internal(InternalError::TaskFailed));
+                    break 'supervisor Err(TaskError::TaskFailed.into());
                 };
 
                 match result {
@@ -59,13 +51,13 @@ pub async fn init(
             },
             res = &mut send_handle, if !send_handle.is_finished() => {
                 let Ok(result) = res else {
-                    break 'supervisor Err(PacketProcessingError::Internal(InternalError::TaskFailed));
+                    break 'supervisor Err(TaskError::TaskFailed.into());
                 };
 
                 match result {
                     // TODO: update error handling
-                    Err(e) => Err(e),
-                    Ok(()) => { recv_handle.abort(); break 'supervisor Ok(())},
+                    (_, Err(e)) => Err(e),
+                    (_, Ok(())) => { recv_handle.abort(); break 'supervisor Ok(())},
                 }
             }
         }
