@@ -13,6 +13,8 @@ macro_rules! dispatch {
     };
 }
 
+pub struct W<T>(pub T);
+
 pub struct HandleMonitor {
     handles: Mutex<Vec<JoinHandle<()>>>,
     destroyed: AtomicBool,

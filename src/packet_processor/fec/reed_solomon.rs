@@ -11,39 +11,6 @@ use std::{
 use tokio::sync::Mutex;
 
 struct BatchFull;
-
-struct OutboundBatch {
-    packets: Vec<FecPacket>,
-    batch_id: u16,
-    batch_size: u8,
-    batch_top: u8,
-}
-
-impl OutboundBatch {
-    fn new() -> Self {
-        Self {
-            packets: Vec::new(),
-            batch_id: Self::get_batch_id(),
-            batch_size: Self::get_batch_size(),
-            batch_top: 0,
-        }
-    }
-
-    fn get_batch_id() -> u16 {
-        // ignore this i just felt like it
-        (SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("TIME")
-            .as_millis()
-            * 3_432_141_324) as u16
-            ^ ((69_567_564_845 >> 33) & 2_134_123_512) as u16
-    }
-
-    fn get_batch_size() -> u8 {
-        24
-    }
-}
-
 impl From<DataPacket> for FecPacket {
     fn from(value: DataPacket) -> Self {
         let mut data: Vec<u8> = vec![];
@@ -71,7 +38,7 @@ static RECEIVED_PACKETS: LazyLock<Mutex<HashMap<Batch, Option<HashSet<FecPacket>
 static OUTBOUND: LazyLock<Mutex<HashMap<SessionId, OutboundBatch>>> =
     LazyLock::new(Default::default);
 
-async fn received(batch: Batch, pack: FecPacket) -> Result<(), BatchFull> {
+pub async fn received(batch: Batch, pack: FecPacket) -> bool {
     // get received table
     let mut table = RECEIVED_PACKETS.lock().await;
     let batch_size = batch.batch_size as usize;
@@ -82,16 +49,16 @@ async fn received(batch: Batch, pack: FecPacket) -> Result<(), BatchFull> {
         if entry.len() <= batch_size {
             entry.insert(pack);
         } else {
-            return Err(BatchFull {});
+            return false;
         }
     }
 
-    Ok(())
+    true
 }
 
 // adds the given packet to the batch, if this causes the batch to fill parity will be derived
 // and returned, otherwise None will be returned
-async fn sent(packet: DataPacket) -> Option<DataPacket> {
+pub async fn sent(packet: DataPacket) -> Option<ParityPacket> {
     let mut table = OUTBOUND.lock().await;
     let entry = table
         .entry(packet.session_id)

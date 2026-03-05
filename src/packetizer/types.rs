@@ -262,7 +262,7 @@ pub struct DataPacket {
     pub session_id: SessionId, // 64
     // encrypted
     pub timestamp_ms: u64, // 64
-    pub byte_range: ByteRange,
+    pub byte_range: u32,
     pub payload_length: u16,                    // 16
     pub payload: Box<[u8; MAX_PAYLOAD_LENGTH]>, // 1400
 }
@@ -294,7 +294,7 @@ impl ParityPacket {
     pub const MIN_SIZE: usize = ParityPacket::HEADER_SIZE + 9;
 
     pub fn new(
-        payload: [u8; Self::LOCAL_MAX_PAYLOAD_LENGTH],
+        payload: Box<[u8; Self::LOCAL_MAX_PAYLOAD_LENGTH]>,
         opts: Options,
         packet_type_batch_id: PacketTypeFecBatchID,
         fec_info: FecInfo,
@@ -309,7 +309,7 @@ impl ParityPacket {
             session_id,
             timestamp_ms,
             payload_length: Self::LOCAL_MAX_PAYLOAD_LENGTH as u16,
-            payload: Box::new(payload),
+            payload: payload,
         }
     }
 }
