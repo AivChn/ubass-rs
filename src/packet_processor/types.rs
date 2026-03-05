@@ -1,21 +1,18 @@
+use crate::prelude::*;
+
+pub use crate::{packetizer::types::PacketWrapper, transport::types::ReceivedPacket};
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::{
-    InternalError,
-    packetizer::types::{
-        MAX_PAYLOAD_LENGTH, Options, PacketType, PacketWrapper, SessionId, Version,
-    },
-    transport::types::{ReceivedPacket, TransportError},
-};
+use crate::packetizer::types::{MAX_PAYLOAD_LENGTH, Options, PacketType, SessionId};
 
 pub struct InboundChannels {
-    pub t_receiver: Receiver<Result<ReceivedPacket, TransportError>>,
-    pub p_sender: Sender<Result<PacketWrapper, PacketProcessingError>>,
+    pub t_receiver: Receiver<Result<ReceivedPacket>>,
+    pub p_sender: Sender<Result<PacketWrapper>>,
 }
 
 pub struct OutboundChannels {
-    pub t_sender: Sender<TransportSendMessage>,
-    pub p_sender: Sender<Result<PacketWrapper, PacketProcessingError>>,
+    pub t_sender: Sender<TransportMessage>,
+    pub p_sender: Sender<Result<PacketWrapper>>,
     pub p_receiver: Receiver<PacketProcessingMessage>,
 }
 
@@ -57,7 +54,7 @@ pub enum PacketProcessingMessage {
 /// Contains either processed packets ready for transmission or a close signal.
 /// Upon receiving Close, the task will wait to confirm all packets were sent.
 #[derive(Debug, Clone)]
-pub enum TransportSendMessage {
+pub enum TransportMessage {
     Data(Vec<ProcessedPacket>),
     Close,
 }
@@ -79,16 +76,4 @@ pub struct ProcessedPacket {
     pub packet_type: PacketType,
     pub data: Vec<u8>,
     pub duplicate_count: usize,
-}
-
-/// Errors that can occur during packet processing operations.
-/// Covers deserialization failures, version incompatibilities, and internal errors.
-#[derive(Debug)]
-pub enum PacketProcessingError {
-    Internal(InternalError),
-    PacketTypeNotIMplemented(PacketType),
-    IncompatibleVersion(Version),
-    WrongHeaderSize(usize),
-    InvalidPacketTypeHeader(u8),
-    FailedToDeserialize,
 }

@@ -1,25 +1,19 @@
 mod fec;
 mod inbound;
-mod outboud;
+mod outbound;
 pub mod serialize;
 pub mod types;
+
+use crate::prelude::*;
 
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
 };
-
 use tokio::sync::mpsc::{Receiver, Sender};
-
-use crate::{
-    InternalError,
-    packetizer::types::PacketWrapper,
-    transport::types::{ReceivedPacket, TransportError},
-};
 
 use types::*;
 
-// =================== TYPE DEFINITIONS =================================|
 // =================== PUBLIC FUNCTIONS =================================|
 
 /// Initializes the packet processing layer and supervises send/recv tasks.
@@ -32,11 +26,11 @@ use types::*;
 /// If either task fails, the supervisor will abort the other and return an error.
 pub async fn init(
     p_receiver: Receiver<PacketProcessingMessage>,
-    p_sender: Sender<Result<PacketWrapper, PacketProcessingError>>,
-    t_receiver: Receiver<Result<ReceivedPacket, TransportError>>,
-    t_sender: Sender<TransportSendMessage>,
+    p_sender: Sender<Result<PacketWrapper>>,
+    t_receiver: Receiver<Result<ReceivedPacket>>,
+    t_sender: Sender<TransportMessage>,
     fec_table: Arc<HashMap<Batch, HashSet<FecPacket>>>,
-) -> Result<(), PacketProcessingError> {
+) -> ErrResult {
     let mut recv_handle = tokio::spawn(inbound::init(
         InboundChannels {
             t_receiver,
