@@ -26,11 +26,10 @@ mod inbound;
 mod outbound;
 pub mod types;
 
-use crate::error::Recoverabilty::*;
-use crate::error::*;
+use crate::prelude::*;
+
 use tokio::sync::mpsc::Sender;
 
-use crate::prelude::*;
 use types::*;
 
 /// Initializes and supervises the transport layer.
@@ -101,7 +100,7 @@ pub async fn init(port: u16, InboundChannels { receiver, sender }: InboundChanne
                     TransportError::RecvFailedTooManyTimes => send_handle = tokio::spawn(outbound::init(sender.clone(), receiver)),
                     TransportError::CouldNotSend(packets) => {
                         if sender.send(Err(TransportError::CouldNotSend(packets).into())).await.is_err() {
-                            Err(ChannelError::ChannelClosed(PipeDirection::Outbound))?
+                            return Err(ChannelError::ChannelClosed(Outbound).into());
                         }
                         send_handle = tokio::spawn(outbound::init(sender.clone(), receiver));
                     },

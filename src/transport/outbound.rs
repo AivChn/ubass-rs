@@ -1,7 +1,7 @@
 use crate::{
     dispatch,
     error::*,
-    packet_processor::types::{PacketId, ProcessedPacket, TransportSendMessage},
+    packet_processor::types::{PacketId, ProcessedPacket, TransportMessage},
     packetizer::types::SessionId,
 };
 use std::{collections::HashMap, sync::Arc, vec};
@@ -83,10 +83,10 @@ use crate::prelude::*;
 
 pub async fn init(
     sender: Sender<Result<ReceivedPacket>>,
-    mut receiver: Receiver<TransportSendMessage>,
-) -> (Receiver<TransportSendMessage>, ErrResult) {
-    let monitor = HandleMonitor::new();
-    monitor.init();
+    mut receiver: Receiver<TransportMessage>,
+) -> (Receiver<TransportMessage>, ErrResult) {
+    let monitor = Arc::from(HandleMonitor::new());
+    HandleMonitor::init(monitor.clone());
     let Ok(mut sockets) = OutboundSockets::new().await else {
         return (receiver, Err(TransportError::FailedToBind.into()));
     };
@@ -112,12 +112,12 @@ pub async fn init(
                     );
                 }
                 // close pipeline
-                Ok(Some(TransportSendMessage::Close)) => {
+                Ok(Some(TransportMessage::Close)) => {
                     monitor.flush().await;
                     return (receiver, Ok(()));
                 }
                 // get data
-                Ok(Some(TransportSendMessage::Data(data))) => data,
+                Ok(Some(TransportMessage::Data(data))) => data,
             };
 
             buffer.extend(data);

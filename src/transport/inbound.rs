@@ -1,9 +1,9 @@
+use crate::prelude::*;
+
 use tokio::{net::UdpSocket, sync::mpsc::Sender};
 
 use super::send_to_processing_layer;
 use super::types::*;
-use crate::error::*;
-use crate::prelude::*;
 
 /// Listens for incoming UDP packets and forwards them to the packet processor.
 ///

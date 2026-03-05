@@ -1,7 +1,5 @@
 use crate::{
-    InternalError,
-    error::*,
-    packet_processor::types::{PacketId, ProcessedPacket, TransportSendMessage},
+    packet_processor::types::{PacketId, ProcessedPacket, TransportMessage},
     prelude::*,
 };
 use std::{cmp::min, fmt::Debug, sync::Arc};
@@ -16,7 +14,7 @@ pub const MAX_PACKET_BUFFER_SIZE: usize = 128;
 pub const BUFFER_TIMEOUT: u64 = 25;
 
 pub struct InboundChannels {
-    pub receiver: Receiver<TransportSendMessage>,
+    pub receiver: Receiver<TransportMessage>,
     pub sender: Sender<Result<ReceivedPacket>>,
 }
 
