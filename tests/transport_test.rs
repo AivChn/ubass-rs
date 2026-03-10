@@ -10,9 +10,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::{Duration, timeout};
 
-use ubass_rs::packet_processor::{PacketId, ProcessedPacket, TransportSendMessage};
-use ubass_rs::packetizer::PacketType;
-use ubass_rs::transport::{TransportError, get_session_token, init};
+use crate::packet_processor::{PacketId, ProcessedPacket, TransportSendMessage};
+use crate::packetizer::PacketType;
+use crate::transport::{TransportError, get_session_token, init};
 
 // ============================================================================
 // Helper Functions
