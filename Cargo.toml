@@ -7,6 +7,11 @@ edition = "2024"
 name = "ubass"
 path = "src/lib.rs"
 
+[features]
+default = ["fec_xor"]
+fec_xor = []
+fec_rs = []
+
 [dependencies]
 thiserror = "1"
 ubass_macros = { path = "ubass_macros"}
@@ -16,6 +21,7 @@ futures = "0.3.31"
 reed-solomon-simd = "3.1.0"
 tokio = {version = "1.49.0", features=["full"]}
 derive_more = { version="2.1.1", features=["full"]}
+async-trait = "0.1.89"
 
 [build-dependencies]
 uniffi = { version = "0.31.0", features = ["build"]}
