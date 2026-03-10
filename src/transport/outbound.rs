@@ -1,9 +1,11 @@
+use crate::prelude::*;
 use crate::{
     dispatch,
-    error::*,
+    manager::types::AddressSessionMonitor,
     packet_processor::types::{PacketId, ProcessedPacket, TransportMessage},
     packetizer::types::SessionId,
 };
+use std::sync::LazyLock;
 use std::{collections::HashMap, sync::Arc, vec};
 use tokio::{
     net::UdpSocket,
@@ -13,80 +15,15 @@ use tokio::{
 
 use super::send_to_processing_layer;
 use super::types::*;
-use crate::prelude::*;
 
-/// Manages outbound packet transmission from the packet processor.
-///
-/// This function receives send commands via the channel, spawns send tasks.
-/// It batches operations in 25ms windows for efficiency.
-///
-/// # Arguments
-///
-/// * `receiver` - Channel for receiving [`TransportSendMessage`] commands
-///
-/// # Returns
-///
-/// * `Ok(())` - Graceful shutdown (`Close` message received)
-/// * `Err((TransportError, Receiver))` - Error occurred; receiver is returned
-///   so the supervisor can restart with the same channel (preserves connection)
-///
-/// # Batching Behavior
-///
-/// Messages are processed in 25ms batches:
-/// 1. Spawn send tasks as `Data` messages arrive
-/// 2. After 25ms, join all tasks and collect any errors
-/// 3. If errors occurred, return them (supervisor may restart)
-/// 4. Otherwise, start a new batch
-//pub async fn init(
-//    sender: Sender<Result<ReceivedPacket>>,
-//    receiver: Arc<Receiver<TransportSendMessage>>,
-//) -> ErrResult {
-//    let monitor = utils::HandleMonitor::new();
-//
-//    let Ok(mut sockets) = OutboundSockets::new().await else {
-//        Err(TransportError::FailedToBind)?
-//    };
-//
-//    loop {
-//        let now = Instant::now();
-//
-//        while now.elapsed() < Duration::from_millis(OutboundSockets::TIMEOUT)
-//            && monitor.size().await <= MAX_CONCURRENT_SENDS
-//        {
-//            let remaining = Duration::from_millis(25) - now.elapsed();
-//            let message = match timeout(remaining, receiver.recv()).await {
-//                // timeout reached
-//                Err(_) => {
-//                    break;
-//                }
-//                // Channel closed
-//                Ok(None) => Err(ChannelError::ChannelClosed(PipeDirection::Outbound))?,
-//                Ok(Some(msg)) => msg,
-//            };
-
-//            match message {
-//                TransportSendMessage::Data(buffer) => {
-//                    sockets.update(now.elapsed().as_millis() as u64);
-//                    crate::dispatch!(
-//                        distribute_send_to_session(buffer, sockets.retrieve(), sender.clone()),
-//                        monitor
-//                    );
-//                }
-//                TransportSendMessage::Close => {
-//                    monitor.flush().await;
-//                    return Ok(());
-//                }
-//            }
-//        }
-//    }
-//}
+static ADRESS_TABLE: LazyLock<AddressSessionMonitor> = LazyLock::new(Default::default);
 
 pub async fn init(
     sender: Sender<Result<ReceivedPacket>>,
     mut receiver: Receiver<TransportMessage>,
 ) -> (Receiver<TransportMessage>, ErrResult) {
     let monitor = Arc::from(HandleMonitor::new());
-    HandleMonitor::init(monitor.clone());
+    HandleMonitor::init(monitor.clone()).await;
     let Ok(mut sockets) = OutboundSockets::new().await else {
         return (receiver, Err(TransportError::FailedToBind.into()));
     };
@@ -123,7 +60,7 @@ pub async fn init(
             buffer.extend(data);
         }
 
-        sockets
+        let _ = sockets
             .update(start_time.elapsed().as_millis() as u64)
             .await;
         dispatch!(
@@ -188,7 +125,7 @@ async fn distribute_send_to_session(
     )
     .into());
 
-    send_to_processing_layer(sender, could_not_send_error).await;
+    _ = send_to_processing_layer(sender, could_not_send_error).await;
 }
 
 /// Sends all packets for a single session to its destination.
@@ -216,7 +153,7 @@ async fn send_to(
     for packet in buffer {
         for _ in 0..packet.duplicate_count {
             if socket
-                .send_to(&packet.data, get_addr(session_token))
+                .send_to(&packet.data, ADRESS_TABLE.get_addr(session_token).await)
                 .await
                 .is_err()
             {
@@ -230,14 +167,4 @@ async fn send_to(
     } else {
         Err(TransportError::CouldNotSend(errors).into())
     }
-}
-
-/// Decodes a session token to a destination address string.
-///
-/// **Note:** This is a placeholder implementation that only decodes the port
-/// and assumes localhost. Will be replaced with proper session management.
-#[deprecated]
-pub fn get_addr(session_token: SessionId) -> String {
-    let port = session_token.0 / (12 * 100_000_012);
-    format!("127.0.0.1:{port}")
 }

@@ -57,7 +57,7 @@ impl HandleMonitor {
 
         let mut handles = self.handles.lock().await;
         for handle in handles.drain(..) {
-            handle.await;
+            _ = handle.await;
         }
     }
 }

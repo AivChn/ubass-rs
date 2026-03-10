@@ -1,10 +1,12 @@
+#[allow(unused_imports)]
+use crate::prelude::*;
+
 use std::{
     fmt::Display,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use crate::packet_processor::serialize::{PacketDeserialize, PacketSerialize};
-use crate::prelude;
 use ubass_macros::{PacketDeserialize, PacketSerialize};
 
 pub const MAX_PAYLOAD_LENGTH: usize = 1400;

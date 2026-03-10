@@ -3,7 +3,7 @@ use crate::prelude::*;
 pub use crate::{packetizer::types::PacketWrapper, transport::types::ReceivedPacket};
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::packetizer::types::{Options, PacketType, SessionId};
+use crate::packetizer::types::{PacketType, SessionId};
 
 pub struct InboundChannels {
     pub t_receiver: Receiver<Result<ReceivedPacket>>,
@@ -14,13 +14,6 @@ pub struct OutboundChannels {
     pub t_sender: Sender<TransportMessage>,
     pub p_sender: Sender<Result<PacketWrapper>>,
     pub p_receiver: Receiver<PacketProcessingMessage>,
-}
-
-struct PacketIdentifiers {
-    pub session_id: SessionId,
-    pub packet_type: PacketType,
-    pub opts: Options,
-    pub timestamp_ms: u64,
 }
 
 #[repr(C)]

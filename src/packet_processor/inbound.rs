@@ -21,6 +21,7 @@ pub async fn init(
     }
 }
 
+#[allow(unused)]
 async fn handle_messages(
     buffer: Box<[Result<ReceivedPacket>]>,
     sender: Sender<Result<PacketWrapper>>,
