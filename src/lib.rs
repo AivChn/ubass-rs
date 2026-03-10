@@ -1,6 +1,7 @@
-// #![allow(unused)]
+#![allow(unused)]
 
 pub mod error;
+pub mod manager;
 pub mod packet_processor;
 pub mod packetizer;
 pub mod prelude;
