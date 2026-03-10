@@ -79,8 +79,10 @@ pub enum PacketType {
     Session = 8,
 }
 
+pub type BatchID = u16;
+
 #[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy)]
-pub struct PacketTypeFecBatchID(pub PacketType, pub u16);
+pub struct PacketTypeFecBatchID(pub PacketType, pub BatchID);
 
 #[derive(PacketDeserialize, PacketSerialize, Debug, PartialEq)]
 #[repr(transparent)]
@@ -146,9 +148,10 @@ impl SessionId {
 
 #[repr(C)]
 #[derive(PacketDeserialize, PacketSerialize, Clone, Copy, Debug, PartialEq)]
-pub struct FecInfo {
+pub struct FECInfo {
     pub batch_size: u8,
     pub batch_pos: u8,
+    pub recovery_size: u8,
 }
 
 #[repr(C)]
@@ -258,12 +261,11 @@ pub struct DataPacket {
     pub version: Version, // 16
     pub opts: Options,    // 16
     pub packet_type_batch_id: PacketTypeFecBatchID,
-    pub fec_info: FecInfo,     // 16
+    pub fec_info: FECInfo,     // 16
     pub session_id: SessionId, // 64
     // encrypted
     pub timestamp_ms: u64, // 64
-    pub byte_range: u32,
-    pub payload_length: u16,                    // 16
+    pub byte_range_start: u32,
     pub payload: Box<[u8; MAX_PAYLOAD_LENGTH]>, // 1400
 }
 
@@ -279,7 +281,7 @@ pub struct ParityPacket {
     pub version: Version, // 16
     pub opts: Options,    // 16
     pub packet_type_batch_id: PacketTypeFecBatchID,
-    pub fec_info: FecInfo,     // 16
+    pub fec_info: FECInfo,     // 16
     pub session_id: SessionId, // 64
     // encrypted
     pub timestamp_ms: u64,                                          // 64
@@ -288,7 +290,7 @@ pub struct ParityPacket {
 }
 
 impl ParityPacket {
-    pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH + 8;
+    pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH + 4;
     pub const HEADER_SIZE: usize =
         size_of::<ParityPacket>() - size_of::<Box<[u8; ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH]>>();
     pub const MIN_SIZE: usize = ParityPacket::HEADER_SIZE + 9;
@@ -297,7 +299,7 @@ impl ParityPacket {
         payload: Box<[u8; Self::LOCAL_MAX_PAYLOAD_LENGTH]>,
         opts: Options,
         packet_type_batch_id: PacketTypeFecBatchID,
-        fec_info: FecInfo,
+        fec_info: FECInfo,
         session_id: SessionId,
         timestamp_ms: u64,
     ) -> Self {
