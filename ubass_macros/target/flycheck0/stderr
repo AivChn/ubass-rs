@@ -1,4 +1,1 @@
-    Updating crates.io index
-error: no matching package named `super` found
-location searched: /home/aiv/dev/ubass-rs
-required by package `ubass_macros v0.1.0 (/home/aiv/dev/ubass-rs/ubass_macros)`
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.00s
