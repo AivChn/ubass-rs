@@ -27,11 +27,11 @@ macro_rules! impl_packet_serialization_ints {
             impl PacketDeserialize for $t {
                 #[inline]
                 fn deserialize(bytes: &[u8]) -> Option<Self> {
-                    Some(unsafe {
-                        std::mem::transmute(
+                    Some(
+                        <Self>::from_be_bytes(
                             <[u8; size_of::<Self>()]>::try_from(bytes.get(..size_of::<Self>())?).ok()?,
                         )
-                    })
+                    )
                 }
             }
         )*
