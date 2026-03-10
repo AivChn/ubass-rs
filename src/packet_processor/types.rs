@@ -1,9 +1,9 @@
-use crate::{packetizer::types::ParityPacket, prelude::*};
+use crate::prelude::*;
 
 pub use crate::{packetizer::types::PacketWrapper, transport::types::ReceivedPacket};
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::packetizer::types::{MAX_PAYLOAD_LENGTH, Options, PacketType, SessionId};
+use crate::packetizer::types::{Options, PacketType, SessionId};
 
 pub struct InboundChannels {
     pub t_receiver: Receiver<Result<ReceivedPacket>>,
@@ -28,19 +28,6 @@ struct PacketIdentifiers {
 pub struct Batch {
     pub batch_id: u16,
     pub batch_size: u8,
-}
-
-#[derive(Hash, Eq)]
-pub struct FecPacket {
-    pub is_data: bool,
-    pub batch_pos: u8,
-    pub data: [u8; ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH],
-}
-
-impl PartialEq for FecPacket {
-    fn eq(&self, other: &Self) -> bool {
-        self.batch_pos == other.batch_pos && self.is_data == other.is_data
-    }
 }
 
 /// Messages sent to the packet processing layer from the packetizer.
