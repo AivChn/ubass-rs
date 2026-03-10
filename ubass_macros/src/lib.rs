@@ -356,3 +356,8 @@ pub fn deserialize_derive_macro(item: TokenStream) -> TokenStream {
         Err(e) => panic!("{}", e.to_string()),
     }
 }
+
+#[proc_macro_attribute]
+pub fn remove(_attr: TokenStream, _item: TokenStream) -> TokenStream {
+    TokenStream::new()
+}
