@@ -2,7 +2,7 @@
 
 use crate::prelude::*;
 
-use super::types::*;
+use super::types::{InboundChannels, PacketWrapper, ReceivedPacket};
 
 use tokio::sync::mpsc::Sender;
 
@@ -21,11 +21,8 @@ pub async fn init(
     }
 }
 
-#[allow(unused)]
-async fn handle_messages(
-    buffer: Box<[Result<ReceivedPacket>]>,
-    sender: Sender<Result<PacketWrapper>>,
-) {
+#[allow(clippy::needless_pass_by_value)]
+fn handle_messages(buffer: Box<[Result<ReceivedPacket>]>, sender: Sender<Result<PacketWrapper>>) {
     // TODO: Finish this
     for packet in buffer {
         // TODO: Erorr handling

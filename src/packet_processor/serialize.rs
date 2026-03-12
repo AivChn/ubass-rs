@@ -47,7 +47,7 @@ impl PacketSerialize for Vec<u8> {
         if buf.len() < self.len() {
             false
         } else {
-            buf.copy_from_slice(&self);
+            buf.copy_from_slice(self);
             true
         }
     }

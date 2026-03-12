@@ -33,6 +33,11 @@ impl OutboundSockets {
     const REMOVAL_THRESHOLD: u64 = 54_651;
     const ADDITION_THRESHOLD: u64 = 26_224;
 
+    /// Creates a new `OutboundSockets` struct
+    ///
+    /// # Errors
+    ///
+    /// This function may erorr if it failed to create a socket.
     pub async fn new() -> Result<Self> {
         let sockets = vec![Arc::new(
             UdpSocket::bind("0.0.0.0:0")
@@ -55,7 +60,14 @@ impl OutboundSockets {
         self.sockets[self.current_socket].clone()
     }
 
+    /// Updates all the meters based on the time it took for a buffer to be sent.
+    ///
+    /// # Errors
+    ///
+    /// This function may erorr if creating a new socket has failed
     pub async fn update(&mut self, elapsed: u64) -> ErrResult {
+        #[allow(clippy::cast_possible_truncation)]
+        #[allow(clippy::cast_sign_loss)]
         let n = min(BUFFER_TIMEOUT as i128 - elapsed as i128, 0) as u64;
         if n == 0 {
             self.early_batches = 1;
@@ -130,16 +142,6 @@ impl From<ProcessedPacket> for SendablePacket {
             id: value.packet_id,
             data: value.data,
             duplicate_count: value.duplicate_count,
-        }
-    }
-}
-
-impl PartialEq for TransportError {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::CouldNotSend(_), Self::CouldNotSend(_)) => true,
-            (Self::FailedToBind, Self::FailedToBind) => true,
-            _ => false,
         }
     }
 }

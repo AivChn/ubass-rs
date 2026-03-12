@@ -11,7 +11,7 @@ pub struct AddressSessionMonitor {
 }
 
 impl AddressSessionMonitor {
-    pub async fn get_session_id(&self, addr: (u8, u8, u8, u8, u16)) -> SessionId {
+    pub fn get_session_id(&self, addr: (u8, u8, u8, u8, u16)) -> SessionId {
         let full: u64 = (addr.0 as u64) << 40
             | (addr.1 as u64) << 32
             | (addr.2 as u64) << 24
@@ -20,7 +20,8 @@ impl AddressSessionMonitor {
         SessionId(full * self.table.factor)
     }
 
-    pub async fn get_addr(&self, session_id: SessionId) -> String {
+    pub fn get_addr(&self, session_id: SessionId) -> String {
+        #![allow(clippy::many_single_char_names)]
         let unfactored = session_id.0 / self.table.factor;
         let a = ((unfactored >> 40) & 0xFF) as u8;
         let b = ((unfactored >> 32) & 0xFF) as u8;
@@ -28,14 +29,16 @@ impl AddressSessionMonitor {
         let d = (unfactored >> 16) & 0xFF;
         let p = (unfactored & 0xFFFF) as u16;
 
-        format!("{}.{}.{}.{}:{}", a, b, c, d, p)
+        format!("{a}.{b}.{c}.{d}:{p}")
     }
 }
 
 impl Default for AddressSessionMonitor {
     fn default() -> Self {
         Self {
-            table: Arc::new(TmpAddressSessionMapper { factor: 333333333 }),
+            table: Arc::new(TmpAddressSessionMapper {
+                factor: 333_333_333,
+            }),
         }
     }
 }

@@ -7,6 +7,9 @@ use std::{
 };
 
 use crate::packet_processor::serialize::{PacketDeserialize, PacketSerialize};
+use aes_gcm_siv::aead::Payload;
+use reed_solomon_simd::Recovery;
+use tokio::time::Instant;
 use ubass_macros::{PacketDeserialize, PacketSerialize};
 
 pub const MAX_PAYLOAD_LENGTH: usize = 1400;
@@ -46,30 +49,18 @@ impl Version {
     pub fn is_compatible(&self) -> bool {
         *self >= Version::MIN_COMPATIBLE_VERSION
     }
-
-    #[inline]
-    #[deprecated]
-    pub const fn from_bytes(bytes: &[u8; 2]) -> Self {
-        Self((bytes[1] as u16) << 8 | bytes[0] as u16)
-    }
-
-    #[inline]
-    #[deprecated]
-    pub const fn to_bytes(&self) -> [u8; 2] {
-        [(self.0 >> 8) as u8, (self.0 & 0xFF) as u8]
-    }
 }
 
 impl Display for Version {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (major, minor, patch) = self.parse();
-        write!(f, "{}.{}.{}", major, minor, patch)
+        write!(f, "{major}.{minor}.{patch}")
     }
 }
 
 /// Enum of all possible packet types as of now
 #[derive(PacketDeserialize, PacketSerialize, Clone, Copy, PartialEq, Debug)]
-#[repr(u16)]
+#[repr(u8)]
 pub enum PacketType {
     Data = 1,
     Metadata = 2,
@@ -86,12 +77,23 @@ pub type BatchID = u16;
 #[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy)]
 pub struct PacketTypeFecBatchID(pub PacketType, pub BatchID);
 
+impl PacketTypeFecBatchID {
+    pub fn new(packet_type: PacketType, batch_id: BatchID) -> Self {
+        debug_assert!(
+            batch_id < 1023,
+            "Invariant broken while constructing `PacketTypeFecBatchID`:\
+            batch_id` should only be 10 bits, but is bigger than 1023: {batch_id}"
+        );
+        Self(packet_type, batch_id)
+    }
+}
+
 #[derive(PacketDeserialize, PacketSerialize, Debug, PartialEq)]
 #[repr(transparent)]
 pub struct Options(u16);
 
 impl Options {
-    pub fn construct(flags: Vec<OptionFlags>) -> Self {
+    pub fn construct(flags: &[OptionFlags]) -> Self {
         Self(
             flags
                 .iter()
@@ -101,30 +103,46 @@ impl Options {
         )
     }
 
+    #[inline]
+    pub fn contains(&self, flag: OptionFlags) -> bool {
+        self.0 & (flag as u16) != 0
+    }
+
+    #[must_use]
+    pub fn remove(mut self, flags: &[OptionFlags]) -> Self {
+        self.0 &= !flags
+            .iter()
+            .map(|x| *x as u16)
+            .reduce(|acc, x| acc | x)
+            .unwrap_or(0);
+        self
+    }
+
+    #[allow(clippy::should_implement_trait)]
+    #[must_use]
+    pub fn add(mut self, flags: &[OptionFlags]) -> Self {
+        self.0 |= flags
+            .iter()
+            .map(|x| *x as u16)
+            .reduce(|acc, x| acc | x)
+            .unwrap_or(0);
+        self
+    }
+
+    // TODO: make a macro to get the list of all variants from an enum
     pub fn deconstruct(&self) -> Vec<OptionFlags> {
         let mut opts = vec![];
         if (OptionFlags::RequireAck as u16) & self.0 != 0 {
             opts.push(OptionFlags::RequireAck);
         }
-
-        if (OptionFlags::SessionEncrypted as u16) & self.0 != 0 {
-            opts.push(OptionFlags::SessionEncrypted);
-        }
-
         opts
-    }
-
-    #[inline]
-    pub const fn from_bytes(msb: u8, lsb: u8) -> Self {
-        Self((msb as u16) << 8 | (lsb as u16))
     }
 }
 
 #[derive(Clone, Copy)]
 #[repr(u8)]
 pub enum OptionFlags {
-    SessionEncrypted = 1 << 0,
-    RequireAck = 1 << 1,
+    RequireAck = 1 << 0,
 }
 
 #[repr(C)]
@@ -135,19 +153,6 @@ struct Key(u128, u128);
 #[derive(PacketDeserialize, PacketSerialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
 pub struct SessionId(pub u64);
 
-impl SessionId {
-    pub fn new() -> Self {
-        Self(
-            (SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("time should move forward")
-                .as_millis()
-                * 32413245
-                % 324987645983276514357846239847) as u64,
-        )
-    }
-}
-
 #[repr(C)]
 #[derive(PacketDeserialize, PacketSerialize, Clone, Copy, Debug, PartialEq)]
 pub struct FECInfo {
@@ -156,13 +161,64 @@ pub struct FECInfo {
     pub recovery_size: u8,
 }
 
+impl FECInfo {
+    pub fn new(batch_size: u8, batch_pos: u8, recovery_size: u8) -> Self {
+        debug_assert!(
+            batch_pos < batch_size,
+            "Invariant broken while constructing `FECInfo`: \
+            `batch_pos` is bigger than `batch_size` ({batch_pos} >= {batch_size})"
+        );
+        debug_assert!(
+            recovery_size <= batch_size,
+            "Invariant broken while constructing `FECInfo`: \
+            there are more recovery shards than there are data shards ({recovery_size} > {batch_size})"
+        );
+        Self {
+            batch_size,
+            batch_pos,
+            recovery_size,
+        }
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, PacketDeserialize, PacketSerialize)]
 struct ByteRange {
-    pub start: u32,
-    pub length: u16,
+    start: u32,
+    length: u16,
 }
 
+impl ByteRange {
+    pub fn new(start: u32, length: u16) -> Self {
+        debug_assert!(
+            length as usize <= MAX_PAYLOAD_LENGTH,
+            "Invariant broken while constructing a `ByteRange`:\
+            `length` is too big ({length}). To combine multiple continous ranges, use `Self::concat()`"
+        );
+        Self { start, length }
+    }
+
+    pub fn concat(&mut self, other: &ByteRange) -> bool {
+        debug_assert!(
+            self.start + self.length as u32 == other.start
+                || other.start + other.length as u32 == self.start,
+            "Invariant broken while trying to concatincate two `ByteRange`s: The two are not continous. \
+            self: {self:?}, other: {other:?}"
+        );
+
+        if u16::try_from(self.length as u32 + other.length as u32).is_ok() {
+            self.length += other.length;
+            if other.start + other.length as u32 == self.start {
+                self.start = other.start;
+            }
+            true
+        } else {
+            false
+        }
+    }
+}
+
+// TODO: finalize after encryption is understood
 #[repr(C)]
 #[derive(PacketSerialize, PacketDeserialize)]
 struct HelloPacket {
@@ -186,8 +242,33 @@ struct RetransmitPacket {
     pub control_type: ControlType,
     pub reserved: u16,
     pub session_id: SessionId,
-    pub payload_length: u16,
     pub payload: Vec<ByteRange>,
+}
+
+impl RetransmitPacket {
+    // closest I can get to `MAX_PAYLOAD_LENGTH` while aligning to 6 bytes
+    const LOCAL_MAX_PAYLOAD_LENGTH: usize = 1398;
+    const HEADER_SIZE: usize = size_of::<Self>() - Self::LOCAL_MAX_PAYLOAD_LENGTH;
+
+    pub fn new(opts: Options, session_id: SessionId, payload: Vec<ByteRange>) -> Self {
+        debug_assert!(
+            payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
+            "Invariant broken while constructing a `RetransmitPacket`: payload bigger than allowed max size: {} `ByteRange`s ({} bytes) > {} `ByteRange`s ({} bytes)",
+            payload.len(),
+            (payload.len() * size_of::<ByteRange>()),
+            (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
+            Self::LOCAL_MAX_PAYLOAD_LENGTH
+        );
+        Self {
+            version: Version::CURRENT_VERSION,
+            opts: opts.add(&[OptionFlags::RequireAck]),
+            packet_type: PacketType::Session,
+            control_type: ControlType::Retransmit,
+            reserved: 0,
+            session_id,
+            payload,
+        }
+    }
 }
 
 impl PacketSerialize for Vec<ByteRange> {
@@ -197,8 +278,7 @@ impl PacketSerialize for Vec<ByteRange> {
         } else {
             self.iter()
                 .enumerate()
-                .map(|(i, e)| e.serialize(&mut buf[i * size_of::<ByteRange>()..]))
-                .all(|e| e)
+                .all(|(i, e)| e.serialize(&mut buf[i * size_of::<ByteRange>()..]))
         }
     }
 
@@ -227,6 +307,7 @@ impl PacketDeserialize for Vec<ByteRange> {
         }
     }
 }
+
 #[repr(C)]
 #[derive(PacketSerialize)]
 struct TrackRequestPacket {
@@ -236,12 +317,29 @@ struct TrackRequestPacket {
     pub control_type: ControlType,
     pub reserved: u16,
     pub session_id: SessionId,
-    pub payload_length: u16,
-    pub payload: Vec<u8>,
+    pub payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
 }
 
+impl TrackRequestPacket {
+    pub fn new(
+        opts: Options,
+        session_id: SessionId,
+        payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
+    ) -> Self {
+        Self {
+            version: Version::CURRENT_VERSION,
+            opts: opts.add(&[OptionFlags::RequireAck]),
+            packet_type: PacketType::Session,
+            control_type: ControlType::TrackRequest,
+            reserved: 0,
+            session_id,
+            payload,
+        }
+    }
+}
+
+// TODO: figure this shit out with the hello packet
 #[repr(C)]
-#[derive()]
 struct SessionKeyPart {
     pub version: Version, // 16
     pub opts: Options,    // 16
@@ -275,6 +373,29 @@ impl DataPacket {
     pub const HEADER_SIZE: usize =
         size_of::<DataPacket>() - size_of::<Box<[u8; MAX_PAYLOAD_LENGTH]>>();
     pub const MIN_SIZE: usize = DataPacket::HEADER_SIZE + 1;
+
+    pub fn new(
+        opts: Options,
+        batch_id: BatchID,
+        fec_info: FECInfo,
+        session_id: SessionId,
+        byte_range_start: u32,
+        payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
+    ) -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        Self {
+            version: Version::CURRENT_VERSION,
+            opts,
+            packet_type_batch_id: PacketTypeFecBatchID::new(PacketType::Data, batch_id),
+            fec_info,
+            session_id,
+            timestamp_ms: Instant::now()
+                .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
+                .as_millis() as u64,
+            byte_range_start,
+            payload,
+        }
+    }
 }
 
 #[repr(C)]
@@ -286,9 +407,8 @@ pub struct ParityPacket {
     pub fec_info: FECInfo,     // 16
     pub session_id: SessionId, // 64
     // encrypted
-    pub timestamp_ms: u64,                                          // 64
-    pub payload_length: u16,                                        // 16
-    pub payload: Box<[u8; ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH]>, // payload includes data payload and byte range inf o
+    pub timestamp_ms: u64,                                  // 64
+    pub payload: Box<[u8; Self::LOCAL_MAX_PAYLOAD_LENGTH]>, // payload includes data payload and byte range inf o
 }
 
 impl ParityPacket {
@@ -298,22 +418,23 @@ impl ParityPacket {
     pub const MIN_SIZE: usize = ParityPacket::HEADER_SIZE + 9;
 
     pub fn new(
-        payload: Box<[u8; Self::LOCAL_MAX_PAYLOAD_LENGTH]>,
         opts: Options,
-        packet_type_batch_id: PacketTypeFecBatchID,
+        batch_id: BatchID,
         fec_info: FECInfo,
         session_id: SessionId,
-        timestamp_ms: u64,
+        payload: Box<[u8; Self::LOCAL_MAX_PAYLOAD_LENGTH]>,
     ) -> Self {
+        #[allow(clippy::cast_possible_truncation)]
         Self {
             version: Version::CURRENT_VERSION,
             opts,
-            packet_type_batch_id,
+            packet_type_batch_id: PacketTypeFecBatchID::new(PacketType::Parity, batch_id),
             fec_info,
             session_id,
-            timestamp_ms,
-            payload_length: Self::LOCAL_MAX_PAYLOAD_LENGTH as u16,
-            payload: payload,
+            timestamp_ms: Instant::now()
+                .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
+                .as_millis() as u64,
+            payload,
         }
     }
 }
@@ -335,6 +456,34 @@ pub struct AckPacket {
 impl AckPacket {
     pub const HEADER_SIZE: usize = size_of::<AckPacket>();
     pub const MIN_SIZE: usize = AckPacket::HEADER_SIZE;
+
+    pub fn new(
+        opts: Options,
+        session_id: SessionId,
+        ack_timestamp_ms: u64,
+        ack_opts: Options,
+        ack_packet_type: PacketType,
+    ) -> Self {
+        debug_assert!(
+            !opts.contains(OptionFlags::RequireAck),
+            "Invariant broken while constructing `AckPacket`: \
+            flag `RequireAck` was present, which should not be allowed."
+        );
+        #[allow(clippy::cast_possible_truncation)]
+        Self {
+            version: Version::CURRENT_VERSION,
+            opts,
+            packet_type: PacketType::Ack,
+            reserved: 0,
+            session_id,
+            timestamp_ms: Instant::now()
+                .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
+                .as_millis() as u64,
+            ack_timestamp_ms,
+            ack_opts,
+            ack_packet_type,
+        }
+    }
 }
 
 #[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, PartialEq)]
@@ -352,6 +501,7 @@ pub enum ControlType {
 }
 
 #[repr(C)]
+#[deprecated]
 #[derive(PacketDeserialize, PacketSerialize, Debug, PartialEq)]
 pub struct ControlPacket {
     pub version: Version,
@@ -371,5 +521,3 @@ impl ControlPacket {
         size_of::<ControlPacket>() - size_of::<Box<[u8; MAX_PAYLOAD_LENGTH]>>();
     pub const MIN_SIZE: usize = ControlPacket::HEADER_SIZE + 1;
 }
-
-// ===================== IMPLEMENTATIONS ===================================|

@@ -1,4 +1,6 @@
 #![allow(unused)]
+#![allow(clippy::cast_lossless)]
+#![allow(clippy::must_use_candidate)]
 
 pub mod error;
 pub mod manager;

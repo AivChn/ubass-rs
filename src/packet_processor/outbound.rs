@@ -6,7 +6,7 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::{dispatch, prelude::*};
 
-use super::types::*;
+use super::types::{OutboundChannels, PacketProcessingMessage, PacketWrapper, TransportMessage};
 
 pub async fn init(
     OutboundChannels {
@@ -15,7 +15,7 @@ pub async fn init(
         mut p_receiver,
     }: OutboundChannels,
 ) -> (Receiver<PacketProcessingMessage>, ErrResult) {
-    let monitor = Arc::from(HandleMonitor::new());
+    let monitor = Arc::from(HandleMonitor::default());
     tokio::spawn(HandleMonitor::init(monitor.clone()));
 
     loop {
@@ -45,6 +45,7 @@ pub async fn init(
     }
 }
 
+#[allow(clippy::unused_async)]
 async fn handle_received(
     buffer: Box<[PacketWrapper]>,
     p_sender: Sender<Result<PacketWrapper>>,

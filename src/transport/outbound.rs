@@ -14,15 +14,19 @@ use tokio::{
 };
 
 use super::send_to_processing_layer;
-use super::types::*;
+use super::types::{
+    BUFFER_TIMEOUT, MAX_CONCURRENT_SENDS, MAX_PACKET_BUFFER_SIZE, OutboundSockets, ReceivedPacket,
+    SendablePacket,
+};
 
-static ADRESS_TABLE: LazyLock<AddressSessionMonitor> = LazyLock::new(Default::default);
+static ADRESS_TABLE: LazyLock<AddressSessionMonitor> =
+    LazyLock::new(AddressSessionMonitor::default);
 
 pub async fn init(
     sender: Sender<Result<ReceivedPacket>>,
     mut receiver: Receiver<TransportMessage>,
 ) -> (Receiver<TransportMessage>, ErrResult) {
-    let monitor = Arc::from(HandleMonitor::new());
+    let monitor = Arc::from(HandleMonitor::default());
     HandleMonitor::init(monitor.clone()).await;
     let Ok(mut sockets) = OutboundSockets::new().await else {
         return (receiver, Err(TransportError::FailedToBind.into()));
@@ -36,6 +40,7 @@ pub async fn init(
             && buffer.len() < MAX_PACKET_BUFFER_SIZE
             && monitor.size().await < MAX_CONCURRENT_SENDS
         {
+            #[allow(clippy::cast_possible_truncation)]
             let remaining = BUFFER_TIMEOUT - start_time.elapsed().as_millis() as u64;
 
             let data = match timeout(Duration::from_millis(remaining), receiver.recv()).await {
@@ -60,6 +65,7 @@ pub async fn init(
             buffer.extend(data);
         }
 
+        #[allow(clippy::cast_possible_truncation)]
         let _ = sockets
             .update(start_time.elapsed().as_millis() as u64)
             .await;
@@ -104,7 +110,10 @@ async fn distribute_send_to_session(
     }
 
     let results = futures::future::join_all(futures).await;
-    let errors: Vec<_> = results.into_iter().filter_map(|r| r.err()).collect();
+    let errors: Vec<_> = results
+        .into_iter()
+        .filter_map(std::result::Result::err)
+        .collect();
 
     if errors.is_empty() {
         return;
@@ -153,12 +162,12 @@ async fn send_to(
     for packet in buffer {
         for _ in 0..packet.duplicate_count {
             if socket
-                .send_to(&packet.data, ADRESS_TABLE.get_addr(session_token).await)
+                .send_to(&packet.data, ADRESS_TABLE.get_addr(session_token))
                 .await
                 .is_err()
             {
                 errors.push(packet.id);
-            };
+            }
         }
     }
 

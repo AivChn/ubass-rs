@@ -8,7 +8,10 @@ use crate::prelude::*;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use types::*;
+use types::{
+    Batch, InboundChannels, OutboundChannels, PacketProcessingMessage, PacketWrapper,
+    ReceivedPacket, TransportMessage,
+};
 
 // =================== PUBLIC FUNCTIONS =================================|
 
@@ -20,6 +23,13 @@ use types::*;
 ///
 /// Acts as a supervisor, monitoring both tasks and handling failures.
 /// If either task fails, the supervisor will abort the other and return an error.
+///
+/// # Errors
+///
+/// This function only errors on unrecoverable errors occuring from either the tasks returning an
+/// error or failing to start.
+/// `TaskError::TaskFailed`: returned if the tasks failed - not by returning an error.
+/// TODO finish this
 pub async fn init(
     p_receiver: Receiver<PacketProcessingMessage>,
     p_sender: Sender<Result<PacketWrapper>>,

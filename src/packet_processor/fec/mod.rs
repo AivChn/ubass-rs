@@ -105,7 +105,7 @@ struct FECPacket {
 
 impl From<DataPacket> for FECPacket {
     fn from(value: DataPacket) -> Self {
-        let mut data: FECData = Default::default();
+        let mut data = FECData::default();
         value.byte_range_start.serialize(&mut data.0[..]);
         value.payload.serialize(&mut data.0[4..MAX_PAYLOAD_LENGTH]);
         FECPacket {
@@ -122,7 +122,7 @@ impl From<DataPacket> for FECPacket {
 
 impl From<ParityPacket> for FECPacket {
     fn from(value: ParityPacket) -> Self {
-        let mut data: FECData = Default::default();
+        let mut data = FECData::default();
         value.payload.serialize(&mut data.0[..FEC_DATA_SIZE]);
         FECPacket {
             is_parity: true,
@@ -141,7 +141,7 @@ impl FECCompatible for DataPacket {}
 impl FECCompatible for ParityPacket {}
 
 #[cfg(all(feature = "fec_xor", not(feature = "fec_rs")))]
-type FECImpl = xor::XOR;
+type FECImpl = xor::Xor;
 
 #[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
 type FECImpl = reed_solomon::RS;

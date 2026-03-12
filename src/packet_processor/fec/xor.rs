@@ -8,6 +8,7 @@ use std::ops::{BitXor, BitXorAssign};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use futures::future::Map;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
@@ -16,9 +17,9 @@ use crate::{
     packetizer::types::{DataPacket, SessionId},
 };
 
-use super::*;
+use super::{FECData, FECPacket, ParityPacket, RecoverdPacket};
 
-/// impl `^=` for FECData
+/// impl `^=` for `FECData`
 impl BitXorAssign for FECData {
     fn bitxor_assign(&mut self, rhs: Self) {
         self.0
@@ -28,7 +29,7 @@ impl BitXorAssign for FECData {
     }
 }
 
-/// impl `^` for FECData
+/// impl `^` for `FECData`
 impl BitXor for FECData {
     type Output = FECData;
 
@@ -37,7 +38,7 @@ impl BitXor for FECData {
         self
     }
 }
-
+#[allow(clippy::doc_markdown)]
 /// Represents a sinle inbound batch
 ///
 /// `product`: The result of XORing all received packets other than parity.
@@ -56,7 +57,7 @@ impl InboundBatchData {
     /// takes a `batch_size` u8
     fn new(batch_size: u8) -> Self {
         Self {
-            product: Default::default(),
+            product: FECData::default(),
             parity: None,
             batch_size,
             packets_received: 0,
@@ -101,6 +102,7 @@ impl From<InboundBatchData> for Arc<Mutex<InboundBatchData>> {
     }
 }
 
+#[allow(clippy::doc_markdown)]
 /// Represents an outbound batch
 ///
 /// `product`: the result of XORing all the received packets so far.
@@ -117,7 +119,7 @@ impl OutboundBatchData {
     /// Takes a `batch_size` u8
     fn new(batch_size: u8) -> Self {
         Self {
-            product: Default::default(),
+            product: FECData::default(),
             batch_size: batch_size as usize,
             current_size: 0,
         }
@@ -128,11 +130,7 @@ impl OutboundBatchData {
     fn add(&mut self, data: FECData) -> bool {
         self.product ^= data;
         self.current_size += 1;
-        if self.batch_size <= self.current_size {
-            true
-        } else {
-            false
-        }
+        self.batch_size <= self.current_size
     }
 }
 
@@ -143,18 +141,22 @@ impl From<OutboundBatchData> for Arc<Mutex<OutboundBatchData>> {
     }
 }
 
+type MapKey = (BatchID, SessionId);
+type InboundBatch = Arc<Mutex<InboundBatchData>>;
+type OutboundBatch = Arc<Mutex<OutboundBatchData>>;
+
 /// Represents the full state of the FEC module.
-/// `inbound`: a hashmap of (batch_id, session_id) to a batch of inbound packets.
-/// `outbound`: a hashmap of (batch_id, session_id) to a batch of outbound packets.
+/// `inbound`: a hashmap of `(batch_id, session_id)` to a batch of inbound packets.
+/// `outbound`: a hashmap of `(batch_id, session_id)` to a batch of outbound packets.
 ///
 /// The values are behind `Arc<Mutex<>>` to allow for asynchronous tasks to access the value without
 /// locking the whole hashmap for the full duration of the operation.
-pub struct XOR {
-    inbound: Mutex<HashMap<(BatchID, SessionId), Arc<Mutex<InboundBatchData>>>>,
-    outbound: Mutex<HashMap<(BatchID, SessionId), Arc<Mutex<OutboundBatchData>>>>,
+pub struct Xor {
+    inbound: Mutex<HashMap<MapKey, InboundBatch>>,
+    outbound: Mutex<HashMap<MapKey, OutboundBatch>>,
 }
 
-impl XOR {
+impl Xor {
     /// creates a new empty XOR struct
     pub fn new() -> Self {
         Self {
@@ -178,14 +180,13 @@ impl XOR {
                 .clone()
         };
 
-        // ↓ Note this
-        if !{
+        let batch_ready = {
             // if the batch was *not* filled after adding this packet:
             let mut batch = entry.lock().await;
             batch.add(FECData(packet.data.0)) // <- returns `bool`
-        } {
-            None
-        } else {
+        };
+
+        if batch_ready {
             // if it was:
             let (_, value) = {
                 let mut guard = self.outbound.lock().await;
@@ -198,26 +199,19 @@ impl XOR {
 
             // prepare parity packet fields
             let payload = batch.product.0.clone();
-            let opts = Options::construct(Vec::with_capacity(0));
-            let packet_type_batch_id = PacketTypeFecBatchID(PacketType::Parity, packet.batch_id);
-            let fec_info = FECInfo {
-                batch_size: packet.batch_size,
-                batch_pos: 0,
-                recovery_size: 1,
-            };
+            let opts = Options::construct(&[]);
+            let fec_info = FECInfo::new(packet.batch_size, 0, 1);
             let session_id = packet.session_id;
-            let timestamp_ms = Instant::now()
-                .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
-                .as_millis() as u64;
 
             Some(vec![ParityPacket::new(
-                payload,
                 opts,
-                packet_type_batch_id,
+                packet.batch_id,
                 fec_info,
                 session_id,
-                timestamp_ms,
+                payload,
             )])
+        } else {
+            None
         }
     }
 
@@ -250,12 +244,10 @@ impl XOR {
         session_id: SessionId,
     ) -> Option<Vec<RecoverdPacket>> {
         // if there is no entry return None
-        let Some(entry) = ({
+        let entry = ({
             let mut guard = self.inbound.lock().await;
             guard.remove(&(batch_id, session_id))
-        }) else {
-            return None;
-        };
+        })?;
 
         // get the parity, assuming it exists
         let parity = {

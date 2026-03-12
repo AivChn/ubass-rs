@@ -30,23 +30,16 @@ use crate::prelude::*;
 
 use tokio::sync::mpsc::Sender;
 
-use types::*;
+use types::{InboundChannels, ReceivedPacket};
 
 /// Initializes and supervises the transport layer.
 ///
 /// This is the main entry point for the transport layer. It spawns two concurrent tasks
 /// (recv and send) and supervises them in a loop, handling restarts on recoverable errors.
 ///
-/// # Arguments
+/// # Errors
 ///
-/// * `port` - The UDP port to bind the listening socket to
-/// * `receiver` - Channel for receiving send commands from the packet processor
-/// * `sender` - Channel for forwarding received packets to the packet processor
-///
-/// # Returns
-///
-/// * `Ok(())` - Graceful shutdown (received `Close` message)
-/// * `Err(TransportError)` - Unrecoverable error occurred
+/// `TaskError::TaskFailed`: returned if the task failed not by returning an error.
 ///
 /// # Supervisor Behavior
 ///
@@ -59,10 +52,10 @@ pub async fn init(port: u16, InboundChannels { receiver, sender }: InboundChanne
     let mut send_handle = tokio::spawn(outbound::init(sender.clone(), receiver));
 
     'supervisor: loop {
-        _ = tokio::select! {
+        tokio::select! {
             res = &mut recv_handle, if !recv_handle.is_finished() => {
                 let Ok(result) = res else {
-                    break 'supervisor Err(Error::new(Unrecoverable, ErrorContents::Task(TaskError::TaskFailed)));
+                    break 'supervisor Err(TaskError::TaskFailed.into());
                 };
 
                 let err = match result {
@@ -74,15 +67,16 @@ pub async fn init(port: u16, InboundChannels { receiver, sender }: InboundChanne
                 };
 
                 match err.contents() {
-                    ErrorContents::Transport(TransportError::RecvFailedTooManyTimes) |
-                    ErrorContents::Transport(TransportError::FailedToBind) |
-                    ErrorContents::Transport(TransportError::CouldNotSend(_)) => recv_handle = tokio::spawn(inbound::init(port, sender.clone())),
+                    ErrorContents::Transport(
+                        TransportError::RecvFailedTooManyTimes |
+                        TransportError::FailedToBind |
+                        TransportError::CouldNotSend(_)) => recv_handle = tokio::spawn(inbound::init(port, sender.clone())),
                     _ => todo!("Finish the Error match for receive select branch"),
                 }
             },
             res = &mut send_handle, if !send_handle.is_finished() => {
                 let Ok(result) = res else {
-                    break 'supervisor Err(Error::new(Recoverable, ErrorContents::Task(TaskError::TaskFailed)));
+                    break 'supervisor Err(TaskError::TaskFailed.into());
                 };
 
                 let (receiver, result) = result;
@@ -95,7 +89,11 @@ pub async fn init(port: u16, InboundChannels { receiver, sender }: InboundChanne
                     Err(err) => err,
                 };
 
-                match TransportError::try_from(err).unwrap() {
+                let ErrorContents::Transport(error) = err.consume_contents() else {
+                    todo!();
+                };
+
+                match error {
                     TransportError::FailedToBind |
                     TransportError::RecvFailedTooManyTimes => send_handle = tokio::spawn(outbound::init(sender.clone(), receiver)),
                     TransportError::CouldNotSend(packets) => {
@@ -130,11 +128,11 @@ async fn send_to_processing_layer(
     res: Result<ReceivedPacket>,
 ) -> ErrResult {
     if sender.is_closed() {
-        Err(ChannelError::ChannelClosed(PipeDirection::Inbound))?
+        return Err(ChannelError::ChannelClosed(Inbound).into());
     }
 
     sender
         .send(res)
         .await
-        .map_err(|_| ChannelError::ChannelFailed(PipeDirection::Inbound).into())
+        .map_err(|_| ChannelError::ChannelFailed(Inbound).into())
 }

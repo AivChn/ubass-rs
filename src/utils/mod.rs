@@ -21,13 +21,6 @@ pub struct HandleMonitor {
 }
 
 impl HandleMonitor {
-    pub fn new() -> Self {
-        Self {
-            handles: Mutex::new(Vec::with_capacity(32)),
-            destroyed: AtomicBool::new(false),
-        }
-    }
-
     pub async fn size(&self) -> usize {
         let mut handles = self.handles.lock().await;
         handles.retain(|h| !h.is_finished());
@@ -58,6 +51,15 @@ impl HandleMonitor {
         let mut handles = self.handles.lock().await;
         for handle in handles.drain(..) {
             _ = handle.await;
+        }
+    }
+}
+
+impl Default for HandleMonitor {
+    fn default() -> Self {
+        Self {
+            handles: Mutex::new(Vec::with_capacity(32)),
+            destroyed: AtomicBool::new(false),
         }
     }
 }

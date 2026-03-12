@@ -18,6 +18,7 @@ pub struct Error {
 }
 
 impl Error {
+    #[must_use]
     pub fn new(recoverable: Recoverabilty, contents: ErrorContents) -> Self {
         Self {
             recoverable,
@@ -34,6 +35,10 @@ impl Error {
 
     pub fn contents(&self) -> &ErrorContents {
         &self.contents
+    }
+
+    pub fn consume_contents(self) -> ErrorContents {
+        self.contents
     }
 }
 
@@ -81,7 +86,9 @@ impl From<ChannelError> for Error {
             ChannelError::ChannelClosed(_) => {
                 Self::new(Recoverabilty::Unrecoverable, ErrorContents::Channel(value))
             }
-            any => Self::new(Recoverabilty::Recoverable, ErrorContents::Channel(any)),
+            any @ ChannelError::ChannelFailed(_) => {
+                Self::new(Recoverabilty::Recoverable, ErrorContents::Channel(any))
+            }
         }
     }
 }

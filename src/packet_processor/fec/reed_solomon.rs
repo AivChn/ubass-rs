@@ -14,7 +14,7 @@ use crate::{
     prelude::*,
 };
 
-use super::*;
+use super::{FEC_DATA_SIZE, RecoverdPacket};
 
 struct InboundBatchData {
     decoder: ReedSolomonDecoder,
@@ -69,27 +69,25 @@ impl From<&FECPacket> for Arc<Mutex<OutboundBatchData>> {
 impl From<(u8, &FECPacket, &[u8])> for ParityPacket {
     fn from(value: (u8, &FECPacket, &[u8])) -> Self {
         let (i, packet, payload) = value;
+        #[allow(clippy::cast_possible_truncation)]
         ParityPacket::new(
-            Box::new(payload.try_into().expect("Length is guaranteed by library")),
-            Options::construct(Vec::with_capacity(0)),
-            PacketTypeFecBatchID(PacketType::Parity, packet.batch_id),
-            FECInfo {
-                batch_size: packet.batch_size,
-                batch_pos: i,
-                recovery_size: packet.recovery_count,
-            },
+            Options::construct(&[]),
+            packet.batch_id,
+            FECInfo::new(packet.batch_size, i, packet.recovery_count),
             packet.session_id,
-            Instant::now()
-                .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
-                .as_millis() as u64,
+            Box::new(payload.try_into().expect("Length is guaranteed by library")),
         )
     }
 }
 
+type MapKey = (BatchID, SessionId);
+type InboundBatch = Arc<Mutex<InboundBatchData>>;
+type OutboundBatch = Arc<Mutex<OutboundBatchData>>;
+
 /// Represents the full state of the Reed-Solomon FEC strategy
 pub struct RS {
-    inbound: Mutex<HashMap<(BatchID, SessionId), Arc<Mutex<InboundBatchData>>>>,
-    outbound: Mutex<HashMap<(BatchID, SessionId), Arc<Mutex<OutboundBatchData>>>>,
+    inbound: Mutex<HashMap<MapKey, InboundBatch>>,
+    outbound: Mutex<HashMap<MapKey, OutboundBatch>>,
 }
 
 impl RS {
@@ -117,6 +115,7 @@ impl RS {
             if batch.received_count >= batch.batch_size {
                 let recovery = batch.encoder.encode().expect("This Should not fail");
                 Some(
+                    #[allow(clippy::cast_possible_truncation)]
                     recovery
                         .recovery_iter()
                         .enumerate()
@@ -168,12 +167,10 @@ impl RS {
         batch_id: BatchID,
         session_id: SessionId,
     ) -> Option<Vec<RecoverdPacket>> {
-        let Some((_, entry)) = ({
+        let (_, entry) = ({
             let mut guard = self.inbound.lock().await;
             guard.remove_entry(&(batch_id, session_id))
-        }) else {
-            return None;
-        };
+        })?;
 
         let mut batch = entry.lock().await;
         batch.decoder.decode().ok().map(|result| {
