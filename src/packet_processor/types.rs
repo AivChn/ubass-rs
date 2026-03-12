@@ -5,22 +5,17 @@ use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::packetizer::types::{PacketType, SessionId};
 
+/// packages the channels needed for the inbound task
 pub struct InboundChannels {
     pub t_receiver: Receiver<Result<ReceivedPacket>>,
     pub p_sender: Sender<Result<PacketWrapper>>,
 }
 
+/// packages the channels needed for the outbound task
 pub struct OutboundChannels {
     pub t_sender: Sender<TransportMessage>,
     pub p_sender: Sender<Result<PacketWrapper>>,
     pub p_receiver: Receiver<PacketProcessingMessage>,
-}
-
-#[repr(C)]
-#[derive(Hash, PartialEq, Eq)]
-pub struct Batch {
-    pub batch_id: u16,
-    pub batch_size: u8,
 }
 
 /// Messages sent to the packet processing layer from the packetizer.

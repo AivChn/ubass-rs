@@ -9,8 +9,8 @@ use crate::prelude::*;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use types::{
-    Batch, InboundChannels, OutboundChannels, PacketProcessingMessage, PacketWrapper,
-    ReceivedPacket, TransportMessage,
+    InboundChannels, OutboundChannels, PacketProcessingMessage, PacketWrapper, ReceivedPacket,
+    TransportMessage,
 };
 
 // =================== PUBLIC FUNCTIONS =================================|

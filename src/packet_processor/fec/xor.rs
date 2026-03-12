@@ -13,7 +13,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::{
-    packet_processor::{Batch, serialize::PacketSerialize},
+    packet_processor::serialize::PacketSerialize,
     packetizer::types::{DataPacket, SessionId},
 };
 
