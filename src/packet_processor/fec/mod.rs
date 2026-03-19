@@ -95,7 +95,7 @@ impl From<FECData> for RecoverdPacket {
 struct FECPacket {
     is_parity: bool,
     session_id: SessionId,
-    batch_id: u16, // u10 in practice
+    batch_id: BatchID, // u10 in practice
     batch_size: u8,
     batch_pos: u8,
     recovery_count: u8,
@@ -110,7 +110,7 @@ impl From<DataPacket> for FECPacket {
         FECPacket {
             is_parity: false,
             session_id: value.session_id,
-            batch_id: value.packet_type_batch_id.1,
+            batch_id: value.packet_type_batch_id.batch_id,
             batch_size: value.fec_info.batch_size,
             batch_pos: value.fec_info.batch_pos,
             recovery_count: value.fec_info.recovery_size,
@@ -126,7 +126,7 @@ impl From<ParityPacket> for FECPacket {
         FECPacket {
             is_parity: true,
             session_id: value.session_id,
-            batch_id: value.packet_type_batch_id.1,
+            batch_id: value.packet_type_batch_id.batch_id,
             batch_size: value.fec_info.batch_size,
             batch_pos: value.fec_info.batch_pos,
             recovery_count: value.fec_info.recovery_size,
@@ -147,7 +147,8 @@ type FECImpl = reed_solomon::RS;
 
 static FEC: LazyLock<FECImpl> = LazyLock::new(FECImpl::new);
 
-pub async fn sent(packet: DataPacket) -> Option<Vec<ParityPacket>> {
+#[allow(private_bounds)]
+pub async fn sent(packet: impl FECCompatible) -> Option<Vec<ParityPacket>> {
     FEC.sent(packet.into()).await
 }
 
