@@ -1,9 +1,85 @@
-use std::sync::Arc;
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    sync::{Arc, atomic::AtomicU64},
+};
+
+use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
+use futures::lock::Mutex;
 
 use crate::packetizer::types::SessionId;
 
-/// Temporary mapper just to have things working
-pub struct TmpAddressSessionMapper {
+pub enum ManagerMessage {
+    Close,
+    Highway,
+}
+
+#[derive(PartialEq)]
+pub enum HighwayMessage {
+    Packetizer,
+    PacketProcessor,
+    Transport,
+}
+
+pub struct EncryptionWindow {
+    cipher: Aes256GcmSiv,
+    nonce: AtomicU64,
+}
+
+impl EncryptionWindow {
+    pub fn new(cipher: Aes256GcmSiv) -> Self {
+        Self {
+            cipher,
+            nonce: AtomicU64::new(0),
+        }
+    }
+
+    pub fn get(&self) -> (&Aes256GcmSiv, [u8; 8]) {
+        let x = self
+            .nonce
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        (&self.cipher, x.to_be_bytes())
+    }
+}
+
+type EncryptionTable = HashMap<SessionId, EncryptionWindow>;
+
+pub struct EncryptionMonitor<'a> {
+    table: &'a EncryptionTable,
+}
+
+impl<'a> EncryptionMonitor<'a> {
+    fn new(table: &'a EncryptionTable) -> Self {
+        Self { table }
+    }
+}
+
+impl<'a> EncryptionMonitor<'a> {
+    pub fn get(&self, session_id: SessionId) -> (&Aes256GcmSiv, [u8; 8]) {
+        self.table
+            .get(&session_id)
+            .expect(
+                format!(
+                    "Invairant broken while accessing session table: \
+        session ({session_id}) does not have a key but is being accessed for encryption",
+                )
+                .as_str(),
+            )
+            .get()
+    }
+}
+
+struct SessionTable {
+    encryption: EncryptionTable,
+}
+
+impl SessionTable {
+    pub fn get_encryption_monitor(&self) -> EncryptionMonitor<'_> {
+        EncryptionMonitor::new(&self.encryption)
+    }
+}
+
+struct TmpAddressSessionMapper {
     factor: u64,
 }
 
