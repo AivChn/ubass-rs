@@ -8,6 +8,7 @@ use std::{
 
 use crate::packet_processor::serialize::{PacketDeserialize, PacketSerialize};
 use aes_gcm_siv::aead::Payload;
+use derive_more::Display;
 use reed_solomon_simd::Recovery;
 use tokio::time::Instant;
 use ubass_macros::{PacketDeserialize, PacketSerialize};
@@ -18,7 +19,6 @@ pub const MAX_PAYLOAD_LENGTH: usize = 1400;
 pub enum PacketWrapper {
     DataPacket(DataPacket),
     AckPacket(AckPacket),
-    ControlPacket(ControlPacket),
 }
 
 #[derive(
@@ -75,17 +75,10 @@ pub enum PacketType {
 pub type BatchID = u16;
 
 #[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy)]
-pub struct PacketTypeFecBatchID(pub PacketType, pub BatchID);
-
-impl PacketTypeFecBatchID {
-    pub fn new(packet_type: PacketType, batch_id: BatchID) -> Self {
-        debug_assert!(
-            batch_id < 1023,
-            "Invariant broken while constructing `PacketTypeFecBatchID`:\
-            batch_id` should only be 10 bits, but is bigger than 1023: {batch_id}"
-        );
-        Self(packet_type, batch_id)
-    }
+#[repr(C)]
+pub struct PacketTypeFecBatchID {
+    pub packet_type: PacketType,
+    pub batch_id: BatchID,
 }
 
 #[derive(PacketDeserialize, PacketSerialize, Debug, PartialEq)]
@@ -150,7 +143,7 @@ pub enum OptionFlags {
 struct Key(u128, u128);
 
 #[repr(transparent)]
-#[derive(PacketDeserialize, PacketSerialize, Debug, PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(PacketDeserialize, PacketSerialize, Debug, PartialEq, Eq, Hash, Clone, Copy, Display)]
 pub struct SessionId(pub u64);
 
 #[repr(C)]
@@ -358,15 +351,14 @@ struct SessionKeyPart {
 #[repr(C)]
 #[derive(PacketDeserialize, PacketSerialize, Debug)]
 pub struct DataPacket {
-    pub version: Version, // 16
-    pub opts: Options,    // 16
+    pub version: Version,
+    pub opts: Options,
     pub packet_type_batch_id: PacketTypeFecBatchID,
-    pub fec_info: FECInfo,     // 16
-    pub session_id: SessionId, // 64
-    // encrypted
-    pub timestamp_ms: u64, // 64
+    pub fec_info: FECInfo,
+    pub session_id: SessionId,
+    pub timestamp_ms: u64,
     pub byte_range_start: u32,
-    pub payload: Box<[u8; MAX_PAYLOAD_LENGTH]>, // 1400
+    pub payload: Vec<u8>,
 }
 
 impl DataPacket {
@@ -380,18 +372,24 @@ impl DataPacket {
         fec_info: FECInfo,
         session_id: SessionId,
         byte_range_start: u32,
-        payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
+        payload: Vec<u8>,
     ) -> Self {
-        #[allow(clippy::cast_possible_truncation)]
+        let version = Version::CURRENT_VERSION;
+        let packet_type_batch_id = PacketTypeFecBatchID {
+            packet_type: PacketType::Data,
+            batch_id,
+        };
+        let timestamp_ms = Instant::now()
+            .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
+            .as_millis() as u64;
+
         Self {
-            version: Version::CURRENT_VERSION,
+            version,
             opts,
-            packet_type_batch_id: PacketTypeFecBatchID::new(PacketType::Data, batch_id),
+            packet_type_batch_id,
             fec_info,
             session_id,
-            timestamp_ms: Instant::now()
-                .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
-                .as_millis() as u64,
+            timestamp_ms,
             byte_range_start,
             payload,
         }
@@ -401,20 +399,18 @@ impl DataPacket {
 #[repr(C)]
 #[derive(PacketDeserialize, PacketSerialize, Debug)]
 pub struct ParityPacket {
-    pub version: Version, // 16
-    pub opts: Options,    // 16
+    pub version: Version,
+    pub opts: Options,
     pub packet_type_batch_id: PacketTypeFecBatchID,
-    pub fec_info: FECInfo,     // 16
-    pub session_id: SessionId, // 64
-    // encrypted
-    pub timestamp_ms: u64,                                  // 64
-    pub payload: Box<[u8; Self::LOCAL_MAX_PAYLOAD_LENGTH]>, // payload includes data payload and byte range inf o
+    pub fec_info: FECInfo,
+    pub session_id: SessionId,
+    pub timestamp_ms: u64,
+    pub payload: Vec<u8>,
 }
 
 impl ParityPacket {
     pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH + 4;
-    pub const HEADER_SIZE: usize =
-        size_of::<ParityPacket>() - size_of::<Box<[u8; ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH]>>();
+    pub const HEADER_SIZE: usize = size_of::<ParityPacket>() - size_of::<Vec<u8>>();
     pub const MIN_SIZE: usize = ParityPacket::HEADER_SIZE + 9;
 
     pub fn new(
@@ -422,18 +418,24 @@ impl ParityPacket {
         batch_id: BatchID,
         fec_info: FECInfo,
         session_id: SessionId,
-        payload: Box<[u8; Self::LOCAL_MAX_PAYLOAD_LENGTH]>,
+        payload: Vec<u8>,
     ) -> Self {
-        #[allow(clippy::cast_possible_truncation)]
+        let version = Version::CURRENT_VERSION;
+        let packet_type_batch_id = PacketTypeFecBatchID {
+            packet_type: PacketType::Parity,
+            batch_id,
+        };
+        let timestamp_ms = Instant::now()
+            .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
+            .as_millis() as u64;
+
         Self {
-            version: Version::CURRENT_VERSION,
+            version,
             opts,
-            packet_type_batch_id: PacketTypeFecBatchID::new(PacketType::Parity, batch_id),
+            packet_type_batch_id,
             fec_info,
             session_id,
-            timestamp_ms: Instant::now()
-                .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
-                .as_millis() as u64,
+            timestamp_ms,
             payload,
         }
     }
@@ -498,26 +500,4 @@ pub enum ControlType {
     Seek,
     TrackRequest,
     SessionKeyOffer,
-}
-
-#[repr(C)]
-#[deprecated]
-#[derive(PacketDeserialize, PacketSerialize, Debug, PartialEq)]
-pub struct ControlPacket {
-    pub version: Version,
-    pub opts: Options,
-    pub packet_type: PacketType,
-    pub control_type: ControlType,
-    reserved: u16,
-    pub session_id: SessionId,
-    // encrypted
-    pub timestamp_ms: u64,
-    pub payload_length: u16,
-    pub payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
-}
-
-impl ControlPacket {
-    pub const HEADER_SIZE: usize =
-        size_of::<ControlPacket>() - size_of::<Box<[u8; MAX_PAYLOAD_LENGTH]>>();
-    pub const MIN_SIZE: usize = ControlPacket::HEADER_SIZE + 1;
 }

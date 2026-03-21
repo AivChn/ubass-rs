@@ -69,13 +69,12 @@ impl From<&FECPacket> for Arc<Mutex<OutboundBatchData>> {
 impl From<(u8, &FECPacket, &[u8])> for ParityPacket {
     fn from(value: (u8, &FECPacket, &[u8])) -> Self {
         let (i, packet, payload) = value;
-        #[allow(clippy::cast_possible_truncation)]
         ParityPacket::new(
             Options::construct(&[]),
             packet.batch_id,
             FECInfo::new(packet.batch_size, i, packet.recovery_count),
             packet.session_id,
-            Box::new(payload.try_into().expect("Length is guaranteed by library")),
+            payload.try_into().expect("Length is guaranteed by library"),
         )
     }
 }

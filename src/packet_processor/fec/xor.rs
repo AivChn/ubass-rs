@@ -208,7 +208,7 @@ impl Xor {
                 packet.batch_id,
                 fec_info,
                 session_id,
-                payload,
+                payload.to_vec(),
             )])
         } else {
             None
