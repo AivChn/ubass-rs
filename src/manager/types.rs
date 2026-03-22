@@ -1,11 +1,9 @@
 use std::{
-    cell::RefCell,
     collections::HashMap,
     sync::{Arc, atomic::AtomicU64},
 };
 
-use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
-use futures::lock::Mutex;
+use aes_gcm_siv::Aes256GcmSiv;
 
 use crate::packetizer::types::SessionId;
 
@@ -52,19 +50,20 @@ impl<'a> EncryptionMonitor<'a> {
     fn new(table: &'a EncryptionTable) -> Self {
         Self { table }
     }
-}
 
-impl<'a> EncryptionMonitor<'a> {
+    /// returns the key and nonce counter for a specific session
+    ///
+    /// # Panics
+    /// This function panics if the key is not yet created, which should be impossible
     pub fn get(&self, session_id: SessionId) -> (&Aes256GcmSiv, [u8; 8]) {
         self.table
             .get(&session_id)
-            .expect(
-                format!(
+            .unwrap_or_else(|| {
+                panic!(
                     "Invairant broken while accessing session table: \
         session ({session_id}) does not have a key but is being accessed for encryption",
                 )
-                .as_str(),
-            )
+            })
             .get()
     }
 }

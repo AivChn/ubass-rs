@@ -1,5 +1,5 @@
 use aes_gcm_siv::aead::OsRng;
-use x25519_dalek::{EphemeralSecret, PublicKey, SharedSecret};
+use x25519_dalek::{EphemeralSecret, PublicKey};
 
 pub fn get() -> (EphemeralSecret, PublicKey) {
     let secret = EphemeralSecret::random_from_rng(OsRng);
