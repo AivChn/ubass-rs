@@ -1,6 +1,9 @@
 use crate::prelude::*;
 
-use std::fmt::Display;
+use std::{
+    fmt::Display,
+    net::{Ipv4Addr, SocketAddrV4},
+};
 
 use crate::packet_processor::serialize::{PacketDeserialize, PacketSerialize};
 use derive_more::Display;
@@ -33,6 +36,7 @@ pub struct HelloPacket {
     pub proposed_session_id: SessionId,
     pub public_key: PublicKey,
     pub app_id: AppId,
+    pub host_address: SocketAddrV4,
 }
 
 impl HelloPacket {
@@ -41,6 +45,7 @@ impl HelloPacket {
         proposed_session_id: SessionId,
         public_key: PublicKey,
         app_id: AppId,
+        host_address: SocketAddrV4,
     ) -> Self {
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Host;
@@ -58,6 +63,7 @@ impl HelloPacket {
             proposed_session_id,
             public_key,
             app_id,
+            host_address,
         }
     }
 }
