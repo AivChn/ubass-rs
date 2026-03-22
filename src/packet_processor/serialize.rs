@@ -1,3 +1,5 @@
+use std::net::{Ipv4Addr, SocketAddrV4};
+
 pub trait PacketSerialize {
     fn serialize(&self, buf: &mut [u8]) -> bool;
     fn sized(&self) -> usize;
@@ -41,6 +43,24 @@ macro_rules! impl_packet_serialization_ints {
 impl_packet_serialization_ints!(
     u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize
 );
+
+impl PacketSerialize for SocketAddrV4 {
+    fn serialize(&self, buf: &mut [u8]) -> bool {
+        if buf.len() < self.sized() {
+            false
+        } else {
+            buf.copy_from_slice(&self.ip().octets());
+            buf[4..].copy_from_slice(&self.port().to_be_bytes());
+
+            true
+        }
+    }
+
+    #[inline]
+    fn sized(&self) -> usize {
+        6
+    }
+}
 
 impl PacketSerialize for Vec<u8> {
     fn serialize(&self, buf: &mut [u8]) -> bool {
@@ -109,6 +129,19 @@ impl<const N: usize> PacketSerialize for Box<[u8; N]> {
 
 pub trait PacketDeserialize: Sized {
     fn deserialize(bytes: &[u8]) -> Option<Self>;
+}
+
+impl PacketDeserialize for SocketAddrV4 {
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 6 {
+            None
+        } else {
+            let octets = <[u8; 4]>::deserialize(bytes).expect("size guaranteed");
+            let port = u16::deserialize(&bytes[4..]).expect("size guaranteed");
+
+            Some(SocketAddrV4::new(Ipv4Addr::from_octets(octets), port))
+        }
+    }
 }
 
 impl<T: PacketDeserialize + Default + PartialEq> PacketDeserialize for Option<T> {
