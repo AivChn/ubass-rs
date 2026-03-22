@@ -1,24 +1,460 @@
-#[allow(unused_imports)]
 use crate::prelude::*;
 
-use std::{
-    fmt::Display,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::fmt::Display;
 
 use crate::packet_processor::serialize::{PacketDeserialize, PacketSerialize};
-use aes_gcm_siv::aead::Payload;
 use derive_more::Display;
-use reed_solomon_simd::Recovery;
 use tokio::time::Instant;
 use ubass_macros::{PacketDeserialize, PacketSerialize};
 
+use super::fingerprint::Fingerprint;
+
 pub const MAX_PAYLOAD_LENGTH: usize = 1400;
 
-#[derive(Debug)]
 pub enum PacketWrapper {
+    HelloPacket(HelloPacket),
+    TrackRequestPacket(TrackRequestPacket),
     DataPacket(DataPacket),
+    MetadataPacket(MetadataPacket),
+    ParityPacket(ParityPacket),
     AckPacket(AckPacket),
+    RetransmitPacket(RetransmitPacket),
+}
+
+#[repr(C)]
+#[derive(Fingerprint, PacketSerialize, PacketDeserialize)]
+pub struct HelloPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub control_type: ControlType,
+    pub reserved: Reserved<2>,
+    pub timestamp: Timestamp,
+    pub proposed_session_id: SessionId,
+    pub public_key: PublicKey,
+    pub app_id: AppId,
+}
+
+impl HelloPacket {
+    pub fn new(
+        opts: Options,
+        proposed_session_id: SessionId,
+        public_key: PublicKey,
+        app_id: AppId,
+    ) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let packet_type = PacketType::Host;
+        let control_type = ControlType::Hello;
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            control_type,
+            reserved,
+            timestamp,
+            proposed_session_id,
+            public_key,
+            app_id,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Fingerprint, PacketSerialize)]
+pub struct TrackRequestPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub control_type: ControlType,
+    pub reserved: Reserved<2>,
+    pub timestamp: Timestamp,
+    pub session_id: SessionId,
+    pub payload: Vec<u8>,
+}
+
+impl TrackRequestPacket {
+    #[must_use]
+    pub fn request_track(opts: Options, session_id: SessionId, payload: Vec<u8>) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let opts = opts.add(OptionFlags::RequireAck);
+        let packet_type = PacketType::Session;
+        let control_type = ControlType::TrackRequest;
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            control_type,
+            reserved,
+            timestamp,
+            session_id,
+            payload,
+        }
+    }
+
+    #[must_use]
+    pub fn request_metadata(opts: Options, session_id: SessionId, payload: Vec<u8>) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let opts = opts.add(OptionFlags::RequireAck);
+        let packet_type = PacketType::Session;
+        let control_type = ControlType::MetadataRequest;
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            control_type,
+            reserved,
+            timestamp,
+            session_id,
+            payload,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Fingerprint, PacketDeserialize, PacketSerialize)]
+pub struct DataPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub batch_id: BatchID,
+    pub fec_info: FECInfo,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+    pub byte_range_start: BytePosition,
+    pub payload: Vec<u8>,
+}
+
+impl DataPacket {
+    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<Vec<u8>>();
+    pub const MIN_SIZE: usize = Self::HEADER_SIZE + 1;
+
+    #[must_use]
+    pub fn new(
+        opts: Options,
+        batch_id: BatchID,
+        fec_info: FECInfo,
+        session_id: SessionId,
+        byte_range_start: BytePosition,
+        payload: Vec<u8>,
+    ) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let packet_type = PacketType::Data;
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            batch_id,
+            fec_info,
+            session_id,
+            timestamp,
+            byte_range_start,
+            payload,
+        }
+    }
+}
+
+#[derive(Fingerprint, PacketDeserialize, PacketSerialize)]
+#[repr(C)]
+pub struct MetadataPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub batch_id: BatchID,
+    pub fec_info: FECInfo,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+    pub buffer_id: BufferId,
+    pub buffer_size: BufferSize,
+    pub position: BytePosition,
+    pub payload: Vec<u8>,
+}
+
+impl MetadataPacket {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        opts: Options,
+        batch_id: BatchID,
+        fec_info: FECInfo,
+        session_id: SessionId,
+        buffer_id: BufferId,
+        buffer_size: BufferSize,
+        position: BytePosition,
+        payload: Vec<u8>,
+    ) -> Self {
+        debug_assert!(
+            position.0 < buffer_size.0,
+            "Invariant broken while constructing `MetadataPacket`: \
+            position is laregr than buffer size ({position} > {buffer_size})"
+        );
+
+        let version = Version::CURRENT_VERSION;
+        let packet_type = PacketType::Metadata;
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            batch_id,
+            fec_info,
+            session_id,
+            timestamp,
+            buffer_id,
+            buffer_size,
+            position,
+            payload,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Fingerprint, PacketDeserialize, PacketSerialize)]
+pub struct ParityPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type_batch_id: PacketTypeFecBatchID,
+    pub fec_info: FECInfo,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+    pub payload: Vec<u8>,
+}
+
+impl ParityPacket {
+    pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH + 4;
+    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<Vec<u8>>();
+    pub const MIN_SIZE: usize = Self::HEADER_SIZE + 9;
+
+    #[must_use]
+    pub fn new(
+        opts: Options,
+        batch_id: BatchID,
+        fec_info: FECInfo,
+        session_id: SessionId,
+        payload: Vec<u8>,
+    ) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let packet_type_batch_id = PacketTypeFecBatchID {
+            packet_type: PacketType::Parity,
+            batch_id,
+        };
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type_batch_id,
+            fec_info,
+            session_id,
+            timestamp,
+            payload,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Fingerprint, PacketDeserialize, PacketSerialize)]
+pub struct AckPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    reserved: Reserved<1>,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+    pub fingerprint: PacketFingerprint,
+}
+
+impl AckPacket {
+    pub const HEADER_SIZE: usize = size_of::<AckPacket>();
+    pub const MIN_SIZE: usize = AckPacket::HEADER_SIZE;
+
+    pub fn new(opts: Options, session_id: SessionId, fingerprint: PacketFingerprint) -> Self {
+        debug_assert!(
+            !opts.contains(OptionFlags::RequireAck),
+            "Invariant broken while constructing `AckPacket`: \
+            flag `RequireAck` was present, which should not be allowed."
+        );
+
+        let version = Version::CURRENT_VERSION;
+        let packet_type = PacketType::Ack;
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            reserved,
+            session_id,
+            timestamp,
+            fingerprint,
+        }
+    }
+}
+
+#[repr(C)]
+#[derive(Fingerprint, PacketSerialize, PacketDeserialize)]
+pub struct RetransmitPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub control_type: ControlType,
+    pub buffer_id: Option<BufferId>,
+    pub timestamp: Timestamp,
+    pub session_id: SessionId,
+    pub payload: Vec<ByteRange>,
+}
+
+impl RetransmitPacket {
+    // closest I can get to `MAX_PAYLOAD_LENGTH` while aligning to 6 bytes
+    const LOCAL_MAX_PAYLOAD_LENGTH: usize = 1398;
+    const HEADER_SIZE: usize = size_of::<Self>() - Self::LOCAL_MAX_PAYLOAD_LENGTH;
+
+    pub fn new(
+        opts: Options,
+        buffer_id: Option<BufferId>,
+        session_id: SessionId,
+        payload: Vec<ByteRange>,
+    ) -> Self {
+        debug_assert!(
+            payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
+            "Invariant broken while constructing a `RetransmitPacket`: payload bigger than allowed max size: {} `ByteRange`s ({} bytes) > {} `ByteRange`s ({} bytes)",
+            payload.len(),
+            (payload.len() * size_of::<ByteRange>()),
+            (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
+            Self::LOCAL_MAX_PAYLOAD_LENGTH
+        );
+
+        let version = Version::CURRENT_VERSION;
+        let opts = opts.add(OptionFlags::RequireAck);
+        let packet_type = PacketType::Session;
+        let control_type = ControlType::Retransmit;
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            control_type,
+            buffer_id,
+            timestamp,
+            session_id,
+            payload,
+        }
+    }
+}
+
+#[derive(PacketDeserialize, PacketSerialize)]
+#[repr(transparent)]
+pub struct PacketFingerprint([u8; 16]);
+
+impl<T: Fingerprint> From<T> for PacketFingerprint {
+    fn from(value: T) -> Self {
+        Self(value.fingerprint())
+    }
+}
+
+#[derive(PacketDeserialize, PacketSerialize, PartialEq, Default)]
+#[repr(transparent)]
+pub struct BufferId(u16);
+
+impl BufferId {
+    pub fn new(id: u16) -> Self {
+        debug_assert!(
+            id != 0,
+            "Invariant broken while constructing `BufferId`: \
+            a buffer ID can never be 0"
+        );
+
+        Self(id)
+    }
+}
+
+#[derive(PacketDeserialize, PacketSerialize, Display)]
+#[repr(transparent)]
+pub struct BufferSize(u32);
+
+impl BufferSize {
+    const MAX_MB: usize = 10;
+    const MAX_BUFFER_SIZE: usize = Self::MAX_MB * 1024 * 1024;
+    pub fn new(size: u32) -> Self {
+        debug_assert!(
+            (size as usize) < Self::MAX_BUFFER_SIZE,
+            "Invariant broken while constructing `BufferSize`: \
+            provided size larger than allowed ({} > {})",
+            size,
+            Self::MAX_MB
+        );
+
+        Self(size)
+    }
+}
+
+#[derive(PacketDeserialize, PacketSerialize)]
+#[repr(transparent)]
+pub struct AppId(pub u64);
+
+#[derive(PacketDeserialize, PacketSerialize)]
+#[repr(transparent)]
+pub struct PublicKey(pub [u8; 32]);
+
+#[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, Display)]
+#[repr(transparent)]
+pub struct BytePosition(pub u32);
+
+#[derive(PacketDeserialize, PacketSerialize)]
+#[repr(transparent)]
+pub struct Timestamp(u64);
+
+impl Timestamp {
+    fn now() -> Self {
+        #[allow(clippy::cast_possible_truncation)]
+        Self(
+            Instant::now()
+                .duration_since(*PROTOCOL_EPOCH.get().expect(
+                    "Invariant broken while constructing `Timestamp`: \
+        `PROTOCOL_EPOCH` is not initialized",
+                ))
+                .as_millis() as u64,
+        )
+    }
+}
+
+pub struct Reserved<const N: usize>;
+
+impl<const N: usize> PacketSerialize for Reserved<N> {
+    fn serialize(&self, buf: &mut [u8]) -> bool {
+        if buf.len() < N {
+            false
+        } else {
+            buf[..N].fill(0);
+            true
+        }
+    }
+
+    fn sized(&self) -> usize {
+        N
+    }
+}
+
+impl<const N: usize> PacketDeserialize for Reserved<N> {
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < N || bytes[..N].iter().any(|n| *n != 0) {
+            None
+        } else {
+            Some(Reserved)
+        }
+    }
 }
 
 #[derive(
@@ -72,7 +508,9 @@ pub enum PacketType {
     Session = 8,
 }
 
-pub type BatchID = u16;
+#[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(transparent)]
+pub struct BatchID(pub u16);
 
 #[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy)]
 #[repr(C)]
@@ -86,6 +524,7 @@ pub struct PacketTypeFecBatchID {
 pub struct Options(u16);
 
 impl Options {
+    #[inline]
     pub fn construct(flags: &[OptionFlags]) -> Self {
         Self(
             flags
@@ -97,45 +536,38 @@ impl Options {
     }
 
     #[inline]
-    pub fn contains(&self, flag: OptionFlags) -> bool {
+    pub const fn contains(&self, flag: OptionFlags) -> bool {
         self.0 & (flag as u16) != 0
     }
 
     #[must_use]
-    pub fn remove(mut self, flags: &[OptionFlags]) -> Self {
-        self.0 &= !flags
-            .iter()
-            .map(|x| *x as u16)
-            .reduce(|acc, x| acc | x)
-            .unwrap_or(0);
+    pub const fn remove(mut self, flag: OptionFlags) -> Self {
+        self.0 &= !(flag as u16);
         self
     }
 
     #[allow(clippy::should_implement_trait)]
     #[must_use]
-    pub fn add(mut self, flags: &[OptionFlags]) -> Self {
-        self.0 |= flags
-            .iter()
-            .map(|x| *x as u16)
-            .reduce(|acc, x| acc | x)
-            .unwrap_or(0);
+    pub const fn add(mut self, flag: OptionFlags) -> Self {
+        self.0 |= flag as u16;
         self
     }
 
-    // TODO: make a macro to get the list of all variants from an enum
     pub fn deconstruct(&self) -> Vec<OptionFlags> {
-        let mut opts = vec![];
-        if (OptionFlags::RequireAck as u16) & self.0 != 0 {
-            opts.push(OptionFlags::RequireAck);
-        }
-        opts
+        OptionFlags::VARIANTS
+            .iter()
+            .copied()
+            .filter(|e| (*e as u16) & self.0 != 0)
+            .collect()
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Display)]
 #[repr(u8)]
+#[variants_array]
 pub enum OptionFlags {
     RequireAck = 1 << 0,
+    Metadata = 1 << 1,
 }
 
 #[repr(C)]
@@ -176,13 +608,13 @@ impl FECInfo {
 
 #[repr(C)]
 #[derive(Debug, PacketDeserialize, PacketSerialize)]
-struct ByteRange {
-    start: u32,
+pub struct ByteRange {
+    start: BytePosition,
     length: u16,
 }
 
 impl ByteRange {
-    pub fn new(start: u32, length: u16) -> Self {
+    pub fn new(start: BytePosition, length: u16) -> Self {
         debug_assert!(
             length as usize <= MAX_PAYLOAD_LENGTH,
             "Invariant broken while constructing a `ByteRange`:\
@@ -193,73 +625,20 @@ impl ByteRange {
 
     pub fn concat(&mut self, other: &ByteRange) -> bool {
         debug_assert!(
-            self.start + self.length as u32 == other.start
-                || other.start + other.length as u32 == self.start,
+            self.start.0 + self.length as u32 == other.start.0
+                || other.start.0 + other.length as u32 == self.start.0,
             "Invariant broken while trying to concatincate two `ByteRange`s: The two are not continous. \
             self: {self:?}, other: {other:?}"
         );
 
-        if u16::try_from(self.length as u32 + other.length as u32).is_ok() {
-            self.length += other.length;
-            if other.start + other.length as u32 == self.start {
+        if let Some(res) = self.length.checked_add(other.length) {
+            self.length = res;
+            if other.start.0 + other.length as u32 == self.start.0 {
                 self.start = other.start;
             }
             true
         } else {
             false
-        }
-    }
-}
-
-// TODO: finalize after encryption is understood
-#[repr(C)]
-#[derive(PacketSerialize, PacketDeserialize)]
-struct HelloPacket {
-    pub version: Version, // 16
-    pub opts: Options,    // 16
-    pub packet_type: PacketType,
-    pub control_type: ControlType,
-    pub reserved: u16,
-    pub timestamp_ms: u64,
-    pub proposed_session_id: u64,
-    pub encryption_public_key: Key,
-    pub signing_public_key: Key,
-}
-
-#[repr(C)]
-#[derive(PacketSerialize, PacketDeserialize)]
-struct RetransmitPacket {
-    pub version: Version, // 16
-    pub opts: Options,    // 16
-    pub packet_type: PacketType,
-    pub control_type: ControlType,
-    pub reserved: u16,
-    pub session_id: SessionId,
-    pub payload: Vec<ByteRange>,
-}
-
-impl RetransmitPacket {
-    // closest I can get to `MAX_PAYLOAD_LENGTH` while aligning to 6 bytes
-    const LOCAL_MAX_PAYLOAD_LENGTH: usize = 1398;
-    const HEADER_SIZE: usize = size_of::<Self>() - Self::LOCAL_MAX_PAYLOAD_LENGTH;
-
-    pub fn new(opts: Options, session_id: SessionId, payload: Vec<ByteRange>) -> Self {
-        debug_assert!(
-            payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
-            "Invariant broken while constructing a `RetransmitPacket`: payload bigger than allowed max size: {} `ByteRange`s ({} bytes) > {} `ByteRange`s ({} bytes)",
-            payload.len(),
-            (payload.len() * size_of::<ByteRange>()),
-            (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
-            Self::LOCAL_MAX_PAYLOAD_LENGTH
-        );
-        Self {
-            version: Version::CURRENT_VERSION,
-            opts: opts.add(&[OptionFlags::RequireAck]),
-            packet_type: PacketType::Session,
-            control_type: ControlType::Retransmit,
-            reserved: 0,
-            session_id,
-            payload,
         }
     }
 }
@@ -301,36 +680,6 @@ impl PacketDeserialize for Vec<ByteRange> {
     }
 }
 
-#[repr(C)]
-#[derive(PacketSerialize)]
-struct TrackRequestPacket {
-    pub version: Version, // 16
-    pub opts: Options,    // 16
-    pub packet_type: PacketType,
-    pub control_type: ControlType,
-    pub reserved: u16,
-    pub session_id: SessionId,
-    pub payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
-}
-
-impl TrackRequestPacket {
-    pub fn new(
-        opts: Options,
-        session_id: SessionId,
-        payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
-    ) -> Self {
-        Self {
-            version: Version::CURRENT_VERSION,
-            opts: opts.add(&[OptionFlags::RequireAck]),
-            packet_type: PacketType::Session,
-            control_type: ControlType::TrackRequest,
-            reserved: 0,
-            session_id,
-            payload,
-        }
-    }
-}
-
 // TODO: figure this shit out with the hello packet
 #[repr(C)]
 struct SessionKeyPart {
@@ -348,146 +697,6 @@ struct SessionKeyPart {
     pub mac_key_part: Key,
 }
 
-#[repr(C)]
-#[derive(PacketDeserialize, PacketSerialize, Debug)]
-pub struct DataPacket {
-    pub version: Version,
-    pub opts: Options,
-    pub packet_type_batch_id: PacketTypeFecBatchID,
-    pub fec_info: FECInfo,
-    pub session_id: SessionId,
-    pub timestamp_ms: u64,
-    pub byte_range_start: u32,
-    pub payload: Vec<u8>,
-}
-
-impl DataPacket {
-    pub const HEADER_SIZE: usize =
-        size_of::<DataPacket>() - size_of::<Box<[u8; MAX_PAYLOAD_LENGTH]>>();
-    pub const MIN_SIZE: usize = DataPacket::HEADER_SIZE + 1;
-
-    pub fn new(
-        opts: Options,
-        batch_id: BatchID,
-        fec_info: FECInfo,
-        session_id: SessionId,
-        byte_range_start: u32,
-        payload: Vec<u8>,
-    ) -> Self {
-        let version = Version::CURRENT_VERSION;
-        let packet_type_batch_id = PacketTypeFecBatchID {
-            packet_type: PacketType::Data,
-            batch_id,
-        };
-        let timestamp_ms = Instant::now()
-            .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
-            .as_millis() as u64;
-
-        Self {
-            version,
-            opts,
-            packet_type_batch_id,
-            fec_info,
-            session_id,
-            timestamp_ms,
-            byte_range_start,
-            payload,
-        }
-    }
-}
-
-#[repr(C)]
-#[derive(PacketDeserialize, PacketSerialize, Debug)]
-pub struct ParityPacket {
-    pub version: Version,
-    pub opts: Options,
-    pub packet_type_batch_id: PacketTypeFecBatchID,
-    pub fec_info: FECInfo,
-    pub session_id: SessionId,
-    pub timestamp_ms: u64,
-    pub payload: Vec<u8>,
-}
-
-impl ParityPacket {
-    pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH + 4;
-    pub const HEADER_SIZE: usize = size_of::<ParityPacket>() - size_of::<Vec<u8>>();
-    pub const MIN_SIZE: usize = ParityPacket::HEADER_SIZE + 9;
-
-    pub fn new(
-        opts: Options,
-        batch_id: BatchID,
-        fec_info: FECInfo,
-        session_id: SessionId,
-        payload: Vec<u8>,
-    ) -> Self {
-        let version = Version::CURRENT_VERSION;
-        let packet_type_batch_id = PacketTypeFecBatchID {
-            packet_type: PacketType::Parity,
-            batch_id,
-        };
-        let timestamp_ms = Instant::now()
-            .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
-            .as_millis() as u64;
-
-        Self {
-            version,
-            opts,
-            packet_type_batch_id,
-            fec_info,
-            session_id,
-            timestamp_ms,
-            payload,
-        }
-    }
-}
-#[repr(C)]
-#[derive(PacketDeserialize, PacketSerialize, Debug, PartialEq)]
-pub struct AckPacket {
-    pub version: Version,
-    pub opts: Options,
-    pub packet_type: PacketType,
-    reserved: u8,
-    pub session_id: SessionId,
-    // encrypted
-    pub timestamp_ms: u64,
-    pub ack_timestamp_ms: u64,
-    pub ack_opts: Options,
-    pub ack_packet_type: PacketType,
-}
-
-impl AckPacket {
-    pub const HEADER_SIZE: usize = size_of::<AckPacket>();
-    pub const MIN_SIZE: usize = AckPacket::HEADER_SIZE;
-
-    pub fn new(
-        opts: Options,
-        session_id: SessionId,
-        ack_timestamp_ms: u64,
-        ack_opts: Options,
-        ack_packet_type: PacketType,
-    ) -> Self {
-        debug_assert!(
-            !opts.contains(OptionFlags::RequireAck),
-            "Invariant broken while constructing `AckPacket`: \
-            flag `RequireAck` was present, which should not be allowed."
-        );
-        #[allow(clippy::cast_possible_truncation)]
-        Self {
-            version: Version::CURRENT_VERSION,
-            opts,
-            packet_type: PacketType::Ack,
-            reserved: 0,
-            session_id,
-            timestamp_ms: Instant::now()
-                .duration_since(*PROTOCOL_EPOCH.get_or_init(Instant::now))
-                .as_millis() as u64,
-            ack_timestamp_ms,
-            ack_opts,
-            ack_packet_type,
-        }
-    }
-}
-
 #[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum ControlType {
@@ -499,5 +708,6 @@ pub enum ControlType {
     Pause,
     Seek,
     TrackRequest,
+    MetadataRequest,
     SessionKeyOffer,
 }
