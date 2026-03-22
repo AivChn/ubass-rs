@@ -10,7 +10,7 @@ use derive_more::Display;
 use tokio::time::Instant;
 use ubass_macros::{PacketDeserialize, PacketSerialize};
 
-use super::fingerprint::Fingerprint;
+use super::fingerprint::*;
 
 pub const MAX_PAYLOAD_LENGTH: usize = 1400;
 
@@ -25,7 +25,7 @@ pub enum PacketWrapper {
 }
 
 #[repr(C)]
-#[derive(Fingerprint, PacketSerialize, PacketDeserialize)]
+#[derive(HeaderSerialize, PacketSerialize, PacketDeserialize)]
 pub struct HelloPacket {
     pub version: Version,
     pub opts: Options,
@@ -69,7 +69,7 @@ impl HelloPacket {
 }
 
 #[repr(C)]
-#[derive(Fingerprint, PacketSerialize)]
+#[derive(HeaderSerialize, PacketSerialize)]
 pub struct TrackRequestPacket {
     pub version: Version,
     pub opts: Options,
@@ -126,7 +126,7 @@ impl TrackRequestPacket {
 }
 
 #[repr(C)]
-#[derive(Fingerprint, PacketDeserialize, PacketSerialize)]
+#[derive(HeaderSerialize, PacketDeserialize, PacketSerialize)]
 pub struct DataPacket {
     pub version: Version,
     pub opts: Options,
@@ -170,7 +170,7 @@ impl DataPacket {
     }
 }
 
-#[derive(Fingerprint, PacketDeserialize, PacketSerialize)]
+#[derive(HeaderSerialize, PacketDeserialize, PacketSerialize)]
 #[repr(C)]
 pub struct MetadataPacket {
     pub version: Version,
@@ -225,7 +225,7 @@ impl MetadataPacket {
 }
 
 #[repr(C)]
-#[derive(Fingerprint, PacketDeserialize, PacketSerialize)]
+#[derive(HeaderSerialize, PacketDeserialize, PacketSerialize)]
 pub struct ParityPacket {
     pub version: Version,
     pub opts: Options,
@@ -269,7 +269,7 @@ impl ParityPacket {
 }
 
 #[repr(C)]
-#[derive(Fingerprint, PacketDeserialize, PacketSerialize)]
+#[derive(HeaderSerialize, PacketDeserialize, PacketSerialize)]
 pub struct AckPacket {
     pub version: Version,
     pub opts: Options,
@@ -309,7 +309,7 @@ impl AckPacket {
 }
 
 #[repr(C)]
-#[derive(Fingerprint, PacketSerialize, PacketDeserialize)]
+#[derive(HeaderSerialize, PacketSerialize, PacketDeserialize)]
 pub struct RetransmitPacket {
     pub version: Version,
     pub opts: Options,
