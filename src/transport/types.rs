@@ -1,6 +1,5 @@
 use crate::{
     packet_processor::types::{PacketId, ProcessedPacket, TransportMessage},
-    packetizer::types::MAX_PAYLOAD_LENGTH,
     prelude::*,
 };
 use std::{cmp::min, fmt::Debug, sync::Arc};
