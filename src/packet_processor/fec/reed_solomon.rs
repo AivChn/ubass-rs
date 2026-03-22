@@ -74,7 +74,7 @@ impl From<(u8, &FECPacket, &[u8])> for ParityPacket {
             packet.batch_id,
             FECInfo::new(packet.batch_size, i, packet.recovery_count),
             packet.session_id,
-            payload.try_into().expect("Length is guaranteed by library"),
+            payload.into(),
         )
     }
 }

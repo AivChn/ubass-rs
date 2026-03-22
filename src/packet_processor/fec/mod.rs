@@ -110,7 +110,7 @@ impl From<DataPacket> for FECPacket {
         FECPacket {
             is_parity: false,
             session_id: value.session_id,
-            batch_id: value.packet_type_batch_id.batch_id,
+            batch_id: value.batch_id,
             batch_size: value.fec_info.batch_size,
             batch_pos: value.fec_info.batch_pos,
             recovery_count: value.fec_info.recovery_size,
