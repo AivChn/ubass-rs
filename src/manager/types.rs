@@ -38,6 +38,10 @@ impl EncryptionWindow {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (&self.cipher, x.to_be_bytes())
     }
+
+    pub fn get_cipher(&self) -> &Aes256GcmSiv {
+        &self.cipher
+    }
 }
 
 type EncryptionTable = HashMap<SessionId, EncryptionWindow>;
@@ -55,9 +59,9 @@ impl<'a> EncryptionMonitor<'a> {
     ///
     /// # Panics
     /// This function panics if the key is not yet created, which should be impossible
-    pub fn get(&self, session_id: SessionId) -> (&Aes256GcmSiv, [u8; 8]) {
+    pub fn get(&self, session_id: &SessionId) -> (&Aes256GcmSiv, [u8; 8]) {
         self.table
-            .get(&session_id)
+            .get(session_id)
             .unwrap_or_else(|| {
                 panic!(
                     "Invairant broken while accessing session table: \
@@ -65,6 +69,17 @@ impl<'a> EncryptionMonitor<'a> {
                 )
             })
             .get()
+    }
+    pub fn get_cipher(&self, session_id: &SessionId) -> &Aes256GcmSiv {
+        self.table
+            .get(session_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Invairant broken while accessing session table: \
+        session ({session_id}) does not have a key but is being accessed for encryption",
+                )
+            })
+            .get_cipher()
     }
 }
 
