@@ -589,7 +589,7 @@ pub struct SessionId(pub u64);
 pub struct FECInfo {
     pub batch_size: u8,
     pub batch_pos: u8,
-    pub recovery_size: u8,
+    pub recovery_count: u8,
 }
 
 impl FECInfo {
@@ -607,7 +607,7 @@ impl FECInfo {
         Self {
             batch_size,
             batch_pos,
-            recovery_size,
+            recovery_count: recovery_size,
         }
     }
 }
