@@ -1,3 +1,5 @@
+use std::net::SocketAddrV4;
+
 use crate::prelude::*;
 
 pub use crate::{packetizer::types::PacketWrapper, transport::types::ReceivedPacket};
@@ -47,6 +49,7 @@ pub struct PacketId {
 /// and retransmission logic. Uses Vec<u8> since it can represent any packet type.
 #[derive(Clone, Debug)]
 pub struct ProcessedPacket {
+    pub dest_addr: SocketAddrV4,
     pub packet_id: PacketId,
     pub packet_type: PacketType,
     pub data: Vec<u8>,
