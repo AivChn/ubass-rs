@@ -375,20 +375,20 @@ fn get_fingerprint_impl(input: DeriveInput) -> TokenStream {
     }
 
     quote! {
-        impl Fingerprint for #ident {
-            fn fingerprint(&self) -> [u8; 16] {
+        impl HeaderSerialize for #ident {
+            fn headers(&self) -> Vec<u8> {
                 let mut buf = vec![0u8; #struct_size];
                 #(#serialize_logic)*
 
-                xxhash_rust::xxh3::xxh3_128(&buf).to_be_bytes()
+                buf
             }
         }
     }
     .into()
 }
 
-#[proc_macro_derive(Fingerprint)]
-pub fn fingerprint_derive_macro(item: TokenStream) -> TokenStream {
+#[proc_macro_derive(HeaderSerialize)]
+pub fn header_serialize_derive_macro(item: TokenStream) -> TokenStream {
     let input = syn::parse::<DeriveInput>(item)
         .map_err(|e| panic!("{}", e.to_string()))
         .unwrap();
