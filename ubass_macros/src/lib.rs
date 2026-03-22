@@ -1,11 +1,11 @@
 use core::panic;
-use std::vec;
 
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::{
-    DataStruct, DeriveInput, Expr, Type,
+    DataStruct, DeriveInput, Expr, Item, Type,
     parse::{Parse, ParseStream},
+    parse_macro_input,
 };
 
 struct SerializeAs {
@@ -357,7 +357,64 @@ pub fn deserialize_derive_macro(item: TokenStream) -> TokenStream {
     }
 }
 
+fn get_fingerprint_impl(input: DeriveInput) -> TokenStream {
+    let StructRep { ident, fields } = StructRep::new(input).expect("Failed to parse struct");
+    let StructFields::Named { idents, types: _ } = fields else {
+        panic!("This trait is meant for named structs only");
+    };
+
+    let mut struct_size = quote! { 0 };
+    let mut serialize_logic = vec![];
+
+    for i in idents {
+        if i.to_string().as_str() == "payload" {
+            continue;
+        }
+        serialize_logic.push(quote! { self.#i.serialize(&mut buf[(#struct_size)..]); });
+        struct_size = quote! { #struct_size + self.#i.sized() };
+    }
+
+    quote! {
+        impl Fingerprint for #ident {
+            fn fingerprint(&self) -> [u8; 16] {
+                let mut buf = vec![0u8; #struct_size];
+                #(#serialize_logic)*
+
+                xxhash_rust::xxh3::xxh3_128(&buf).to_be_bytes()
+            }
+        }
+    }
+    .into()
+}
+
+#[proc_macro_derive(Fingerprint)]
+pub fn fingerprint_derive_macro(item: TokenStream) -> TokenStream {
+    let input = syn::parse::<DeriveInput>(item)
+        .map_err(|e| panic!("{}", e.to_string()))
+        .unwrap();
+    get_fingerprint_impl(input)
+}
+
 #[proc_macro_attribute]
-pub fn remove(_attr: TokenStream, _item: TokenStream) -> TokenStream {
-    TokenStream::new()
+pub fn variants_array(_attrs: TokenStream, item: TokenStream) -> TokenStream {
+    let mut item_copy = item.clone();
+    let enum_item = parse_macro_input!(item as syn::Item);
+    let Item::Enum(rep) = enum_item else {
+        panic!("This attribute is for enums only");
+    };
+
+    let ident = rep.ident;
+    let variants_size = rep.variants.len();
+    let variants = rep.variants.into_iter().map(|e| {
+        let e = e.ident;
+        quote! {#ident::#e,}
+    });
+
+    item_copy.extend(TokenStream::from(quote! {
+        impl #ident {
+            pub const VARIANTS: [Self; #variants_size] = [#(#variants)*];
+        }
+    }));
+
+    item_copy
 }
