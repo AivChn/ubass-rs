@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 
 use crate::packet_processor::serialize::{PacketDeserialize, PacketSerialize};
 
-use crate::packetizer::types::{BatchID, DataPacket, MAX_PAYLOAD_LENGTH};
+use crate::packetizer::types::{BatchID, DataPacket, FECInfo, MAX_PAYLOAD_LENGTH};
 use crate::packetizer::types::{ParityPacket, SessionId};
 use crate::transport::types::ReceivedPacket;
 
@@ -96,9 +96,7 @@ struct FECPacket {
     is_parity: bool,
     session_id: SessionId,
     batch_id: BatchID, // u10 in practice
-    batch_size: u8,
-    batch_pos: u8,
-    recovery_count: u8,
+    fec_info: FECInfo,
     data: FECData, // 1404 bytes
 }
 
@@ -111,9 +109,7 @@ impl From<DataPacket> for FECPacket {
             is_parity: false,
             session_id: value.session_id,
             batch_id: value.batch_id,
-            batch_size: value.fec_info.batch_size,
-            batch_pos: value.fec_info.batch_pos,
-            recovery_count: value.fec_info.recovery_size,
+            fec_info: value.fec_info,
             data,
         }
     }
@@ -127,9 +123,7 @@ impl From<ParityPacket> for FECPacket {
             is_parity: true,
             session_id: value.session_id,
             batch_id: value.packet_type_batch_id.batch_id,
-            batch_size: value.fec_info.batch_size,
-            batch_pos: value.fec_info.batch_pos,
-            recovery_count: value.fec_info.recovery_size,
+            fec_info: value.fec_info,
             data,
         }
     }

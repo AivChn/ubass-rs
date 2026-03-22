@@ -176,7 +176,7 @@ impl Xor {
             let mut guard = self.outbound.lock().await;
             guard
                 .entry((packet.batch_id, packet.session_id))
-                .or_insert(OutboundBatchData::new(packet.batch_size).into())
+                .or_insert(OutboundBatchData::new(packet.fec_info.batch_size).into())
                 .clone()
         };
 
@@ -200,7 +200,7 @@ impl Xor {
             // prepare parity packet fields
             let payload = batch.product.0.clone();
             let opts = Options::construct(&[]);
-            let fec_info = FECInfo::new(packet.batch_size, 0, 1);
+            let fec_info = FECInfo::new(packet.fec_info.batch_size, 0, 1);
             let session_id = packet.session_id;
 
             Some(vec![ParityPacket::new(
@@ -222,7 +222,7 @@ impl Xor {
             let mut guard = self.inbound.lock().await;
             guard
                 .entry((packet.batch_id, packet.session_id))
-                .or_insert(InboundBatchData::new(packet.batch_size).into())
+                .or_insert(InboundBatchData::new(packet.fec_info.batch_size).into())
                 .clone()
         };
 

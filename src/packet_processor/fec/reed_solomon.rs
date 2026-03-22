@@ -25,8 +25,8 @@ struct InboundBatchData {
 
 impl From<&FECPacket> for Arc<Mutex<InboundBatchData>> {
     fn from(value: &FECPacket) -> Self {
-        let batch_size = value.batch_size;
-        let recovery_count = value.recovery_count;
+        let batch_size = value.fec_info.batch_size;
+        let recovery_count = value.fec_info.recovery_count;
         Arc::new(Mutex::new(InboundBatchData {
             decoder: ReedSolomonDecoder::new(
                 batch_size as usize,
@@ -50,8 +50,8 @@ struct OutboundBatchData {
 
 impl From<&FECPacket> for Arc<Mutex<OutboundBatchData>> {
     fn from(value: &FECPacket) -> Self {
-        let batch_size = value.batch_size;
-        let recovery_count = value.recovery_count;
+        let batch_size = value.fec_info.batch_size;
+        let recovery_count = value.fec_info.recovery_count;
         Arc::new(Mutex::new(OutboundBatchData {
             encoder: ReedSolomonEncoder::new(
                 batch_size as usize,
@@ -72,7 +72,11 @@ impl From<(u8, &FECPacket, &[u8])> for ParityPacket {
         ParityPacket::new(
             Options::construct(&[]),
             packet.batch_id,
-            FECInfo::new(packet.batch_size, i, packet.recovery_count),
+            FECInfo::new(
+                packet.fec_info.batch_size,
+                i,
+                packet.fec_info.recovery_count,
+            ),
             packet.session_id,
             payload.into(),
         )
@@ -149,12 +153,12 @@ impl RS {
         if packet.is_parity {
             batch
                 .decoder
-                .add_recovery_shard(packet.batch_pos as usize, *packet.data.0);
+                .add_recovery_shard(packet.fec_info.batch_pos as usize, *packet.data.0);
             batch.recovery_count += 1;
         } else {
             batch
                 .decoder
-                .add_original_shard(packet.batch_pos as usize, *packet.data.0);
+                .add_original_shard(packet.fec_info.batch_pos as usize, *packet.data.0);
             batch.received_count += 1;
         }
 
