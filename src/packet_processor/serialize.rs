@@ -49,8 +49,8 @@ impl PacketSerialize for SocketAddrV4 {
         if buf.len() < self.sized() {
             false
         } else {
-            buf.copy_from_slice(&self.ip().octets());
-            buf[4..].copy_from_slice(&self.port().to_be_bytes());
+            self.ip().octets().serialize(buf);
+            self.port().serialize(&mut buf[4..]);
 
             true
         }
@@ -67,7 +67,7 @@ impl PacketSerialize for Vec<u8> {
         if buf.len() < self.len() {
             false
         } else {
-            buf.copy_from_slice(self);
+            buf[..self.len()].copy_from_slice(self);
             true
         }
     }
@@ -100,7 +100,7 @@ impl<const N: usize> PacketSerialize for [u8; N] {
         if buf.len() < N {
             false
         } else {
-            buf.copy_from_slice(self);
+            buf[..N].copy_from_slice(self);
             true
         }
     }
@@ -116,7 +116,7 @@ impl<const N: usize> PacketSerialize for Box<[u8; N]> {
         if buf.len() < N {
             false
         } else {
-            buf.copy_from_slice(&**self);
+            buf[..N].copy_from_slice(&**self);
             true
         }
     }

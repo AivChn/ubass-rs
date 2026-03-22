@@ -1,3 +1,4 @@
+mod encryption;
 mod fec;
 mod inbound;
 mod outbound;
