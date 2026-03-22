@@ -58,6 +58,23 @@ impl PacketSerialize for Vec<u8> {
     }
 }
 
+impl<T: PacketSerialize + Default + PartialEq> PacketSerialize for Option<T> {
+    fn serialize(&self, buf: &mut [u8]) -> bool {
+        if buf.len() < self.sized() {
+            false
+        } else {
+            match self {
+                None => T::default().serialize(buf),
+                Some(value) => value.serialize(buf),
+            }
+        }
+    }
+
+    fn sized(&self) -> usize {
+        size_of::<T>()
+    }
+}
+
 impl<const N: usize> PacketSerialize for [u8; N] {
     fn serialize(&self, buf: &mut [u8]) -> bool {
         if buf.len() < N {
@@ -92,6 +109,24 @@ impl<const N: usize> PacketSerialize for Box<[u8; N]> {
 
 pub trait PacketDeserialize: Sized {
     fn deserialize(bytes: &[u8]) -> Option<Self>;
+}
+
+impl<T: PacketDeserialize + Default + PartialEq> PacketDeserialize for Option<T> {
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        let value = T::deserialize(bytes)?;
+
+        if value == T::default() {
+            Some(None)
+        } else {
+            Some(Some(value))
+        }
+    }
+}
+
+impl<const N: usize> PacketDeserialize for [u8; N] {
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        bytes.get(..N)?.try_into().ok()
+    }
 }
 
 impl PacketDeserialize for Vec<u8> {
