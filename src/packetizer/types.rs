@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::packet_processor::serialize::{PacketDeserialize, PacketSerialize};
+use aes_gcm_siv::aead::generic_array::sequence::Concat;
 use derive_more::Display;
 use tokio::time::Instant;
 use ubass_macros::{PacketDeserialize, PacketSerialize};
@@ -407,20 +408,209 @@ impl RetransmitPacket {
 
 #[derive(PacketDeserialize, PacketSerialize)]
 #[repr(C)]
+pub struct SessionDoesNotExistErrorPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub error_type: ErrorType,
+    pub reserved: Reserved<2>,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+}
+
+impl SessionDoesNotExistErrorPacket {
+    pub const HEADER_SIZE: usize = size_of::<Self>();
+
+    pub fn new(opts: Options, session_id: SessionId) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let packet_type = PacketType::Error;
+        let error_type = ErrorType::SessionDoesNotExist;
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            error_type,
+            reserved,
+            session_id,
+            timestamp,
+        }
+    }
+}
+
+#[derive(PacketDeserialize, PacketSerialize)]
+#[repr(C)]
+pub struct UnexpectedPacketErrorPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub error_type: ErrorType,
+    pub reserved: Reserved<2>,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+    pub received_packet_type: PacketType,
+    pub received_secondary_type: SecondaryType,
+    pub received_fingerprint: PacketFingerprint,
+}
+
+impl UnexpectedPacketErrorPacket {
+    pub const HEADER_SIZE: usize = size_of::<Self>();
+
+    fn new(
+        opts: Options,
+        session_id: SessionId,
+        received_packet_type: PacketType,
+        received_secondary_type: SecondaryType,
+        received_fingerprint: PacketFingerprint,
+        incomprehensible: bool,
+    ) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let packet_type = PacketType::Error;
+        let error_type = if incomprehensible {
+            ErrorType::IncomprehensiblePacket
+        } else {
+            ErrorType::UnexpectedPacket
+        };
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            error_type,
+            reserved,
+            session_id,
+            timestamp,
+            received_packet_type,
+            received_secondary_type,
+            received_fingerprint,
+        }
+    }
+
+    pub fn unexpected(
+        opts: Options,
+        session_id: SessionId,
+        received_packet_type: PacketType,
+        received_secondary_type: SecondaryType,
+        received_fingerprint: PacketFingerprint,
+    ) -> Self {
+        Self::new(
+            opts,
+            session_id,
+            received_packet_type,
+            received_secondary_type,
+            received_fingerprint,
+            false,
+        )
+    }
+
+    pub fn incomprehensible(
+        opts: Options,
+        session_id: SessionId,
+        received_packet_type: PacketType,
+        received_secondary_type: SecondaryType,
+        received_fingerprint: PacketFingerprint,
+    ) -> Self {
+        Self::new(
+            opts,
+            session_id,
+            received_packet_type,
+            received_secondary_type,
+            received_fingerprint,
+            true,
+        )
+    }
+}
+
+pub struct AppRejectErrorPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub error_type: ErrorType,
+    pub reserved: Reserved<2>,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+    pub received_type: PacketType,
+    pub received_control_type: ControlType,
+    pub received_fingerprint: PacketFingerprint,
+    pub payload: Vec<u8>,
+}
+
+impl AppRejectErrorPacket {
+    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<Vec<u8>>();
+
+    pub fn new(
+        opts: Options,
+        session_id: SessionId,
+        received_type: PacketType,
+        received_control_type: ControlType,
+        received_fingerprint: PacketFingerprint,
+        message: String,
+    ) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let opts = opts.add(OptionFlags::RequireAck);
+        let packet_type = PacketType::Error;
+        let error_type = ErrorType::AppReject;
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+        let payload = message.into_bytes();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            error_type,
+            reserved,
+            session_id,
+            timestamp,
+            received_type,
+            received_control_type,
+            received_fingerprint,
+            payload,
+        }
+    }
+}
+
+#[derive(PacketDeserialize, PacketSerialize)]
+#[repr(C)]
 pub struct IncompatibleVersion {
     pub zero_version: Version,
     pub min_version: Version,
 }
 
 impl IncompatibleVersion {
-    pub fn packet() -> [u8; 4] {
-        let mut buffer = [0u8; 4];
+    pub const HEADER_SIZE: usize = size_of::<Self>();
+    pub fn packet() -> [u8; Self::HEADER_SIZE] {
+        let mut buffer = [0u8; Self::HEADER_SIZE];
         Self {
             zero_version: Version::new(0, 0, 0),
             min_version: Version::MIN_COMPATIBLE_VERSION,
         }
         .serialize(&mut buffer);
         buffer
+    }
+}
+
+#[derive(PacketDeserialize, PacketSerialize)]
+#[repr(transparent)]
+pub struct SecondaryType([u8; 2]);
+
+impl From<ControlType> for SecondaryType {
+    fn from(value: ControlType) -> Self {
+        let mut buf = [0u8; 2];
+        value.serialize(&mut buf);
+        Self(buf)
+    }
+}
+
+impl From<ErrorType> for SecondaryType {
+    fn from(value: ErrorType) -> Self {
+        let mut buf = [0u8; 2];
+        value.serialize(&mut buf);
+        Self(buf)
     }
 }
 
