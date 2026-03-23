@@ -406,6 +406,25 @@ impl RetransmitPacket {
 }
 
 #[derive(PacketDeserialize, PacketSerialize)]
+#[repr(C)]
+pub struct IncompatibleVersion {
+    pub zero_version: Version,
+    pub min_version: Version,
+}
+
+impl IncompatibleVersion {
+    pub fn packet() -> [u8; 4] {
+        let mut buffer = [0u8; 4];
+        Self {
+            zero_version: Version::new(0, 0, 0),
+            min_version: Version::MIN_COMPATIBLE_VERSION,
+        }
+        .serialize(&mut buffer);
+        buffer
+    }
+}
+
+#[derive(PacketDeserialize, PacketSerialize)]
 #[repr(transparent)]
 pub struct PacketFingerprint([u8; 16]);
 
@@ -553,11 +572,10 @@ pub enum PacketType {
     Metadata = 2,
     Parity = 3,
     Ack = 4,
-    Control = 5,
-    ConnectionStat = 6,
     Host = 7,
     Session = 8,
     Playback = 9,
+    Error = 10,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -636,6 +654,15 @@ impl From<PlaybackControlType> for ControlType {
     fn from(value: PlaybackControlType) -> Self {
         Self::Playback(value)
     }
+}
+
+#[derive(PacketSerialize, PacketDeserialize, Clone, Copy)]
+#[repr(u8)]
+pub enum ErrorType {
+    AppReject = 1,
+    UnexpectedPacket,
+    IncomprehensiblePacket,
+    SessionDoesNotExist,
 }
 
 #[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
