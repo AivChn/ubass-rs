@@ -9,7 +9,7 @@ use std::{
 };
 
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 use uniffi::{ForeignBytes, foreignbytes};
 
 use crate::packetizer::{
@@ -56,12 +56,43 @@ impl Hash for FingerprintPtr {
 }
 
 pub struct FingerprintMonitor {
+    table: RwLock<HashMap<SessionId, Arc<FingerprintWindow>>>,
+}
+
+impl Default for FingerprintMonitor {
+    fn default() -> Self {
+        Self {
+            table: RwLock::new(HashMap::new()),
+        }
+    }
+}
+
+impl FingerprintMonitor {
+    pub async fn add(&self, session_id: SessionId) {
+        let mut table = self.table.write().await;
+        table.insert(session_id, Default::default());
+    }
+
+    pub async fn get(&self, session_id: SessionId) -> Arc<FingerprintWindow> {
+        let table = self.table.read().await;
+        let Some(window) = table.get(&session_id) else {
+            panic!(
+                "Invairant broken while trying to get a `FingerprintWindow`:\
+            {session_id} is not a valid session"
+            );
+        };
+
+        window.clone()
+    }
+}
+
+pub struct FingerprintWindow {
     fingerprints: Mutex<HashSet<Box<PacketFingerprint>>>,
     queue: Mutex<VecDeque<(Timestamp, FingerprintPtr)>>,
     canceled: AtomicBool,
 }
 
-impl Default for FingerprintMonitor {
+impl Default for FingerprintWindow {
     fn default() -> Self {
         Self {
             fingerprints: Mutex::new(HashSet::new()),
@@ -71,7 +102,7 @@ impl Default for FingerprintMonitor {
     }
 }
 
-impl FingerprintMonitor {
+impl FingerprintWindow {
     const PRUNE_INTERVAL: u64 = 7 * 1000;
 
     pub async fn init(self: Arc<Self>) {
