@@ -10,11 +10,11 @@ pub enum Encryptable {
     Parity(ParityPacket),
 }
 
-fn get_nonce(session_id: SessionId, counter: &[u8; 8]) -> [u8; 12] {
+fn get_nonce(session_id: SessionId, counter: [u8; 8]) -> [u8; 12] {
     let mut result = [0u8; 12];
     let session_part = &session_id.0.to_be_bytes()[..4];
     result[..4].copy_from_slice(session_part);
-    result[4..].copy_from_slice(counter);
+    result[4..].copy_from_slice(&counter);
     result
 }
 
@@ -25,7 +25,7 @@ pub fn encrypt(packet: &mut Encryptable, monitor: &EncryptionMonitor) {
     };
 
     let (cipher, counter) = monitor.get(&session_id);
-    let nonce = Nonce::from(get_nonce(session_id, &counter));
+    let nonce = Nonce::from(get_nonce(session_id, counter));
 
     cipher.encrypt_in_place(&nonce, &aad, payload);
 
@@ -44,14 +44,14 @@ pub fn decrypt(packet: &mut Encryptable, monitor: &EncryptionMonitor) -> bool {
         .collect::<Vec<_>>()
         .try_into()
         .expect("length is guaranteed");
-    let nonce = Nonce::from(get_nonce(session_id, &counter));
+    let nonce = Nonce::from(get_nonce(session_id, counter));
 
     cipher.decrypt_in_place(&nonce, &aad, payload).is_ok()
 }
 
 pub fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: &EncryptionMonitor) {
     let (cipher, counter) = monitor.get(&session_id);
-    let nonce = Nonce::from(get_nonce(session_id, &counter));
+    let nonce = Nonce::from(get_nonce(session_id, counter));
 
     let mut tag = vec![];
 
@@ -67,7 +67,7 @@ pub fn authenticate(packet: &mut Vec<u8>, session_id: SessionId, monitor: &Encry
         .collect::<Vec<_>>()
         .try_into()
         .expect("length is guaranteed");
-    let nonce = Nonce::from(get_nonce(session_id, &counter));
+    let nonce = Nonce::from(get_nonce(session_id, counter));
 
     let mut tag: Vec<u8> = packet.drain(packet.len() - 16..).collect();
 
