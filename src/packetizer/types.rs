@@ -270,6 +270,51 @@ impl ParityPacket {
 
 #[repr(C)]
 #[derive(HeaderSerialize, PacketDeserialize, PacketSerialize)]
+pub struct PlaybackStatusPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub control_type: ControlType,
+    pub reserved: Reserved<2>,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+}
+
+impl PlaybackStatusPacket {
+    fn new(opts: Options, session_id: SessionId, playback_type: PlaybackType) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let opts = opts.add(OptionFlags::RequireAck);
+        let packet_type = PacketType::Playback;
+        let control_type = playback_type.into();
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            control_type,
+            reserved,
+            session_id,
+            timestamp,
+        }
+    }
+
+    pub fn play(opts: Options, session_id: SessionId) -> Self {
+        Self::new(opts, session_id, PlaybackType::Play)
+    }
+
+    pub fn pause(opts: Options, session_id: SessionId) -> Self {
+        Self::new(opts, session_id, PlaybackType::Pause)
+    }
+
+    pub fn stop(opts: Options, session_id: SessionId) -> Self {
+        Self::new(opts, session_id, PlaybackType::Stop)
+    }
+}
+
+#[repr(C)]
+#[derive(HeaderSerialize, PacketDeserialize, PacketSerialize)]
 pub struct AckPacket {
     pub version: Version,
     pub opts: Options,
@@ -512,6 +557,7 @@ pub enum PacketType {
     ConnectionStat = 6,
     Host = 7,
     Session = 8,
+    Playback = 9,
 }
 
 #[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -686,21 +732,21 @@ impl PacketDeserialize for Vec<ByteRange> {
     }
 }
 
-// TODO: figure this shit out with the hello packet
-#[repr(C)]
-struct SessionKeyPart {
-    pub version: Version, // 16
-    pub opts: Options,    // 16
-    pub packet_type: PacketType,
-    pub control_type: ControlType,
-    pub reserved: u16,
-    pub session_id: SessionId,
-    pub encryption_n_value: Key,
-    pub encryption_g_value: u128,
-    pub encryption_key_part: Key,
-    pub mac_n_value: Key,
-    pub mac_g_value: u128,
-    pub mac_key_part: Key,
+enum PlaybackType {
+    Play,
+    Pause,
+    Stop,
+}
+
+impl From<PlaybackType> for ControlType {
+    #[inline]
+    fn from(value: PlaybackType) -> Self {
+        match value {
+            PlaybackType::Play => Self::Play,
+            PlaybackType::Pause => Self::Pause,
+            PlaybackType::Stop => Self::Stop,
+        }
+    }
 }
 
 #[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, PartialEq)]
