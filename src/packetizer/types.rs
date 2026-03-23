@@ -11,7 +11,7 @@ use derive_more::Display;
 use tokio::time::Instant;
 use ubass_macros::{PacketDeserialize, PacketSerialize};
 
-use super::fingerprint::*;
+use super::fingerprint::{Fingerprint, HeaderSerialize};
 
 pub const MAX_PAYLOAD_LENGTH: usize = 1400;
 
@@ -795,10 +795,8 @@ impl PacketDeserialize for ControlType {
             Some(Self::Host(control_type))
         } else if let Some(control_type) = SessionControlType::deserialize(bytes) {
             Some(Self::Session(control_type))
-        } else if let Some(control_type) = PlaybackControlType::deserialize(bytes) {
-            Some(Self::Playback(control_type))
         } else {
-            None
+            PlaybackControlType::deserialize(bytes).map(Self::Playback)
         }
     }
 }
