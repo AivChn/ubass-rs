@@ -55,7 +55,7 @@ impl<'a> EncryptionMonitor<'a> {
         Self { table }
     }
 
-    /// returns the key and nonce counter for a specific session
+    /// returns the key and nonce counter, increasing it in the process, for a specific session
     ///
     /// # Panics
     /// This function panics if the key is not yet created, which should be impossible
@@ -70,6 +70,11 @@ impl<'a> EncryptionMonitor<'a> {
             })
             .get()
     }
+
+    /// returns the key without increasing the counter
+    ///
+    /// # Panics
+    /// This function panics if the key is not yet created, which should be impossible
     pub fn get_cipher(&self, session_id: &SessionId) -> &Aes256GcmSiv {
         self.table
             .get(session_id)
