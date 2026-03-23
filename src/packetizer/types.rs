@@ -49,7 +49,7 @@ impl HelloPacket {
     ) -> Self {
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Host;
-        let control_type = ControlType::Hello;
+        let control_type = ControlType::Host(HostControlType::Hello);
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
@@ -87,7 +87,7 @@ impl TrackRequestPacket {
         let version = Version::CURRENT_VERSION;
         let opts = opts.add(OptionFlags::RequireAck);
         let packet_type = PacketType::Session;
-        let control_type = ControlType::TrackRequest;
+        let control_type = ControlType::Session(SessionControlType::TrackRequest);
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
@@ -108,7 +108,7 @@ impl TrackRequestPacket {
         let version = Version::CURRENT_VERSION;
         let opts = opts.add(OptionFlags::RequireAck);
         let packet_type = PacketType::Session;
-        let control_type = ControlType::MetadataRequest;
+        let control_type = ControlType::Session(SessionControlType::MetadataRequest);
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
@@ -281,7 +281,7 @@ pub struct PlaybackStatusPacket {
 }
 
 impl PlaybackStatusPacket {
-    fn new(opts: Options, session_id: SessionId, playback_type: PlaybackType) -> Self {
+    fn new(opts: Options, session_id: SessionId, playback_type: PlaybackControlType) -> Self {
         let version = Version::CURRENT_VERSION;
         let opts = opts.add(OptionFlags::RequireAck);
         let packet_type = PacketType::Playback;
@@ -301,15 +301,15 @@ impl PlaybackStatusPacket {
     }
 
     pub fn play(opts: Options, session_id: SessionId) -> Self {
-        Self::new(opts, session_id, PlaybackType::Play)
+        Self::new(opts, session_id, PlaybackControlType::Play)
     }
 
     pub fn pause(opts: Options, session_id: SessionId) -> Self {
-        Self::new(opts, session_id, PlaybackType::Pause)
+        Self::new(opts, session_id, PlaybackControlType::Pause)
     }
 
     pub fn stop(opts: Options, session_id: SessionId) -> Self {
-        Self::new(opts, session_id, PlaybackType::Stop)
+        Self::new(opts, session_id, PlaybackControlType::Stop)
     }
 }
 
@@ -389,7 +389,7 @@ impl RetransmitPacket {
         let version = Version::CURRENT_VERSION;
         let opts = opts.add(OptionFlags::RequireAck);
         let packet_type = PacketType::Session;
-        let control_type = ControlType::Retransmit;
+        let control_type = ControlType::Session(SessionControlType::Retransmit);
         let timestamp = Timestamp::now();
 
         Self {
@@ -558,6 +558,84 @@ pub enum PacketType {
     Host = 7,
     Session = 8,
     Playback = 9,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ControlType {
+    Host(HostControlType),
+    Session(SessionControlType),
+    Playback(PlaybackControlType),
+}
+
+impl PacketSerialize for ControlType {
+    fn serialize(&self, buf: &mut [u8]) -> bool {
+        match self {
+            ControlType::Host(packet) => packet.serialize(buf),
+            ControlType::Session(packet) => packet.serialize(buf),
+            ControlType::Playback(packet) => packet.serialize(buf),
+        }
+    }
+
+    fn sized(&self) -> usize {
+        1
+    }
+}
+
+impl PacketDeserialize for ControlType {
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        if let Some(control_type) = HostControlType::deserialize(bytes) {
+            Some(Self::Host(control_type))
+        } else if let Some(control_type) = SessionControlType::deserialize(bytes) {
+            Some(Self::Session(control_type))
+        } else if let Some(control_type) = PlaybackControlType::deserialize(bytes) {
+            Some(Self::Playback(control_type))
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum HostControlType {
+    Hello = 201,
+}
+
+impl From<HostControlType> for ControlType {
+    #[inline]
+    fn from(value: HostControlType) -> Self {
+        Self::Host(value)
+    }
+}
+
+#[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum SessionControlType {
+    Retransmit = 1,
+    TrackRequest = 2,
+    MetadataRequest = 3,
+}
+
+impl From<SessionControlType> for ControlType {
+    #[inline]
+    fn from(value: SessionControlType) -> Self {
+        Self::Session(value)
+    }
+}
+
+#[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum PlaybackControlType {
+    Play = 101,
+    Pause = 102,
+    Stop = 103,
+}
+
+impl From<PlaybackControlType> for ControlType {
+    #[inline]
+    fn from(value: PlaybackControlType) -> Self {
+        Self::Playback(value)
+    }
 }
 
 #[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -730,36 +808,4 @@ impl PacketDeserialize for Vec<ByteRange> {
             Some(result)
         }
     }
-}
-
-enum PlaybackType {
-    Play,
-    Pause,
-    Stop,
-}
-
-impl From<PlaybackType> for ControlType {
-    #[inline]
-    fn from(value: PlaybackType) -> Self {
-        match value {
-            PlaybackType::Play => Self::Play,
-            PlaybackType::Pause => Self::Pause,
-            PlaybackType::Stop => Self::Stop,
-        }
-    }
-}
-
-#[derive(PacketDeserialize, PacketSerialize, Debug, Clone, Copy, PartialEq)]
-#[repr(u8)]
-pub enum ControlType {
-    Hello,
-    Retransmit,
-    Play,
-    Stop,
-    Restart,
-    Pause,
-    Seek,
-    TrackRequest,
-    MetadataRequest,
-    SessionKeyOffer,
 }
