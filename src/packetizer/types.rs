@@ -614,7 +614,7 @@ impl From<ErrorType> for SecondaryType {
     }
 }
 
-#[derive(PacketDeserialize, PacketSerialize)]
+#[derive(PacketDeserialize, PacketSerialize, Hash, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct PacketFingerprint([u8; 16]);
 
@@ -677,7 +677,7 @@ pub struct BytePosition(pub u32);
 pub struct Timestamp(u64);
 
 impl Timestamp {
-    fn now() -> Self {
+    pub fn now() -> Self {
         #[allow(clippy::cast_possible_truncation)]
         Self(
             Instant::now()
@@ -687,6 +687,10 @@ impl Timestamp {
                 ))
                 .as_millis() as u64,
         )
+    }
+
+    pub fn been_longer_than(&self, millis: u64) -> bool {
+        Self::now().0 - self.0 > millis
     }
 }
 
