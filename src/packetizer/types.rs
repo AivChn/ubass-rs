@@ -677,6 +677,10 @@ pub struct BytePosition(pub u32);
 pub struct Timestamp(u64);
 
 impl Timestamp {
+    /// returns the current time since `PROTOCOL_EPOCH`
+    ///
+    /// # Panics
+    /// This function panics if `PROTOCOL_EPOCH` is not yet initialized - an invariant
     pub fn now() -> Self {
         #[allow(clippy::cast_possible_truncation)]
         Self(

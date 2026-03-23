@@ -36,8 +36,8 @@ unsafe impl Send for FingerprintPtr {}
 unsafe impl Sync for FingerprintPtr {}
 
 impl FingerprintPtr {
-    fn from_box(value: &Box<PacketFingerprint>) -> Self {
-        Self(&**value as *const PacketFingerprint)
+    fn from_box(value: &PacketFingerprint) -> Self {
+        Self(std::ptr::from_ref(value))
     }
 }
 
@@ -70,9 +70,13 @@ impl Default for FingerprintMonitor {
 impl FingerprintMonitor {
     pub async fn add(&self, session_id: SessionId) {
         let mut table = self.table.write().await;
-        table.insert(session_id, Default::default());
+        table.insert(session_id, Arc::default());
     }
 
+    /// returns an Arc to the window for this session
+    ///
+    /// # Panics
+    /// This function panics if the session is not yet initialized - an invairant
     pub async fn get(&self, session_id: SessionId) -> Arc<FingerprintWindow> {
         let table = self.table.read().await;
         let Some(window) = table.get(&session_id) else {
@@ -105,7 +109,7 @@ impl Default for FingerprintWindow {
 impl FingerprintWindow {
     const PRUNE_INTERVAL: u64 = 7 * 1000;
 
-    pub async fn init(self: Arc<Self>) {
+    pub fn init(self: Arc<Self>) {
         tokio::spawn(self.prune());
     }
 
