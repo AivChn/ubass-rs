@@ -55,19 +55,15 @@ impl Hash for FingerprintPtr {
     }
 }
 
-pub struct FingerprintMonitor {
-    table: RwLock<HashMap<SessionId, Arc<FingerprintWindow>>>,
+pub struct FingerprintMonitor<'a> {
+    table: &'a RwLock<HashMap<SessionId, Arc<FingerprintWindow>>>,
 }
 
-impl Default for FingerprintMonitor {
-    fn default() -> Self {
-        Self {
-            table: RwLock::new(HashMap::new()),
-        }
+impl<'a> FingerprintMonitor<'a> {
+    pub fn new(table: &'a RwLock<HashMap<SessionId, Arc<FingerprintWindow>>>) -> Self {
+        Self { table }
     }
-}
 
-impl FingerprintMonitor {
     pub async fn add(&self, session_id: SessionId) {
         let mut table = self.table.write().await;
         table.insert(session_id, Arc::default());

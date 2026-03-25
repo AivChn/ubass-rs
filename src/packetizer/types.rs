@@ -282,6 +282,7 @@ pub struct PlaybackStatusPacket {
 }
 
 impl PlaybackStatusPacket {
+    #[inline]
     fn new(opts: Options, session_id: SessionId, playback_type: PlaybackControlType) -> Self {
         let version = Version::CURRENT_VERSION;
         let opts = opts.add(OptionFlags::RequireAck);
@@ -301,14 +302,17 @@ impl PlaybackStatusPacket {
         }
     }
 
+    #[inline]
     pub fn play(opts: Options, session_id: SessionId) -> Self {
         Self::new(opts, session_id, PlaybackControlType::Play)
     }
 
+    #[inline]
     pub fn pause(opts: Options, session_id: SessionId) -> Self {
         Self::new(opts, session_id, PlaybackControlType::Pause)
     }
 
+    #[inline]
     pub fn stop(opts: Options, session_id: SessionId) -> Self {
         Self::new(opts, session_id, PlaybackControlType::Stop)
     }
