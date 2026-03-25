@@ -6,7 +6,7 @@ mod xor;
 use std::mem::transmute;
 use std::sync::LazyLock;
 
-use crate::packet_processor::serialize::{PacketDeserialize, PacketSerialize};
+use crate::packet_processor::serialize::Serialize;
 
 use crate::packetizer::types::{BatchID, DataPacket, FECInfo, MAX_PAYLOAD_LENGTH};
 use crate::packetizer::types::{ParityPacket, SessionId};

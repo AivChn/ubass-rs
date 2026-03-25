@@ -1,5 +1,5 @@
 use crate::manager::types::EncryptionMonitor;
-use crate::packetizer::fingerprint::HeaderSerialize;
+use crate::packetizer::fingerprint::Headers;
 use crate::packetizer::types::{DataPacket, ParityPacket, SessionId};
 use crate::prelude::*;
 
