@@ -5,9 +5,9 @@ use crate::prelude::*;
 
 use aes_gcm_siv::{AeadInPlace, Aes256GcmSiv, Nonce};
 
-pub enum Encryptable {
-    Data(DataPacket),
-    Parity(ParityPacket),
+pub enum Encryptable<'a> {
+    Data(&'a mut DataPacket),
+    Parity(&'a mut ParityPacket),
 }
 
 fn get_nonce(session_id: SessionId, counter: [u8; 8]) -> [u8; 12] {
@@ -32,7 +32,7 @@ pub fn encrypt(packet: &mut Encryptable, monitor: &EncryptionMonitor) {
     payload.extend(counter);
 }
 
-pub fn decrypt(packet: &mut Encryptable, monitor: &EncryptionMonitor) -> bool {
+pub fn decrypt(packet: Encryptable, monitor: &EncryptionMonitor) -> bool {
     let (aad, payload, session_id) = match packet {
         Encryptable::Data(packet) => (packet.headers(), &mut packet.payload, packet.session_id),
         Encryptable::Parity(packet) => (packet.headers(), &mut packet.payload, packet.session_id),
@@ -60,7 +60,11 @@ pub fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: &EncryptionMoni
     packet.extend(counter);
 }
 
-pub fn authenticate(packet: &mut Vec<u8>, session_id: SessionId, monitor: &EncryptionMonitor) {
+pub fn authenticate(
+    packet: &mut Vec<u8>,
+    session_id: SessionId,
+    monitor: &EncryptionMonitor,
+) -> bool {
     let cipher = monitor.get_cipher(&session_id);
     let counter: [u8; 8] = packet
         .drain(packet.len() - 8..)
@@ -71,5 +75,5 @@ pub fn authenticate(packet: &mut Vec<u8>, session_id: SessionId, monitor: &Encry
 
     let mut tag: Vec<u8> = packet.drain(packet.len() - 16..).collect();
 
-    cipher.decrypt_in_place(&nonce, packet, &mut tag);
+    cipher.decrypt_in_place(&nonce, packet, &mut tag).is_ok()
 }

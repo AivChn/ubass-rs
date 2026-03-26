@@ -23,6 +23,11 @@ pub enum PacketWrapper {
     ParityPacket(ParityPacket),
     AckPacket(AckPacket),
     RetransmitPacket(RetransmitPacket),
+    PlaybackStatusPacket(PlaybackStatusPacket),
+    IncompatibleVersion(IncompatibleVersion),
+    SessionDoesNotExistErrorPacket(SessionDoesNotExistErrorPacket),
+    UnexpectedPacketErrorPacket(UnexpectedPacketErrorPacket),
+    AppRejectErrorPacket(AppRejectErrorPacket),
 }
 
 #[repr(C)]
@@ -529,6 +534,8 @@ impl UnexpectedPacketErrorPacket {
     }
 }
 
+#[derive(Serialize)]
+#[repr(C)]
 pub struct AppRejectErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -715,7 +722,7 @@ impl<const N: usize> Serialize for Reserved<N> {
     }
 
     fn deserialize(bytes: &[u8]) -> Option<Self> {
-        if bytes.len() < N || bytes[..N].iter().any(|n| *n != 0) {
+        if bytes.len() < N {
             None
         } else {
             Some(Reserved)

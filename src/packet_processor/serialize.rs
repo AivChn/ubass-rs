@@ -158,3 +158,27 @@ impl<const N: usize> Serialize for Box<[u8; N]> {
         N
     }
 }
+
+impl<T1, T2> Serialize for (T1, T2)
+where
+    T1: Serialize,
+    T2: Serialize,
+{
+    fn serialize(&self, buf: &mut [u8]) -> bool {
+        if buf.len() < self.sized() {
+            false
+        } else {
+            self.0.serialize(buf) && self.1.serialize(&mut buf[self.0.sized()..])
+        }
+    }
+
+    fn deserialize(bytes: &[u8]) -> Option<Self> {
+        let f1 = T1::deserialize(bytes)?;
+        let f2 = T2::deserialize(&bytes[f1.sized()..])?;
+        Some((f1, f2))
+    }
+
+    fn sized(&self) -> usize {
+        self.0.sized() + self.1.sized()
+    }
+}
