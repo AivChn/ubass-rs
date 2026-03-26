@@ -151,18 +151,24 @@ impl RS {
 
         let mut batch = entry.lock().await;
         if packet.is_parity {
-            batch
+            if let Err(reed_solomon_simd::Error::DuplicateOriginalShardIndex { index: _ }) = batch
                 .decoder
-                .add_recovery_shard(packet.fec_info.batch_pos as usize, *packet.data.0);
+                .add_recovery_shard(packet.fec_info.batch_pos as usize, *packet.data.0)
+            {
+                return false;
+            }
             batch.recovery_count += 1;
         } else {
-            batch
+            if let Err(reed_solomon_simd::Error::DuplicateOriginalShardIndex { index: _ }) = batch
                 .decoder
-                .add_original_shard(packet.fec_info.batch_pos as usize, *packet.data.0);
+                .add_original_shard(packet.fec_info.batch_pos as usize, *packet.data.0)
+            {
+                return false;
+            }
             batch.received_count += 1;
         }
 
-        batch.received_count + batch.recovery_count >= batch.batch_size
+        true
     }
 
     pub async fn recover(

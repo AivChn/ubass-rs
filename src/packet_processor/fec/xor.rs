@@ -50,6 +50,7 @@ struct InboundBatchData {
     parity: Option<FECData>,
     batch_size: u8,
     packets_received: u8,
+    batch_mask: [u128; 2],
 }
 
 impl InboundBatchData {
@@ -61,25 +62,36 @@ impl InboundBatchData {
             parity: None,
             batch_size,
             packets_received: 0,
+            batch_mask: [0; 2],
         }
     }
 
-    /// Add a packet to the FEC batch. Returns `true` if there are enough packets in the batch to
-    /// recover, otherwise `false`
-    fn add(&mut self, data: FECData) -> bool {
-        if self.packets_received < self.batch_size {
-            self.product ^= data;
+    /// Add a packet to the FEC batch. Returns `true` if the packet wasnt already in the batch
+    fn add(&mut self, data: FECPacket) -> bool {
+        if self.packets_received < self.batch_size
+            && (self.batch_mask[(data.fec_info.batch_pos / 128) as usize]
+                >> data.fec_info.batch_pos % 128)
+                & 1
+                == 0
+        {
+            self.product ^= data.data;
             self.packets_received += 1;
+            true
+        } else {
+            false
         }
-        self.packets_received >= self.batch_size
     }
 
-    /// To be used when the parity packet is received, returns if a packet can be recovered from
-    /// this batch
+    /// To be used when the parity packet is received, returns `true` if the packet wasnt already
+    /// in the batch
     fn parity(&mut self, parity: FECData) -> bool {
-        self.parity = Some(parity);
-        self.packets_received += 1;
-        self.packets_received >= self.batch_size
+        if self.parity.is_some() {
+            false
+        } else {
+            self.parity = Some(parity);
+            self.packets_received += 1;
+            true
+        }
     }
 
     /// Recover a packet from this batch. This function returns `Some(ParityPacket)` if there are
@@ -229,7 +241,7 @@ impl Xor {
         if packet.is_parity {
             entry.lock().await.parity(FECData(packet.data.0))
         } else {
-            entry.lock().await.add(FECData(packet.data.0))
+            entry.lock().await.add(packet)
         }
     }
 
