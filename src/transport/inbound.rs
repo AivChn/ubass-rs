@@ -35,9 +35,9 @@ pub async fn init(port: u16, sender: Sender<Result<ReceivedPacket>>) -> ErrResul
     loop {
         let mut buffer = vec![0u8; MAX_PACKET_SIZE];
 
-        let stripped_buffer = loop {
-            if let Ok(read) = socket.recv(&mut buffer).await {
-                break &buffer[..read];
+        let (stripped_buffer, addr) = loop {
+            if let Ok((read, addr)) = socket.recv_from(&mut buffer).await {
+                break (&buffer[..read], addr);
             }
 
             if fail_count >= MAX_ALLOWED_FAILS {
@@ -46,13 +46,16 @@ pub async fn init(port: u16, sender: Sender<Result<ReceivedPacket>>) -> ErrResul
 
             fail_count += 1;
 
-            if let Ok(read) = socket.recv(&mut buffer).await {
+            if let Ok((read, addr)) = socket.recv_from(&mut buffer).await {
                 fail_count = 0;
-                break &buffer[..read];
+                break (&buffer[..read], addr);
             }
         };
 
-        let packet = ReceivedPacket::new(stripped_buffer.to_vec());
+        let packet = ReceivedPacket {
+            src_addr: addr,
+            data: stripped_buffer.to_vec(),
+        };
 
         send_to_processing_layer(sender.clone(), Ok(packet)).await?;
     }

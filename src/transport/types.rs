@@ -2,7 +2,12 @@ use crate::{
     packet_processor::types::{PacketId, ProcessedPacket, TransportMessage},
     prelude::*,
 };
-use std::{cmp::min, fmt::Debug, sync::Arc};
+use std::{
+    cmp::min,
+    fmt::Debug,
+    net::{SocketAddr, SocketAddrV4},
+    sync::Arc,
+};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -143,16 +148,10 @@ pub struct SendablePacket {
 }
 
 /// A packet straight from the socket oven
-#[repr(transparent)]
 #[derive(Debug, Clone)]
 pub struct ReceivedPacket {
+    pub src_addr: SocketAddr,
     pub data: Vec<u8>,
-}
-
-impl ReceivedPacket {
-    pub fn new(data: Vec<u8>) -> Self {
-        Self { data }
-    }
 }
 
 impl From<ProcessedPacket> for SendablePacket {
