@@ -153,30 +153,6 @@ impl StructFields {
     }
 }
 
-struct ReprC(bool);
-
-impl Parse for ReprC {
-    fn parse(input: ParseStream) -> syn::Result<Self> {
-        let mut v = vec![];
-        while !input.is_empty() {
-            v.push(input.parse::<syn::Ident>()?);
-            _ = input.parse::<syn::Token![,]>();
-        }
-
-        Ok(Self(v.iter().any(|e| "C" == e.to_string().as_str())))
-    }
-}
-
-fn is_repr_c_found(attrs: &Vec<syn::Attribute>) -> bool {
-    attrs.iter().any(|e| {
-        if e.path().is_ident("repr") {
-            e.parse_args::<ReprC>().expect("Failed to find idents").0
-        } else {
-            false
-        }
-    })
-}
-
 fn enum_serialization(input: DeriveInput) -> TokenStream {
     let EnumRep {
         ident,
@@ -186,24 +162,24 @@ fn enum_serialization(input: DeriveInput) -> TokenStream {
 
     let if_statements: Vec<_> = variants
         .iter()
-        .map(|(i, e)| quote! { if tmp == (#e as #type_representation) { Some(Self::#i) } else })
+        .map(|(i, e)| quote! { if tmp == (#e as #type_representation) { Ok(Self::#i) } else })
         .collect();
 
     quote! {
         impl Serialize for #ident {
-            fn serialize(&self, buf: &mut [u8]) -> bool {
+            fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
                 if buf.len() < self.sized() {
-                    false
+                    Err(())
                 } else {
                     (*self as #type_representation).serialize(buf)
                 }
             }
 
-            fn deserialize(bytes: &[u8]) -> Option<Self> {
+            fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
                 let tmp = <#type_representation>::deserialize(bytes)?;
 
                 #(#if_statements)* {
-                    None
+                    Err(())
                 }
             }
 
@@ -217,7 +193,6 @@ fn enum_serialization(input: DeriveInput) -> TokenStream {
 }
 
 fn struct_serialization(input: DeriveInput) -> TokenStream {
-    let attrs = &input.attrs.clone();
     let StructRep { ident, fields } = StructRep::new(input).expect("Could not parse Struct");
 
     let (struct_size, serialize_logic, deserialize_logic) = match fields.clone() {
@@ -226,10 +201,6 @@ fn struct_serialization(input: DeriveInput) -> TokenStream {
             let mut serialize_logic = vec![];
             let mut deserialize_logic = vec![];
             let mut fields = vec![];
-
-            if !is_repr_c_found(attrs) {
-                panic!("Struct must be repr(C) to be serialized");
-            }
 
             for (i, t) in idents.iter().zip(types) {
                 fields.push(quote! {#i,});
@@ -242,7 +213,7 @@ fn struct_serialization(input: DeriveInput) -> TokenStream {
 
             let deserialize_logic = quote! {
                 #(#deserialize_logic)*
-                Some(Self {
+                Ok(Self {
                     #(#fields)*
                 })
             };
@@ -259,7 +230,7 @@ fn struct_serialization(input: DeriveInput) -> TokenStream {
                 let field = format_ident!("f{i}");
                 let i = syn::Index::from(i);
                 fields.push(quote! {#field, });
-                serialize_logic.push(quote! { self.#i.serialize(&mut buf[(#struct_size)..]); });
+                serialize_logic.push(quote! { self.#i.serialize(&mut buf[(#struct_size)..])?; });
                 deserialize_logic.push(
                     quote! { let #field = <#t>::deserialize(&bytes[offset..])?; offset += #field.sized(); },
                 );
@@ -268,7 +239,7 @@ fn struct_serialization(input: DeriveInput) -> TokenStream {
 
             let deserialize_logic = quote! {
                 #(#deserialize_logic)*
-                Some(Self(
+                Ok(Self(
                     #(#fields)*
                     ))
             };
@@ -279,16 +250,16 @@ fn struct_serialization(input: DeriveInput) -> TokenStream {
 
     quote! {
         impl Serialize for #ident {
-            fn serialize(&self, buf: &mut [u8]) -> bool {
+            fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
                 if buf.len() < self.sized() {
-                    false
+                    Err(())
                 } else {
                     #(#serialize_logic)*
-                    true
+                    Ok(())
                 }
             }
 
-            fn deserialize(bytes: &[u8]) -> Option<Self> {
+            fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
                 let mut offset: usize = 0;
                 #deserialize_logic
             }
