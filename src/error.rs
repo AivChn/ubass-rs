@@ -1,6 +1,10 @@
-use crate::{packet_processor::types::PacketId, packetizer::types::Version};
+use crate::{
+    packet_processor::types::PacketId,
+    packetizer::types::{PacketType, SecondaryType, SessionId, Version},
+};
 pub type Result<T> = core::result::Result<T, Error>;
 pub type ErrResult = Result<()>;
+pub type EmptyResult = core::result::Result<(), ()>;
 
 pub use PipeDirection::*;
 pub use Recoverabilty::*;
