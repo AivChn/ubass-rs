@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::{dispatch, prelude::*};
+use crate::{dispatch, packetizer::types::PacketWrapper, prelude::*};
 
-use super::types::{OutboundChannels, PacketProcessingMessage, PacketWrapper, TransportMessage};
+use super::types::{OutboundChannels, PacketProcessingMessage, Packets, TransportMessage};
 
 pub async fn init(
     OutboundChannels {
@@ -47,7 +47,7 @@ pub async fn init(
 
 #[allow(clippy::unused_async)]
 async fn handle_received(
-    buffer: Box<[PacketWrapper]>,
+    buffer: Box<[Packets]>,
     p_sender: Sender<Result<PacketWrapper>>,
     t_sender: Sender<TransportMessage>,
 ) {
