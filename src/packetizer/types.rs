@@ -2,7 +2,7 @@ use crate::prelude::*;
 
 use std::{
     fmt::Display,
-    net::{Ipv4Addr, SocketAddrV4},
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
 };
 
 use crate::packet_processor::serialize::Serialize;
@@ -11,11 +11,25 @@ use derive_more::Display;
 use tokio::time::Instant;
 use ubass_macros::Serialize;
 
-use super::fingerprint::{Fingerprint, Headers};
+use super::fingerprint::{Fingerprint, Headers, Payload};
 
 pub const MAX_PAYLOAD_LENGTH: usize = 1400;
 
-pub enum PacketWrapper {
+pub struct PacketWrapper {
+    pub addr: SocketAddr,
+    pub packet: Packets,
+}
+
+impl PacketWrapper {
+    pub fn new(src_addr: SocketAddr, packet: Packets) -> Self {
+        Self {
+            addr: src_addr,
+            packet,
+        }
+    }
+}
+
+pub enum Packets {
     HelloPacket(Box<HelloPacket>),
     TrackRequestPacket(Box<TrackRequestPacket>),
     DataPacket(Box<DataPacket>),
@@ -24,13 +38,19 @@ pub enum PacketWrapper {
     AckPacket(Box<AckPacket>),
     RetransmitPacket(Box<RetransmitPacket>),
     PlaybackStatusPacket(Box<PlaybackStatusPacket>),
-    IncompatibleVersion(Box<IncompatibleVersion>),
+    IncompatibleVersion(Box<IncompatibleVersionPacket>),
     SessionDoesNotExistErrorPacket(Box<SessionDoesNotExistErrorPacket>),
     UnexpectedPacketErrorPacket(Box<UnexpectedPacketErrorPacket>),
     AppRejectErrorPacket(Box<AppRejectErrorPacket>),
 }
 
-#[derive(Headers, Serialize)]
+impl Packets {
+    pub fn wrap(self, src_addr: SocketAddr) -> PacketWrapper {
+        PacketWrapper::new(src_addr, self)
+    }
+}
+
+#[derive(Serialize)]
 pub struct HelloPacket {
     pub version: Version,
     pub opts: Options,
@@ -73,7 +93,7 @@ impl HelloPacket {
     }
 }
 
-#[derive(Headers, Serialize)]
+#[derive(Headers, Payload, Serialize, Clone)]
 pub struct TrackRequestPacket {
     pub version: Version,
     pub opts: Options,
@@ -129,7 +149,7 @@ impl TrackRequestPacket {
     }
 }
 
-#[derive(Headers, Serialize)]
+#[derive(Headers, Payload, Serialize)]
 pub struct DataPacket {
     pub version: Version,
     pub opts: Options,
@@ -173,7 +193,7 @@ impl DataPacket {
     }
 }
 
-#[derive(Headers, Serialize)]
+#[derive(Headers, Payload, Serialize)]
 pub struct MetadataPacket {
     pub version: Version,
     pub opts: Options,
@@ -226,7 +246,7 @@ impl MetadataPacket {
     }
 }
 
-#[derive(Headers, Serialize)]
+#[derive(Headers, Payload, Serialize)]
 pub struct ParityPacket {
     pub version: Version,
     pub opts: Options,
@@ -268,7 +288,7 @@ impl ParityPacket {
     }
 }
 
-#[derive(Headers, Serialize)]
+#[derive(Serialize)]
 pub struct PlaybackStatusPacket {
     pub version: Version,
     pub opts: Options,
@@ -316,7 +336,7 @@ impl PlaybackStatusPacket {
     }
 }
 
-#[derive(Headers, Serialize)]
+#[derive(Serialize)]
 pub struct AckPacket {
     pub version: Version,
     pub opts: Options,
@@ -355,7 +375,7 @@ impl AckPacket {
     }
 }
 
-#[derive(Headers, Serialize)]
+#[derive(Headers, Serialize, Clone)]
 pub struct RetransmitPacket {
     pub version: Version,
     pub opts: Options,
@@ -406,7 +426,7 @@ impl RetransmitPacket {
     }
 }
 
-#[derive(Serialize, Headers)]
+#[derive(Serialize)]
 pub struct SessionDoesNotExistErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -439,7 +459,7 @@ impl SessionDoesNotExistErrorPacket {
     }
 }
 
-#[derive(Serialize, Headers)]
+#[derive(Serialize)]
 pub struct UnexpectedPacketErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -523,7 +543,7 @@ impl UnexpectedPacketErrorPacket {
     }
 }
 
-#[derive(Serialize, Headers)]
+#[derive(Serialize, Headers, Payload)]
 pub struct AppRejectErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -573,13 +593,13 @@ impl AppRejectErrorPacket {
     }
 }
 
-#[derive(Serialize, Headers)]
-pub struct IncompatibleVersion {
+#[derive(Serialize)]
+pub struct IncompatibleVersionPacket {
     pub zero_version: Version,
     pub min_version: Version,
 }
 
-impl IncompatibleVersion {
+impl IncompatibleVersionPacket {
     pub const HEADER_SIZE: usize = size_of::<Self>();
     pub fn packet() -> [u8; Self::HEADER_SIZE] {
         let mut buffer = [0u8; Self::HEADER_SIZE];
@@ -616,13 +636,13 @@ impl From<ErrorType> for SecondaryType {
 #[repr(transparent)]
 pub struct PacketFingerprint([u8; 16]);
 
-impl<T: Fingerprint> From<T> for PacketFingerprint {
-    fn from(value: T) -> Self {
+impl<T: Fingerprint> From<&T> for PacketFingerprint {
+    fn from(value: &T) -> Self {
         Self(value.fingerprint())
     }
 }
 
-#[derive(Serialize, PartialEq, Default)]
+#[derive(Serialize, PartialEq, Default, Clone, Copy)]
 #[repr(transparent)]
 pub struct BufferId(u16);
 
@@ -670,7 +690,7 @@ pub struct PublicKey(pub [u8; 32]);
 #[repr(transparent)]
 pub struct BytePosition(pub u32);
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Copy)]
 #[repr(transparent)]
 pub struct Timestamp(u64);
 
@@ -696,6 +716,7 @@ impl Timestamp {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Reserved<const N: usize>;
 
 impl<const N: usize> Serialize for Reserved<N> {
@@ -862,7 +883,7 @@ pub enum ErrorType {
 #[repr(transparent)]
 pub struct BatchID(pub u16);
 
-#[derive(Serialize, Debug, PartialEq)]
+#[derive(Serialize, Debug, PartialEq, Clone, Copy)]
 #[repr(transparent)]
 pub struct Options(u16);
 
@@ -946,7 +967,7 @@ impl FECInfo {
 }
 
 #[repr(C)]
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 pub struct ByteRange {
     start: BytePosition,
     length: u16,
