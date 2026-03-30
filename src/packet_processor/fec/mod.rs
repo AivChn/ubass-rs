@@ -89,7 +89,7 @@ impl From<FECData> for RecoverdPacket {
 /// Represents a packet to be processed. Includes only the data necessary.
 ///
 /// `is_parity`: `true` if the packet is a parity packet
-/// `session_id`: the sesison id for the session this packet is sent through
+/// `session_id`: the session id for the session this packet is sent through
 /// `batch_id`: the ID for the specific batch within a session
 /// `batch_size`: the number of packets expected in this batch
 struct FECPacket {
@@ -122,7 +122,7 @@ impl From<ParityPacket> for FECPacket {
         FECPacket {
             is_parity: true,
             session_id: value.session_id,
-            batch_id: value.packet_type_batch_id.batch_id,
+            batch_id: value.batch_id,
             fec_info: value.fec_info,
             data,
         }

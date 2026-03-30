@@ -7,10 +7,7 @@ use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 
 use crate::{
     packet_processor::fec::FECPacket,
-    packetizer::types::{
-        BatchID, FECInfo, Options, PacketType, PacketTypeFecBatchID, ParityPacket, SessionId,
-        Version,
-    },
+    packetizer::types::{BatchID, FECInfo, Options, PacketType, ParityPacket, SessionId, Version},
     prelude::*,
 };
 

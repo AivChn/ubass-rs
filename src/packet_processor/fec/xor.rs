@@ -1,5 +1,5 @@
 use crate::packet_processor::{inbound, outbound};
-use crate::packetizer::types::{BatchID, FECInfo, Options, PacketType, PacketTypeFecBatchID};
+use crate::packetizer::types::{BatchID, FECInfo, Options, PacketType};
 use crate::prelude::*;
 
 use std::collections::HashMap;
@@ -70,7 +70,7 @@ impl InboundBatchData {
     fn add(&mut self, data: FECPacket) -> bool {
         if self.packets_received < self.batch_size
             && (self.batch_mask[(data.fec_info.batch_pos / 128) as usize]
-                >> data.fec_info.batch_pos % 128)
+                >> (data.fec_info.batch_pos % 128))
                 & 1
                 == 0
         {
