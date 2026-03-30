@@ -38,12 +38,16 @@ pub fn decrypt(packet: Encryptable, monitor: &EncryptionMonitor) -> bool {
         Encryptable::Parity(packet) => (packet.headers(), &mut packet.payload, packet.session_id),
     };
 
+    // len < minimum payload + tag + nonce counter
+    if payload.len() < 1 + 16 + 8 {
+        return false;
+    }
+
     let cipher = monitor.get_cipher(&session_id);
-    let counter: [u8; 8] = payload
-        .drain(payload.len() - 8..)
-        .collect::<Vec<_>>()
+    let counter: [u8; 8] = payload[payload.len() - 8..]
         .try_into()
         .expect("length is guaranteed");
+    payload.truncate(payload.len() - 8);
     let nonce = Nonce::from(get_nonce(session_id, counter));
 
     cipher.decrypt_in_place(&nonce, &aad, payload).is_ok()
@@ -66,9 +70,7 @@ pub fn authenticate(
     monitor: &EncryptionMonitor,
 ) -> bool {
     let cipher = monitor.get_cipher(&session_id);
-    let counter: [u8; 8] = packet
-        .drain(packet.len() - 8..)
-        .collect::<Vec<_>>()
+    let counter: [u8; 8] = packet[packet.len() - 8..]
         .try_into()
         .expect("length is guaranteed");
     let nonce = Nonce::from(get_nonce(session_id, counter));
