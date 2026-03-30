@@ -51,11 +51,14 @@ pub async fn init(
         encryption_monitor,
         fingerprint_monitor,
     ));
-    let mut send_handle = tokio::spawn(outbound::init(OutboundChannels {
-        t_sender: t_sender.clone(),
-        p_sender: p_sender.clone(),
-        p_receiver,
-    }));
+    let mut send_handle = tokio::spawn(outbound::init(
+        OutboundChannels {
+            t_sender: t_sender.clone(),
+            p_sender: p_sender.clone(),
+            p_receiver,
+        },
+        encryption_monitor,
+    ));
 
     'supervisor: loop {
         _ = tokio::select! {
