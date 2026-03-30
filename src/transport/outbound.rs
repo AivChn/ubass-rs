@@ -62,7 +62,7 @@ pub async fn init(
                 Ok(Some(TransportMessage::Data(data))) => data,
             };
 
-            buffer.extend(data);
+            buffer.push(data);
         }
 
         #[allow(clippy::cast_possible_truncation)]
@@ -70,7 +70,7 @@ pub async fn init(
             .update(start_time.elapsed().as_millis() as u64)
             .await;
         dispatch!(
-            distribute_send_to_session(buffer, sockets.retrieve(), sender.clone()),
+            distribute_send_to_session(buffer, sockets.retrieve(), sender.clone()) =>
             monitor
         );
 
