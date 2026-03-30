@@ -73,9 +73,9 @@ impl<'a> FingerprintMonitor<'a> {
     ///
     /// # Panics
     /// This function panics if the session is not yet initialized - an invairant
-    pub async fn get(&self, session_id: SessionId) -> Arc<FingerprintWindow> {
+    pub async fn get(&self, session_id: &SessionId) -> Arc<FingerprintWindow> {
         let table = self.table.read().await;
-        let Some(window) = table.get(&session_id) else {
+        let Some(window) = table.get(session_id) else {
             panic!(
                 "Invairant broken while trying to get a `FingerprintWindow`:\
             {session_id} is not a valid session"
@@ -87,7 +87,7 @@ impl<'a> FingerprintMonitor<'a> {
 }
 
 pub struct FingerprintWindow {
-    fingerprints: Mutex<HashSet<Box<PacketFingerprint>>>,
+    fingerprints: RwLock<HashSet<Box<PacketFingerprint>>>,
     queue: Mutex<VecDeque<(Timestamp, FingerprintPtr)>>,
     canceled: AtomicBool,
 }
@@ -95,7 +95,7 @@ pub struct FingerprintWindow {
 impl Default for FingerprintWindow {
     fn default() -> Self {
         Self {
-            fingerprints: Mutex::new(HashSet::new()),
+            fingerprints: RwLock::new(HashSet::new()),
             queue: Mutex::new(VecDeque::new()),
             canceled: AtomicBool::new(false),
         }
@@ -109,9 +109,15 @@ impl FingerprintWindow {
         tokio::spawn(self.prune());
     }
 
+    #[must_use]
+    pub async fn contains(&self, fingerprint: &Box<PacketFingerprint>) -> bool {
+        let fingerprints = self.fingerprints.read().await;
+        fingerprints.contains(fingerprint)
+    }
+
     pub async fn add(&self, fingerprint: Box<PacketFingerprint>) -> bool {
         let ptr = 'add_to_set: {
-            let mut fingerprints = self.fingerprints.lock().await;
+            let mut fingerprints = self.fingerprints.write().await;
             let ptr = FingerprintPtr::from_box(&fingerprint);
             if fingerprints.insert(fingerprint) {
                 Some(ptr)
@@ -148,7 +154,7 @@ impl FingerprintWindow {
             }
 
             'remove: {
-                let mut fingerprints = self.fingerprints.lock().await;
+                let mut fingerprints = self.fingerprints.write().await;
                 expired
                     .drain(..)
                     .for_each(|value| _ = fingerprints.remove(unsafe { &*value.0 }));
