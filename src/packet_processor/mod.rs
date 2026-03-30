@@ -5,7 +5,7 @@ mod outbound;
 pub mod serialize;
 pub mod types;
 
-use crate::prelude::*;
+use crate::{manager::types::EncryptionMonitor, prelude::*};
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -36,11 +36,15 @@ pub async fn init(
     p_sender: Sender<Result<PacketWrapper>>,
     t_receiver: Receiver<Result<ReceivedPacket>>,
     t_sender: Sender<TransportMessage>,
+    encryption_monitor: &'static EncryptionMonitor<'_>,
 ) -> ErrResult {
-    let mut recv_handle = tokio::spawn(inbound::init(InboundChannels {
-        t_receiver,
-        p_sender: p_sender.clone(),
-    }));
+    let mut recv_handle = tokio::spawn(inbound::init(
+        InboundChannels {
+            t_receiver,
+            p_sender: p_sender.clone(),
+        },
+        encryption_monitor,
+    ));
     let mut send_handle = tokio::spawn(outbound::init(OutboundChannels {
         t_sender: t_sender.clone(),
         p_sender: p_sender.clone(),
