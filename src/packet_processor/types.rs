@@ -1,29 +1,35 @@
 use std::net::SocketAddrV4;
 
-use crate::prelude::*;
+use crate::{packetizer::types::PacketWrapper, prelude::*};
 
-pub use crate::{packetizer::types::PacketWrapper, transport::types::ReceivedPacket};
+pub use crate::{packetizer::types::Packets, transport::types::ReceivedPacket};
 use tokio::sync::mpsc::{Receiver, Sender};
 
 use crate::packetizer::types::{PacketType, SessionId};
 
+pub type InboundSender = Sender<Result<PacketWrapper>>;
+pub type InboundReceiver = Receiver<Result<ReceivedPacket>>;
+
+pub type OutboundSender = Sender<TransportMessage>;
+pub type OutboundReceiver = Receiver<PacketProcessingMessage>;
+
 /// packages the channels needed for the inbound task
 pub struct InboundChannels {
-    pub t_receiver: Receiver<Result<ReceivedPacket>>,
-    pub p_sender: Sender<Result<PacketWrapper>>,
+    pub t_receiver: InboundReceiver,
+    pub p_sender: InboundSender,
 }
 
 /// packages the channels needed for the outbound task
 pub struct OutboundChannels {
-    pub t_sender: Sender<TransportMessage>,
-    pub p_sender: Sender<Result<PacketWrapper>>,
-    pub p_receiver: Receiver<PacketProcessingMessage>,
+    pub t_sender: OutboundSender,
+    pub p_sender: InboundSender,
+    pub p_receiver: OutboundReceiver,
 }
 
 /// Messages sent to the packet processing layer from the packetizer.
 /// Used to send packets for processing or signal graceful shutdown.
 pub enum PacketProcessingMessage {
-    SendPacket(PacketWrapper),
+    SendPacket(Packets),
     Close,
 }
 
