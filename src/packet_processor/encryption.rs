@@ -7,14 +7,14 @@ use crate::prelude::*;
 
 use aes_gcm_siv::{AeadInPlace, Aes256GcmSiv, Nonce};
 
-trait Encryptable: Payload + Headers {}
+pub trait Encryptable: Payload + Headers {}
 
 impl Encryptable for DataPacket {}
 impl Encryptable for ParityPacket {}
 impl Encryptable for TrackRequestPacket {}
 impl Encryptable for AppRejectErrorPacket {}
 
-fn get_nonce(session_id: &SessionId, counter: [u8; 8]) -> [u8; 12] {
+fn get_nonce(session_id: SessionId, counter: [u8; 8]) -> [u8; 12] {
     let mut result = [0u8; 12];
     let session_part = &session_id.0.to_be_bytes()[..4];
     result[..4].copy_from_slice(session_part);
@@ -22,22 +22,20 @@ fn get_nonce(session_id: &SessionId, counter: [u8; 8]) -> [u8; 12] {
     result
 }
 
-#[allow(private_bounds)]
-pub fn encrypt(packet: &mut impl Encryptable, session_id: &SessionId, monitor: &EncryptionMonitor) {
+pub fn encrypt(packet: &mut impl Encryptable, session_id: SessionId, monitor: &EncryptionMonitor) {
     let (aad, payload) = (packet.headers(), packet.payload());
 
     let (cipher, counter) = monitor.get(&session_id);
-    let nonce = Nonce::from(get_nonce(&session_id, counter));
+    let nonce = Nonce::from(get_nonce(session_id, counter));
 
     cipher.encrypt_in_place(&nonce, &aad, payload);
 
     payload.extend(counter);
 }
 
-#[allow(private_bounds)]
 pub fn decrypt(
     packet: &mut impl Encryptable,
-    session_id: &SessionId,
+    session_id: SessionId,
     monitor: &EncryptionMonitor,
 ) -> EmptyResult {
     let (aad, payload) = (packet.headers(), packet.payload());
@@ -52,15 +50,15 @@ pub fn decrypt(
         .try_into()
         .expect("length is guaranteed");
     payload.truncate(payload.len() - 8);
-    let nonce = Nonce::from(get_nonce(&session_id, counter));
+    let nonce = Nonce::from(get_nonce(session_id, counter));
 
     cipher
         .decrypt_in_place(&nonce, &aad, payload)
         .map_err(|_| ())
 }
 
-pub fn tag(packet: &mut Vec<u8>, session_id: &SessionId, monitor: &EncryptionMonitor) {
-    let (cipher, counter) = monitor.get(session_id);
+pub fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: &EncryptionMonitor) {
+    let (cipher, counter) = monitor.get(&session_id);
     let nonce = Nonce::from(get_nonce(session_id, counter));
 
     let mut tag = vec![];
@@ -72,7 +70,7 @@ pub fn tag(packet: &mut Vec<u8>, session_id: &SessionId, monitor: &EncryptionMon
 
 pub fn authenticate(
     packet: &mut Vec<u8>,
-    session_id: &SessionId,
+    session_id: SessionId,
     monitor: &EncryptionMonitor,
 ) -> bool {
     let cipher = monitor.get_cipher(&session_id);
