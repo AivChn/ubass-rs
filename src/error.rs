@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use crate::{
     packet_processor::types::PacketId,
     packetizer::types::{PacketType, SecondaryType, SessionId, Version},
@@ -101,7 +103,7 @@ impl From<ChannelError> for Error {
 /// Covers deserialization failures, version incompatibilities, and internal errors.
 #[derive(Debug)]
 pub enum PacketProcessingError {
-    IncompatibleVersion(Version),
+    IncompatibleVersion(Version, SocketAddr),
     WrongHeaderSize(usize),
     InvalidPacketTypeHeader(u8),
     FailedToDeserialize,
