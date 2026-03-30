@@ -29,7 +29,7 @@ pub struct OutboundChannels {
 /// Messages sent to the packet processing layer from the packetizer.
 /// Used to send packets for processing or signal graceful shutdown.
 pub enum PacketProcessingMessage {
-    SendPacket(Packets),
+    SendPacket(PacketWrapper),
     Close,
 }
 
@@ -38,7 +38,7 @@ pub enum PacketProcessingMessage {
 /// Upon receiving Close, the task will wait to confirm all packets were sent.
 #[derive(Debug, Clone)]
 pub enum TransportMessage {
-    Data(Vec<ProcessedPacket>),
+    Data(ProcessedPacket),
     Close,
 }
 
