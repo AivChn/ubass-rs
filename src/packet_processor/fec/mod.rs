@@ -129,7 +129,8 @@ impl From<ParityPacket> for FECPacket {
     }
 }
 
-trait FECCompatible: Into<FECPacket> {}
+#[allow(private_bounds)]
+pub trait FECCompatible: Into<FECPacket> {}
 impl FECCompatible for DataPacket {}
 impl FECCompatible for ParityPacket {}
 
@@ -141,12 +142,10 @@ type FECImpl = reed_solomon::RS;
 
 static FEC: LazyLock<FECImpl> = LazyLock::new(FECImpl::new);
 
-#[allow(private_bounds)]
 pub async fn sent(packet: impl FECCompatible) -> Option<Vec<ParityPacket>> {
     FEC.sent(packet.into()).await
 }
 
-#[allow(private_bounds)]
 pub async fn received(packet: impl FECCompatible) -> bool {
     let packet: FECPacket = packet.into();
     FEC.received(packet).await
