@@ -16,21 +16,20 @@ use super::fingerprint::{Fingerprint, Headers};
 pub const MAX_PAYLOAD_LENGTH: usize = 1400;
 
 pub enum PacketWrapper {
-    HelloPacket(HelloPacket),
-    TrackRequestPacket(TrackRequestPacket),
-    DataPacket(DataPacket),
-    MetadataPacket(MetadataPacket),
-    ParityPacket(ParityPacket),
-    AckPacket(AckPacket),
-    RetransmitPacket(RetransmitPacket),
-    PlaybackStatusPacket(PlaybackStatusPacket),
-    IncompatibleVersion(IncompatibleVersion),
-    SessionDoesNotExistErrorPacket(SessionDoesNotExistErrorPacket),
-    UnexpectedPacketErrorPacket(UnexpectedPacketErrorPacket),
-    AppRejectErrorPacket(AppRejectErrorPacket),
+    HelloPacket(Box<HelloPacket>),
+    TrackRequestPacket(Box<TrackRequestPacket>),
+    DataPacket(Box<DataPacket>),
+    MetadataPacket(Box<MetadataPacket>),
+    ParityPacket(Box<ParityPacket>),
+    AckPacket(Box<AckPacket>),
+    RetransmitPacket(Box<RetransmitPacket>),
+    PlaybackStatusPacket(Box<PlaybackStatusPacket>),
+    IncompatibleVersion(Box<IncompatibleVersion>),
+    SessionDoesNotExistErrorPacket(Box<SessionDoesNotExistErrorPacket>),
+    UnexpectedPacketErrorPacket(Box<UnexpectedPacketErrorPacket>),
+    AppRejectErrorPacket(Box<AppRejectErrorPacket>),
 }
 
-#[repr(C)]
 #[derive(Headers, Serialize)]
 pub struct HelloPacket {
     pub version: Version,
@@ -38,8 +37,8 @@ pub struct HelloPacket {
     pub packet_type: PacketType,
     pub control_type: ControlType,
     pub reserved: Reserved<2>,
-    pub timestamp: Timestamp,
     pub proposed_session_id: SessionId,
+    pub timestamp: Timestamp,
     pub public_key: PublicKey,
     pub app_id: AppId,
     pub host_address: SocketAddrV4,
@@ -74,7 +73,6 @@ impl HelloPacket {
     }
 }
 
-#[repr(C)]
 #[derive(Headers, Serialize)]
 pub struct TrackRequestPacket {
     pub version: Version,
@@ -82,8 +80,8 @@ pub struct TrackRequestPacket {
     pub packet_type: PacketType,
     pub control_type: ControlType,
     pub reserved: Reserved<2>,
-    pub timestamp: Timestamp,
     pub session_id: SessionId,
+    pub timestamp: Timestamp,
     pub payload: Vec<u8>,
 }
 
@@ -131,7 +129,6 @@ impl TrackRequestPacket {
     }
 }
 
-#[repr(C)]
 #[derive(Headers, Serialize)]
 pub struct DataPacket {
     pub version: Version,
@@ -177,7 +174,6 @@ impl DataPacket {
 }
 
 #[derive(Headers, Serialize)]
-#[repr(C)]
 pub struct MetadataPacket {
     pub version: Version,
     pub opts: Options,
@@ -230,12 +226,12 @@ impl MetadataPacket {
     }
 }
 
-#[repr(C)]
 #[derive(Headers, Serialize)]
 pub struct ParityPacket {
     pub version: Version,
     pub opts: Options,
-    pub packet_type_batch_id: PacketTypeFecBatchID,
+    pub packet_type: PacketType,
+    pub batch_id: BatchID,
     pub fec_info: FECInfo,
     pub session_id: SessionId,
     pub timestamp: Timestamp,
@@ -256,16 +252,14 @@ impl ParityPacket {
         payload: Vec<u8>,
     ) -> Self {
         let version = Version::CURRENT_VERSION;
-        let packet_type_batch_id = PacketTypeFecBatchID {
-            packet_type: PacketType::Parity,
-            batch_id,
-        };
+        let packet_type = PacketType::Parity;
         let timestamp = Timestamp::now();
 
         Self {
             version,
             opts,
-            packet_type_batch_id,
+            packet_type,
+            batch_id,
             fec_info,
             session_id,
             timestamp,
@@ -274,7 +268,6 @@ impl ParityPacket {
     }
 }
 
-#[repr(C)]
 #[derive(Headers, Serialize)]
 pub struct PlaybackStatusPacket {
     pub version: Version,
@@ -323,13 +316,12 @@ impl PlaybackStatusPacket {
     }
 }
 
-#[repr(C)]
 #[derive(Headers, Serialize)]
 pub struct AckPacket {
     pub version: Version,
     pub opts: Options,
     pub packet_type: PacketType,
-    reserved: Reserved<1>,
+    reserved: Reserved<3>,
     pub session_id: SessionId,
     pub timestamp: Timestamp,
     pub fingerprint: PacketFingerprint,
@@ -363,7 +355,6 @@ impl AckPacket {
     }
 }
 
-#[repr(C)]
 #[derive(Headers, Serialize)]
 pub struct RetransmitPacket {
     pub version: Version,
@@ -371,8 +362,8 @@ pub struct RetransmitPacket {
     pub packet_type: PacketType,
     pub control_type: ControlType,
     pub buffer_id: Option<BufferId>,
-    pub timestamp: Timestamp,
     pub session_id: SessionId,
+    pub timestamp: Timestamp,
     pub payload: Vec<ByteRange>,
 }
 
@@ -415,8 +406,7 @@ impl RetransmitPacket {
     }
 }
 
-#[derive(Serialize)]
-#[repr(C)]
+#[derive(Serialize, Headers)]
 pub struct SessionDoesNotExistErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -449,8 +439,7 @@ impl SessionDoesNotExistErrorPacket {
     }
 }
 
-#[derive(Serialize)]
-#[repr(C)]
+#[derive(Serialize, Headers)]
 pub struct UnexpectedPacketErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -534,8 +523,7 @@ impl UnexpectedPacketErrorPacket {
     }
 }
 
-#[derive(Serialize)]
-#[repr(C)]
+#[derive(Serialize, Headers)]
 pub struct AppRejectErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -585,8 +573,7 @@ impl AppRejectErrorPacket {
     }
 }
 
-#[derive(Serialize)]
-#[repr(C)]
+#[derive(Serialize, Headers)]
 pub struct IncompatibleVersion {
     pub zero_version: Version,
     pub min_version: Version,
@@ -712,20 +699,20 @@ impl Timestamp {
 pub struct Reserved<const N: usize>;
 
 impl<const N: usize> Serialize for Reserved<N> {
-    fn serialize(&self, buf: &mut [u8]) -> bool {
+    fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
         if buf.len() < N {
-            false
+            Err(())
         } else {
             buf[..N].fill(0);
-            true
+            Ok(())
         }
     }
 
-    fn deserialize(bytes: &[u8]) -> Option<Self> {
+    fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
         if bytes.len() < N {
-            None
+            Err(())
         } else {
-            Some(Reserved)
+            Ok(Reserved)
         }
     }
 
@@ -760,6 +747,11 @@ impl Version {
     pub fn is_compatible(&self) -> bool {
         *self >= Version::MIN_COMPATIBLE_VERSION
     }
+
+    #[inline]
+    pub fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
 }
 
 impl Display for Version {
@@ -791,7 +783,7 @@ pub enum ControlType {
 }
 
 impl Serialize for ControlType {
-    fn serialize(&self, buf: &mut [u8]) -> bool {
+    fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
         match self {
             ControlType::Host(packet) => packet.serialize(buf),
             ControlType::Session(packet) => packet.serialize(buf),
@@ -799,11 +791,11 @@ impl Serialize for ControlType {
         }
     }
 
-    fn deserialize(bytes: &[u8]) -> Option<Self> {
-        if let Some(control_type) = HostControlType::deserialize(bytes) {
-            Some(Self::Host(control_type))
-        } else if let Some(control_type) = SessionControlType::deserialize(bytes) {
-            Some(Self::Session(control_type))
+    fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
+        if let Ok(control_type) = HostControlType::deserialize(bytes) {
+            Ok(Self::Host(control_type))
+        } else if let Ok(control_type) = SessionControlType::deserialize(bytes) {
+            Ok(Self::Session(control_type))
         } else {
             PlaybackControlType::deserialize(bytes).map(Self::Playback)
         }
@@ -869,13 +861,6 @@ pub enum ErrorType {
 #[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct BatchID(pub u16);
-
-#[derive(Serialize, Debug, Clone, Copy)]
-#[repr(C)]
-pub struct PacketTypeFecBatchID {
-    pub packet_type: PacketType,
-    pub batch_id: BatchID,
-}
 
 #[derive(Serialize, Debug, PartialEq)]
 #[repr(transparent)]
@@ -998,20 +983,21 @@ impl ByteRange {
 }
 
 impl Serialize for Vec<ByteRange> {
-    fn serialize(&self, buf: &mut [u8]) -> bool {
+    fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
         if buf.len() < self.len() * size_of::<ByteRange>() {
-            false
+            Err(())
         } else {
-            self.iter()
-                .enumerate()
-                .all(|(i, e)| e.serialize(&mut buf[i * size_of::<ByteRange>()..]))
+            for (i, e) in self.iter().enumerate() {
+                e.serialize(&mut buf[i * size_of::<ByteRange>()..])?;
+            }
+            Ok(())
         }
     }
 
-    fn deserialize(bytes: &[u8]) -> Option<Self> {
+    fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
         const SIZE: usize = size_of::<ByteRange>();
         if bytes.len() < SIZE {
-            None
+            Err(())
         } else {
             let mut buf = vec![];
             let mut result = vec![];
@@ -1023,7 +1009,7 @@ impl Serialize for Vec<ByteRange> {
                 buf.push(*byte);
             }
 
-            Some(result)
+            Ok(result)
         }
     }
 
