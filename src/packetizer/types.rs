@@ -84,8 +84,8 @@ impl HelloPacket {
             packet_type,
             control_type,
             reserved,
-            timestamp,
             proposed_session_id,
+            timestamp,
             public_key,
             app_id,
             host_address,
@@ -121,8 +121,8 @@ impl TrackRequestPacket {
             packet_type,
             control_type,
             reserved,
-            timestamp,
             session_id,
+            timestamp,
             payload,
         }
     }
@@ -142,14 +142,14 @@ impl TrackRequestPacket {
             packet_type,
             control_type,
             reserved,
-            timestamp,
             session_id,
+            timestamp,
             payload,
         }
     }
 }
 
-#[derive(Headers, Payload, Serialize)]
+#[derive(Headers, Payload, Serialize, Clone)]
 pub struct DataPacket {
     pub version: Version,
     pub opts: Options,
@@ -419,8 +419,8 @@ impl RetransmitPacket {
             packet_type,
             control_type,
             buffer_id,
-            timestamp,
             session_id,
+            timestamp,
             payload,
         }
     }
