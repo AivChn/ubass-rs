@@ -110,7 +110,7 @@ impl FingerprintWindow {
     }
 
     #[must_use]
-    pub async fn contains(&self, fingerprint: &Box<PacketFingerprint>) -> bool {
+    pub async fn contains(&self, fingerprint: &PacketFingerprint) -> bool {
         let fingerprints = self.fingerprints.read().await;
         fingerprints.contains(fingerprint)
     }
