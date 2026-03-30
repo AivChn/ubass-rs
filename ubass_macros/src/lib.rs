@@ -310,6 +310,7 @@ fn get_headers_impl(input: DeriveInput) -> TokenStream {
 
                 buf
             }
+
         }
     }
     .into()
@@ -321,6 +322,22 @@ pub fn headers_derive_macro(item: TokenStream) -> TokenStream {
         .map_err(|e| panic!("{}", e.to_string()))
         .unwrap();
     get_headers_impl(input)
+}
+
+#[proc_macro_derive(Payload)]
+pub fn payload_derive_macro(item: TokenStream) -> TokenStream {
+    let input = syn::parse::<DeriveInput>(item)
+        .map_err(|e| panic!("{}", e.to_string()))
+        .unwrap();
+    let ident = input.ident;
+    quote! {
+        impl Payload for #ident {
+            fn payload(&mut self) -> &mut Vec<u8> {
+                &mut self.payload
+            }
+        }
+    }
+    .into()
 }
 
 #[proc_macro_attribute]
