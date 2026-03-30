@@ -1,11 +1,15 @@
 use crate::{
-    manager::types::EncryptionMonitor,
+    manager::types::{EncryptionMonitor, FingerprintMonitor},
     packet_processor::{encryption, serialize::Serialize},
-    packetizer::{fingerprint::Headers, types::*},
+    packetizer::{
+        fingerprint::{self, Fingerprint, Headers},
+        types::*,
+    },
     prelude::*,
 };
 
-use super::types::{InboundChannels, PacketWrapper, ReceivedPacket};
+use super::types::{InboundChannels, InboundReceiver, InboundSender, ReceivedPacket};
+use crate::packetizer::types::Packets;
 
 use tokio::sync::mpsc::Sender;
 
@@ -13,12 +17,22 @@ const SESSION_ID_OFFSET: usize = 8;
 const PACKET_TYPE_OFFSET: usize = 4;
 const SECONDARY_TYPE_OFFSET: usize = 5;
 
+macro_rules! unwrap_or_return {
+    ($result:expr) => {
+        match $result {
+            Ok(val) => val,
+            Err(_) => return,
+        }
+    };
+}
+
 pub async fn init(
     InboundChannels {
         mut t_receiver,
         p_sender,
     }: InboundChannels,
     encryption_monitor: &'static EncryptionMonitor<'_>,
+    fingerprint_monitor: &'static FingerprintMonitor<'_>,
 ) -> ErrResult {
     loop {
         let mut buffer = Vec::with_capacity(16);
@@ -26,14 +40,20 @@ pub async fn init(
         if received == 0 {
             return Err(ChannelError::ChannelClosed(Inbound).into());
         }
-        handle_messages(buffer.into(), p_sender.clone(), encryption_monitor);
+        tokio::spawn(handle_messages(
+            buffer.into(),
+            p_sender.clone(),
+            encryption_monitor,
+            fingerprint_monitor,
+        ));
     }
 }
 
 async fn handle_messages(
     buffer: Box<[Result<ReceivedPacket>]>,
-    sender: Sender<Result<PacketWrapper>>,
+    sender: InboundSender,
     encryption_monitor: &'static EncryptionMonitor<'_>,
+    fingerprint_monitor: &'static FingerprintMonitor<'_>,
 ) {
     for packet in buffer {
         let packet = match packet {
@@ -43,29 +63,32 @@ async fn handle_messages(
                     tokio::spawn(send_up(Err(err), sender.clone()));
                     continue;
                 } else {
-                    unreachable!("No pacth currently leads to a recoverable error at this level");
+                    unreachable!("No path currently leads to a recoverable error at this level");
                 }
             }
         };
 
-        tokio::spawn(handle_packet(packet, sender.clone(), encryption_monitor));
+        tokio::spawn(handle_packet(
+            packet,
+            sender.clone(),
+            encryption_monitor,
+            fingerprint_monitor,
+        ));
     }
 }
 
 async fn handle_packet(
     mut packet: ReceivedPacket,
-    sender: Sender<Result<PacketWrapper>>,
+    sender: InboundSender,
     encryption_monitor: &'static EncryptionMonitor<'_>,
+    fingerprint_monitor: &'static FingerprintMonitor<'_>,
 ) {
-    let Ok(version) = Version::deserialize(&packet.data) else {
-        return;
-    };
+    let version = unwrap_or_return!(Version::deserialize(&packet.data));
 
-    if version.is_zero()
-        && let Ok(packet) = IncompatibleVersion::deserialize(&packet.data)
-    {
+    if version.is_zero() {
+        let ready_packet = unwrap_or_return!(IncompatibleVersionPacket::deserialize(&packet.data));
         tokio::spawn(send_up(
-            Ok(PacketWrapper::IncompatibleVersion(Box::new(packet))),
+            Ok(Packets::IncompatibleVersion(Box::new(ready_packet)).wrap(packet.src_addr)),
             sender.clone(),
         ));
         return;
@@ -73,133 +96,176 @@ async fn handle_packet(
 
     if !version.is_compatible() {
         tokio::spawn(send_up(
-            Err(PacketProcessingError::IncompatibleVersion(version).into()),
+            Err(PacketProcessingError::IncompatibleVersion(version, packet.src_addr).into()),
             sender.clone(),
         ));
+        return;
     }
 
-    // opts is 16 bits, but isnt necessary to check right now
-    let Ok(packet_type) = <PacketType>::deserialize(&packet.data[PACKET_TYPE_OFFSET..]) else {
-        return;
-    };
+    let packet_type =
+        unwrap_or_return!(PacketType::deserialize(&packet.data[PACKET_TYPE_OFFSET..]));
 
-    let Ok(packet) = deserialize_and_decrypt(packet_type, &mut packet.data, encryption_monitor)
-    else {
-        return;
-    };
+    let ready_packet = unwrap_or_return!(
+        deserialize_and_decrypt(
+            packet_type,
+            packet.data,
+            encryption_monitor,
+            fingerprint_monitor
+        )
+        .await
+    );
 
-    send_up(Ok(packet), sender.clone()).await;
+    send_up(Ok(ready_packet.wrap(packet.src_addr)), sender.clone()).await;
 }
 
-fn handle_incompatible_version_packet(
-    data: &mut Vec<u8>,
-) -> core::result::Result<IncompatibleVersion, ()> {
-    IncompatibleVersion::deserialize(data)
-}
-
-fn deserialize_and_decrypt(
+async fn deserialize_and_decrypt(
     packet_type: PacketType,
-    data: &mut Vec<u8>,
+    mut data: Vec<u8>,
     encryption_monitor: &'static EncryptionMonitor<'_>,
-) -> core::result::Result<PacketWrapper, ()> {
+    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+) -> core::result::Result<Packets, ()> {
+    let session_id = SessionId::deserialize(&data[SESSION_ID_OFFSET..])?;
+
     match packet_type {
         // Single types
         PacketType::Data => {
-            let mut packet = Box::new(DataPacket::deserialize(data)?);
-            if !encryption::decrypt(
-                encryption::Encryptable::Data(&mut packet),
-                encryption_monitor,
-            ) {
-                Err(())
-            } else {
-                Ok(PacketWrapper::DataPacket(packet))
-            }
+            let mut packet = Box::new(DataPacket::deserialize(&data)?);
+            encryption::decrypt(packet.as_mut(), &session_id, encryption_monitor)?;
+            Ok(Packets::DataPacket(packet))
         }
+
         PacketType::Parity => {
-            let mut packet = Box::new(ParityPacket::deserialize(data)?);
-            if !encryption::decrypt(
-                encryption::Encryptable::Parity(&mut packet),
-                encryption_monitor,
-            ) {
-                Err(())
-            } else {
-                Ok(PacketWrapper::ParityPacket(packet))
-            }
+            let mut packet = Box::new(ParityPacket::deserialize(&data)?);
+            encryption::decrypt(packet.as_mut(), &session_id, encryption_monitor)?;
+            Ok(Packets::ParityPacket(packet))
         }
+
         PacketType::Ack => {
-            authenticate(data, encryption_monitor)?;
-            let mut packet = PacketWrapper::AckPacket(Box::new(AckPacket::deserialize(data)?));
+            authenticate(&mut data, &session_id, encryption_monitor)?;
+            let data = dedup_no_payload(data, &session_id, fingerprint_monitor)
+                .await
+                .ok_or(())?;
+            let mut packet = Packets::AckPacket(Box::new(AckPacket::deserialize(&data)?));
 
             Ok(packet)
         }
 
         // Subtypes
         PacketType::Host | PacketType::Session | PacketType::Playback => {
-            deserialize_and_auth_control_packet(data, encryption_monitor)
+            deserialize_and_auth_control_packet(
+                data,
+                &session_id,
+                encryption_monitor,
+                fingerprint_monitor,
+            )
+            .await
         }
-        PacketType::Error => deserialize_error_packet(data, encryption_monitor),
+        PacketType::Error => {
+            deserialize_and_auth_error_packet(
+                data,
+                &session_id,
+                encryption_monitor,
+                fingerprint_monitor,
+            )
+            .await
+        }
 
         // Not yet
         PacketType::Metadata => unimplemented!(),
     }
 }
 
-fn deserialize_and_auth_control_packet(
-    data: &mut Vec<u8>,
+async fn deserialize_and_auth_control_packet(
+    mut data: Vec<u8>,
+    session_id: &SessionId,
     encryption_monitor: &'static EncryptionMonitor<'_>,
-) -> core::result::Result<PacketWrapper, ()> {
-    authenticate(data, encryption_monitor)?;
-
+    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+) -> core::result::Result<Packets, ()> {
     Ok(
         match ControlType::deserialize(&data[SECONDARY_TYPE_OFFSET..])? {
             // host
             ControlType::Host(HostControlType::Hello) => {
-                PacketWrapper::HelloPacket(Box::new(HelloPacket::deserialize(data)?))
+                authenticate(&mut data, &session_id, encryption_monitor)?;
+                let data = dedup_no_payload(data, session_id, fingerprint_monitor)
+                    .await
+                    .ok_or(())?;
+                Packets::HelloPacket(Box::new(HelloPacket::deserialize(&data)?))
             }
+
             //session
             ControlType::Session(SessionControlType::Retransmit) => {
-                PacketWrapper::RetransmitPacket(Box::new(RetransmitPacket::deserialize(data)?))
+                let packet = Box::new(RetransmitPacket::deserialize(&data)?);
+                authenticate(&mut packet.headers(), session_id, encryption_monitor)?;
+                let packet = dedup_with_payload(packet, session_id, fingerprint_monitor)
+                    .await
+                    .ok_or(())?;
+                Packets::RetransmitPacket(packet)
             }
             ControlType::Session(SessionControlType::TrackRequest) => {
-                PacketWrapper::TrackRequestPacket(Box::new(TrackRequestPacket::deserialize(data)?))
+                let mut packet = Box::new(TrackRequestPacket::deserialize(&data)?);
+                encryption::decrypt(packet.as_mut(), &session_id, encryption_monitor)?;
+                let packet = dedup_with_payload(packet, session_id, fingerprint_monitor)
+                    .await
+                    .ok_or(())?;
+                Packets::TrackRequestPacket(packet)
             }
             ControlType::Session(SessionControlType::MetadataRequest) => unimplemented!(),
+
             //playback
-            ControlType::Playback(_) => PacketWrapper::PlaybackStatusPacket(Box::new(
-                PlaybackStatusPacket::deserialize(data)?,
-            )),
+            ControlType::Playback(_) => {
+                authenticate(&mut data, session_id, encryption_monitor)?;
+                let data = dedup_no_payload(data, session_id, fingerprint_monitor)
+                    .await
+                    .ok_or(())?;
+                Packets::PlaybackStatusPacket(Box::new(PlaybackStatusPacket::deserialize(&data)?))
+            }
         },
     )
 }
 
-fn deserialize_error_packet(
-    data: &mut Vec<u8>,
+async fn deserialize_and_auth_error_packet(
+    mut data: Vec<u8>,
+    session_id: &SessionId,
     encryption_monitor: &'static EncryptionMonitor<'_>,
-) -> core::result::Result<PacketWrapper, ()> {
-    authenticate(data, encryption_monitor)?;
-
+    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+) -> core::result::Result<Packets, ()> {
     Ok(
         match ErrorType::deserialize(&data[SECONDARY_TYPE_OFFSET..])? {
-            ErrorType::AppReject => PacketWrapper::AppRejectErrorPacket(Box::new(
-                AppRejectErrorPacket::deserialize(data)?,
-            )),
+            ErrorType::AppReject => {
+                let mut packet = Box::new(AppRejectErrorPacket::deserialize(&data)?);
+                encryption::decrypt(packet.as_mut(), &session_id, encryption_monitor)?;
+                let packet = dedup_with_payload(packet, session_id, fingerprint_monitor)
+                    .await
+                    .ok_or(())?;
+                Packets::AppRejectErrorPacket(packet)
+            }
             ErrorType::UnexpectedPacket | ErrorType::IncomprehensiblePacket => {
-                PacketWrapper::UnexpectedPacketErrorPacket(Box::new(
-                    UnexpectedPacketErrorPacket::deserialize(data)?,
+                authenticate(&mut data, &session_id, encryption_monitor)?;
+                let data = dedup_no_payload(data, session_id, fingerprint_monitor)
+                    .await
+                    .ok_or(())?;
+                Packets::UnexpectedPacketErrorPacket(Box::new(
+                    UnexpectedPacketErrorPacket::deserialize(&data)?,
                 ))
             }
-            ErrorType::SessionDoesNotExist => PacketWrapper::SessionDoesNotExistErrorPacket(
-                Box::new(SessionDoesNotExistErrorPacket::deserialize(data)?),
-            ),
+            ErrorType::SessionDoesNotExist => {
+                authenticate(&mut data, &session_id, encryption_monitor)?;
+                let data = dedup_no_payload(data, session_id, fingerprint_monitor)
+                    .await
+                    .ok_or(())?;
+                Packets::SessionDoesNotExistErrorPacket(Box::new(
+                    SessionDoesNotExistErrorPacket::deserialize(&data)?,
+                ))
+            }
         },
     )
 }
 
 fn authenticate(
     packet: &mut Vec<u8>,
+    session_id: &SessionId,
     encryption_monitor: &'static EncryptionMonitor<'_>,
 ) -> core::result::Result<(), ()> {
-    let session_id = SessionId::deserialize(&packet[SESSION_ID_OFFSET..])?;
     if !encryption::authenticate(packet, session_id, encryption_monitor) {
         Err(())
     } else {
@@ -207,6 +273,36 @@ fn authenticate(
     }
 }
 
-async fn send_up(message: Result<PacketWrapper>, sender: Sender<Result<PacketWrapper>>) {
+async fn dedup_no_payload(
+    packet: Vec<u8>,
+    session_id: &SessionId,
+    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+) -> Option<Vec<u8>> {
+    let window = fingerprint_monitor.get(session_id).await;
+    let fingerprint = Box::new((&packet).into());
+    if window.contains(&fingerprint).await {
+        None
+    } else {
+        _ = window.add(fingerprint).await;
+        Some(packet)
+    }
+}
+
+async fn dedup_with_payload<T: Headers>(
+    packet: Box<T>,
+    session_id: &SessionId,
+    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+) -> Option<Box<T>> {
+    let window = fingerprint_monitor.get(session_id).await;
+    let fingerprint: Box<PacketFingerprint> = Box::new(packet.as_ref().into());
+    if window.contains(&fingerprint).await {
+        None
+    } else {
+        window.add(fingerprint).await;
+        Some(packet)
+    }
+}
+
+async fn send_up(message: Result<PacketWrapper>, sender: InboundSender) {
     sender.send(message).await;
 }
