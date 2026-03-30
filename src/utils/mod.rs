@@ -7,7 +7,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 #[macro_export]
 macro_rules! dispatch {
-    ($call: expr, $monitor: expr) => {
+    ($call:expr => $monitor:expr) => {
         let handle = tokio::spawn($call);
         $monitor.add(handle).await;
     };
