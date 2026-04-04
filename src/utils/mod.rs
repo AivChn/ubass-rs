@@ -5,6 +5,20 @@ use std::{
 
 use tokio::{sync::Mutex, task::JoinHandle};
 
+pub mod messages;
+
+pub use messages::*;
+
+#[macro_export]
+macro_rules! unwrap_or_return {
+    ($result:expr) => {
+        match $result {
+            Ok(val) => val,
+            Err(_) => return,
+        }
+    };
+}
+
 #[macro_export]
 macro_rules! dispatch {
     ($call:expr => $monitor:expr) => {
