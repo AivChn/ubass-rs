@@ -1,6 +1,7 @@
 use crate::{
-    packet_processor::types::{PacketId, ProcessedPacket, TransportMessage},
+    packet_processor::types::ProcessedPacket,
     prelude::*,
+    utils::messages::{PacketProcessingMessage, TransportMessage},
 };
 use std::{
     cmp::min,
@@ -16,12 +17,22 @@ pub const MAX_PACKET_SIZE: usize = 1452;
 
 pub const MAX_CONCURRENT_SENDS: usize = 128;
 pub const MAX_PACKET_BUFFER_SIZE: usize = 128;
-pub const BUFFER_TIMEOUT: u64 = 25;
+pub const BUFFER_TIMEOUT: u64 = 5;
+
+pub type OutboundReceiver = Receiver<TransportMessage>;
+pub type InboundSender = Sender<Result<PacketProcessingMessage>>;
 
 /// Packaging for the two channels the inbound task accesses
-pub struct InboundChannels {
-    pub receiver: Receiver<TransportMessage>,
-    pub sender: Sender<Result<ReceivedPacket>>,
+pub struct TransportChannels {
+    pub receiver: OutboundReceiver,
+    pub sender: InboundSender,
+}
+
+/// A packet straight from the socket oven
+#[derive(Debug, Clone)]
+pub struct ReceivedPacket {
+    pub src_addr: SocketAddr,
+    pub data: Vec<u8>,
 }
 
 /// A struct to manage outbound sockets, using a ring buffer esque structure that expands and
@@ -80,7 +91,7 @@ impl OutboundSockets {
         #[allow(clippy::cast_sign_loss)]
         // get the time left until the buffer would have been sent, 0 if the buffer was sent at the
         // last moment
-        let n = min(BUFFER_TIMEOUT as i128 - elapsed as i128, 0) as u64;
+        let n = BUFFER_TIMEOUT.saturating_sub(elapsed);
         if n == 0 {
             // if the buffer wasnt filled or filled just at the last second,
             // reset early batches and increase on time batches.
@@ -136,30 +147,5 @@ impl OutboundSockets {
     /// swaps the current socket to the next one
     fn next_socket(&mut self) {
         self.current_socket = (self.current_socket + 1) % self.sockets.len();
-    }
-}
-
-/// Packet ready for UDP transmission with metadata for error reporting and redundancy.
-#[derive(Debug, Clone)]
-pub struct SendablePacket {
-    pub id: PacketId,
-    pub data: Vec<u8>,
-    pub duplicate_count: usize,
-}
-
-/// A packet straight from the socket oven
-#[derive(Debug, Clone)]
-pub struct ReceivedPacket {
-    pub src_addr: SocketAddr,
-    pub data: Vec<u8>,
-}
-
-impl From<ProcessedPacket> for SendablePacket {
-    fn from(value: ProcessedPacket) -> Self {
-        Self {
-            id: value.packet_id,
-            data: value.data,
-            duplicate_count: value.duplicate_count,
-        }
     }
 }
