@@ -13,15 +13,15 @@ use ubass_macros::Serialize;
 
 use super::fingerprint::{Fingerprint, Headers, Payload};
 
-pub const MAX_PAYLOAD_LENGTH: usize = 1400;
+pub const MAX_PAYLOAD_LENGTH: usize = 1384;
 
 pub struct PacketWrapper {
     pub addr: SocketAddr,
-    pub packet: Packets,
+    pub packet: Packet,
 }
 
 impl PacketWrapper {
-    pub fn new(src_addr: SocketAddr, packet: Packets) -> Self {
+    pub fn new(src_addr: SocketAddr, packet: Packet) -> Self {
         Self {
             addr: src_addr,
             packet,
@@ -29,7 +29,7 @@ impl PacketWrapper {
     }
 }
 
-pub enum Packets {
+pub enum Packet {
     HelloPacket(Box<HelloPacket>),
     TrackRequestPacket(Box<TrackRequestPacket>),
     DataPacket(Box<DataPacket>),
@@ -44,9 +44,27 @@ pub enum Packets {
     AppRejectErrorPacket(Box<AppRejectErrorPacket>),
 }
 
-impl Packets {
+impl Packet {
     pub fn wrap(self, src_addr: SocketAddr) -> PacketWrapper {
         PacketWrapper::new(src_addr, self)
+    }
+}
+
+impl TryFrom<&Packet> for PacketFingerprint {
+    type Error = ();
+
+    fn try_from(value: &Packet) -> core::result::Result<Self, ()> {
+        Ok(match value {
+            Packet::TrackRequestPacket(packet) => packet.as_ref().into(),
+            Packet::DataPacket(packet) => packet.as_ref().into(),
+            Packet::MetadataPacket(packet) => packet.as_ref().into(),
+            Packet::ParityPacket(packet) => packet.as_ref().into(),
+            Packet::RetransmitPacket(packet) => packet.as_ref().into(),
+            Packet::PlaybackStatusPacket(packet) => packet.as_ref().into(),
+            Packet::UnexpectedPacketErrorPacket(packet) => packet.as_ref().into(),
+            Packet::AppRejectErrorPacket(packet) => packet.as_ref().into(),
+            _ => return Err(()),
+        })
     }
 }
 
@@ -109,7 +127,7 @@ impl TrackRequestPacket {
     #[must_use]
     pub fn request_track(opts: Options, session_id: SessionId, payload: Vec<u8>) -> Self {
         let version = Version::CURRENT_VERSION;
-        let opts = opts.add(OptionFlags::RequireAck);
+        let opts = opts.set(OptionFlags::RequireAck);
         let packet_type = PacketType::Session;
         let control_type = ControlType::Session(SessionControlType::TrackRequest);
         let reserved = Reserved;
@@ -130,7 +148,7 @@ impl TrackRequestPacket {
     #[must_use]
     pub fn request_metadata(opts: Options, session_id: SessionId, payload: Vec<u8>) -> Self {
         let version = Version::CURRENT_VERSION;
-        let opts = opts.add(OptionFlags::RequireAck);
+        let opts = opts.set(OptionFlags::RequireAck);
         let packet_type = PacketType::Session;
         let control_type = ControlType::Session(SessionControlType::MetadataRequest);
         let reserved = Reserved;
@@ -259,9 +277,9 @@ pub struct ParityPacket {
 }
 
 impl ParityPacket {
-    pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH + 4;
+    pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH + size_of::<BytePosition>();
     pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<Vec<u8>>();
-    pub const MIN_SIZE: usize = Self::HEADER_SIZE + 9;
+    pub const MIN_SIZE: usize = Self::HEADER_SIZE + size_of::<BytePosition>() + 1;
 
     #[must_use]
     pub fn new(
@@ -288,7 +306,7 @@ impl ParityPacket {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize, Headers)]
 pub struct PlaybackStatusPacket {
     pub version: Version,
     pub opts: Options,
@@ -303,7 +321,7 @@ impl PlaybackStatusPacket {
     #[inline]
     fn new(opts: Options, session_id: SessionId, playback_type: PlaybackControlType) -> Self {
         let version = Version::CURRENT_VERSION;
-        let opts = opts.add(OptionFlags::RequireAck);
+        let opts = opts.set(OptionFlags::RequireAck);
         let packet_type = PacketType::Playback;
         let control_type = playback_type.into();
         let reserved = Reserved;
@@ -389,7 +407,7 @@ pub struct RetransmitPacket {
 
 impl RetransmitPacket {
     // closest I can get to `MAX_PAYLOAD_LENGTH` while aligning to 6 bytes
-    const LOCAL_MAX_PAYLOAD_LENGTH: usize = 1398;
+    const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH - (MAX_PAYLOAD_LENGTH % 6);
     const HEADER_SIZE: usize = size_of::<Self>() - Self::LOCAL_MAX_PAYLOAD_LENGTH;
 
     pub fn new(
@@ -408,7 +426,7 @@ impl RetransmitPacket {
         );
 
         let version = Version::CURRENT_VERSION;
-        let opts = opts.add(OptionFlags::RequireAck);
+        let opts = opts.set(OptionFlags::RequireAck);
         let packet_type = PacketType::Session;
         let control_type = ControlType::Session(SessionControlType::Retransmit);
         let timestamp = Timestamp::now();
@@ -426,7 +444,7 @@ impl RetransmitPacket {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct SessionDoesNotExistErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -459,7 +477,7 @@ impl SessionDoesNotExistErrorPacket {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Headers)]
 pub struct UnexpectedPacketErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -543,7 +561,7 @@ impl UnexpectedPacketErrorPacket {
     }
 }
 
-#[derive(Serialize, Headers, Payload)]
+#[derive(Clone, Serialize, Headers, Payload)]
 pub struct AppRejectErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -570,7 +588,7 @@ impl AppRejectErrorPacket {
         message: String,
     ) -> Self {
         let version = Version::CURRENT_VERSION;
-        let opts = opts.add(OptionFlags::RequireAck);
+        let opts = opts.set(OptionFlags::RequireAck);
         let packet_type = PacketType::Error;
         let error_type = ErrorType::AppReject;
         let reserved = Reserved;
@@ -632,7 +650,7 @@ impl From<ErrorType> for SecondaryType {
     }
 }
 
-#[derive(Serialize, Hash, PartialEq, Eq)]
+#[derive(Clone, Serialize, Hash, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct PacketFingerprint([u8; 16]);
 
@@ -690,7 +708,7 @@ pub struct PublicKey(pub [u8; 32]);
 #[repr(transparent)]
 pub struct BytePosition(pub u32);
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Clone, Copy, PartialEq, Debug)]
 #[repr(transparent)]
 pub struct Timestamp(u64);
 
@@ -713,6 +731,14 @@ impl Timestamp {
 
     pub fn been_longer_than(&self, millis: u64) -> bool {
         Self::now().0 - self.0 > millis
+    }
+
+    pub fn none() -> Self {
+        Timestamp(0)
+    }
+
+    pub fn get(&self) -> u64 {
+        self.0
     }
 }
 
@@ -899,22 +925,21 @@ impl Options {
         )
     }
 
-    #[inline]
-    pub const fn contains(&self, flag: OptionFlags) -> bool {
-        self.0 & (flag as u16) != 0
-    }
-
     #[must_use]
-    pub const fn remove(mut self, flag: OptionFlags) -> Self {
+    pub const fn unset(mut self, flag: OptionFlags) -> Self {
         self.0 &= !(flag as u16);
         self
     }
 
-    #[allow(clippy::should_implement_trait)]
     #[must_use]
-    pub const fn add(mut self, flag: OptionFlags) -> Self {
+    pub const fn set(mut self, flag: OptionFlags) -> Self {
         self.0 |= flag as u16;
         self
+    }
+
+    #[inline]
+    pub const fn contains(&self, flag: OptionFlags) -> bool {
+        self.0 & (flag as u16) != 0
     }
 
     pub fn deconstruct(&self) -> Vec<OptionFlags> {
