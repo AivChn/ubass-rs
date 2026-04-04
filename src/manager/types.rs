@@ -9,24 +9,76 @@ use std::{
 };
 
 use aes_gcm_siv::{Aes256GcmSiv, Nonce};
-use tokio::sync::{Mutex, RwLock};
-use uniffi::{ForeignBytes, foreignbytes};
-
-use crate::packetizer::{
-    fingerprint,
-    types::{PacketFingerprint, SessionId, Timestamp},
+use futures::future::pending;
+use tokio::sync::{
+    Mutex, RwLock,
+    mpsc::{Receiver, Sender},
 };
 
-pub enum ManagerMessage {
-    Close,
-    Highway,
+use crate::{
+    packet_processor::fec::RecoverdPacket,
+    packetizer::{
+        fingerprint,
+        types::{PacketFingerprint, PacketWrapper, SessionId, Timestamp},
+    },
+    prelude::*,
+};
+
+const PACKET_DISCARD_TIME_MS: u64 = 7 * 1000;
+
+type OutboundReceiver = Receiver<Result<ManagerMessage>>;
+type OutboundSender = Sender<PacketProcessingMessage>;
+
+pub struct PendingAck {
+    packet: PacketWrapper,
+    timestamp: Timestamp,
+    retries: u8,
 }
 
-#[derive(PartialEq)]
-pub enum HighwayMessage {
-    Packetizer,
-    PacketProcessor,
-    Transport,
+impl PendingAck {
+    const MAX_RETRIES: u8 = 5;
+
+    pub fn new(packet: PacketWrapper, timestamp: Timestamp) -> Self {
+        Self {
+            packet,
+            timestamp,
+            retries: 0,
+        }
+    }
+
+    pub fn packet(&self) -> &PacketWrapper {
+        &self.packet
+    }
+
+    pub fn retried(&mut self) {
+        self.timestamp = Timestamp::now();
+        self.retries += 1;
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.timestamp.been_longer_than(PACKET_DISCARD_TIME_MS) && self.retries >= Self::MAX_RETRIES
+    }
+}
+
+type PendingAckTable = HashMap<PacketFingerprint, PendingAck>;
+
+pub struct PendingAckMonitor<'a> {
+    table: &'a RwLock<PendingAckTable>,
+}
+
+impl<'a> PendingAckMonitor<'a> {
+    pub fn new(table: &'a RwLock<PendingAckTable>) -> Self {
+        Self { table }
+    }
+
+    pub async fn add(
+        &self,
+        fingerprint: PacketFingerprint,
+        pending_ack: (PacketWrapper, Timestamp),
+    ) {
+        let mut table = self.table.write().await;
+        table.insert(fingerprint, PendingAck::new(pending_ack.0, pending_ack.1));
+    }
 }
 
 #[derive(Eq)]
@@ -103,7 +155,8 @@ impl Default for FingerprintWindow {
 }
 
 impl FingerprintWindow {
-    const PRUNE_INTERVAL: u64 = 7 * 1000;
+    const PRUNE_INTERVAL: u64 = PACKET_DISCARD_TIME_MS;
+    const BUFFERING_TIME: u64 = 2 * 1000;
 
     pub fn init(self: Arc<Self>) {
         tokio::spawn(self.prune());
@@ -141,6 +194,7 @@ impl FingerprintWindow {
     pub async fn prune(self: Arc<Self>) {
         let mut expired = Vec::with_capacity(256);
         while !self.canceled.load(Ordering::Relaxed) {
+            let top_timestamp;
             'pop_queue: {
                 let mut queue = self.queue.lock().await;
                 while queue
@@ -149,6 +203,13 @@ impl FingerprintWindow {
                 {
                     if let Some((_, value)) = queue.pop_front() {
                         expired.push(value);
+                    }
+                }
+                top_timestamp = {
+                    if let Some(top) = queue.front() {
+                        top.0.get()
+                    } else {
+                        Self::PRUNE_INTERVAL - Self::BUFFERING_TIME
                     }
                 }
             }
@@ -160,7 +221,7 @@ impl FingerprintWindow {
                     .for_each(|value| _ = fingerprints.remove(unsafe { &*value.0 }));
             }
 
-            tokio::time::sleep(Duration::from_millis(Self::PRUNE_INTERVAL));
+            tokio::time::sleep(Duration::from_millis(top_timestamp + Self::BUFFERING_TIME)).await;
         }
     }
 }
