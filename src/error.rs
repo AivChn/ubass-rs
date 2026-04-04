@@ -1,9 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::{
-    packet_processor::types::PacketId,
-    packetizer::types::{PacketType, SecondaryType, SessionId, Version},
-};
+use crate::packetizer::types::{BatchID, PacketType, SecondaryType, SessionId, Version};
 pub type Result<T> = core::result::Result<T, Error>;
 pub type ErrResult = Result<()>;
 pub type EmptyResult = core::result::Result<(), ()>;
@@ -104,6 +101,7 @@ impl From<ChannelError> for Error {
 #[derive(Debug)]
 pub enum PacketProcessingError {
     IncompatibleVersion(Version, SocketAddr),
+    RecoveryNotReady(SessionId, BatchID),
     WrongHeaderSize(usize),
     InvalidPacketTypeHeader(u8),
     FailedToDeserialize,
@@ -124,9 +122,6 @@ impl From<PacketProcessingError> for Error {
 /// to communicate failures to the packet processor layer.
 #[derive(Debug, Clone)]
 pub enum TransportError {
-    /// One or more packets failed to send. Contains the IDs of failed packets
-    /// so they can be retried or reported by upper layers.
-    CouldNotSend(Vec<PacketId>),
     /// Failed to bind a UDP socket to the requested address/port.
     FailedToBind,
     RecvFailedTooManyTimes,
@@ -135,10 +130,6 @@ pub enum TransportError {
 impl From<TransportError> for Error {
     fn from(value: TransportError) -> Self {
         match value {
-            TransportError::CouldNotSend(_) => Error {
-                recoverable: Recoverabilty::Recoverable,
-                contents: ErrorContents::Transport(value),
-            },
             TransportError::RecvFailedTooManyTimes | TransportError::FailedToBind => Error {
                 recoverable: Recoverabilty::Unrecoverable,
                 contents: ErrorContents::Transport(value),
