@@ -1,49 +1,36 @@
 mod encryption;
-mod fec;
+pub mod fec;
 mod inbound;
 mod outbound;
 pub mod serialize;
 pub mod types;
 
 use crate::{
-    manager::types::{EncryptionMonitor, FingerprintMonitor},
+    manager::types::{EncryptionMonitor, FingerprintMonitor, PendingAckMonitor},
+    packet_processor::types::{InboundReceiver, InboundSender, OutboundReceiver, OutboundSender},
     packetizer::types::PacketWrapper,
     prelude::*,
 };
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use types::{
-    InboundChannels, OutboundChannels, PacketProcessingMessage, Packets, ReceivedPacket,
-    TransportMessage,
-};
-
-// =================== PUBLIC FUNCTIONS =================================|
-
-/// Initializes the packet processing layer and supervises send/recv tasks.
-///
-/// Spawns two concurrent tasks:
-/// - recv: Handles incoming packets from transport layer, processes and forwards to packetizer
-/// - send: Handles outgoing packets from packetizer, processes and forwards to transport
-///
-/// Acts as a supervisor, monitoring both tasks and handling failures.
-/// If either task fails, the supervisor will abort the other and return an error.
+use types::{InboundChannels, OutboundChannels, Packet, ReceivedPacket};
+/// initialize the packet processor
 ///
 /// # Errors
 ///
-/// This function only errors on unrecoverable errors occuring from either the tasks returning an
-/// error or failing to start.
-/// `TaskError::TaskFailed`: returned if the tasks failed - not by returning an error.
-/// TODO finish this
+/// propegates any error returned from the inbound or outbound ends of the pipline
+/// returns `Ok(())` to indicate a gracefull shutdown
 pub async fn init(
-    p_receiver: Receiver<PacketProcessingMessage>,
-    p_sender: Sender<Result<PacketWrapper>>,
-    t_receiver: Receiver<Result<ReceivedPacket>>,
-    t_sender: Sender<TransportMessage>,
+    p_receiver: OutboundReceiver,
+    p_sender: InboundSender,
+    t_receiver: InboundReceiver,
+    t_sender: OutboundSender,
     encryption_monitor: &'static EncryptionMonitor<'_>,
     fingerprint_monitor: &'static FingerprintMonitor<'_>,
+    pending_ack_monitor: &'static PendingAckMonitor<'_>,
 ) -> ErrResult {
-    let mut recv_handle = tokio::spawn(inbound::init(
+    let mut inbound_handle = tokio::spawn(inbound::init(
         InboundChannels {
             t_receiver,
             p_sender: p_sender.clone(),
@@ -51,38 +38,27 @@ pub async fn init(
         encryption_monitor,
         fingerprint_monitor,
     ));
-    let mut send_handle = tokio::spawn(outbound::init(
+    let mut outbound_handle = tokio::spawn(outbound::init(
         OutboundChannels {
             t_sender: t_sender.clone(),
             p_sender: p_sender.clone(),
             p_receiver,
         },
         encryption_monitor,
+        pending_ack_monitor,
     ));
 
-    'supervisor: loop {
-        _ = tokio::select! {
-            res = &mut recv_handle, if !recv_handle.is_finished() => {
-                let Ok(result) = res else {
-                    break 'supervisor Err(TaskError::TaskFailed.into());
-                };
-
-                match result {
-                    // TODO: update error handling
-                    Err(e) => Err::<(), _>(e),
-                    Ok(()) => break 'supervisor Ok(()),
-                }
-            },
-            res = &mut send_handle, if !send_handle.is_finished() => {
-                let Ok(result) = res else {
-                    break 'supervisor Err(TaskError::TaskFailed.into());
-                };
-
-                match result {
-                    // TODO: update error handling
-                    (_, Err(e)) => Err(e),
-                    (_, Ok(())) => { recv_handle.abort(); break 'supervisor Ok(())},
-                }
+    tokio::select! {
+        res = &mut inbound_handle, if !inbound_handle.is_finished() => {
+            match res {
+                Err(_) => Err(TaskError::TaskFailed.into()),
+                Ok(res) =>  res,
+            }
+        },
+        res = &mut outbound_handle, if !outbound_handle.is_finished() => {
+            match res {
+                Err(_) => Err(TaskError::TaskFailed.into()),
+                Ok(res) => res,
             }
         }
     }
