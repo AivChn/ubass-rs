@@ -1,31 +1,12 @@
 use crate::prelude::*;
+use crate::transport::types::InboundSender;
 
 use tokio::{net::UdpSocket, sync::mpsc::Sender};
 
 use super::send_to_processing_layer;
 use super::types::{MAX_PACKET_SIZE, ReceivedPacket};
 
-/// Listens for incoming UDP packets and forwards them to the packet processor.
-///
-/// This function runs an infinite loop, receiving packets and sending them up
-/// through the provided channel. It only exits on unrecoverable errors.
-///
-/// # Arguments
-///
-/// * `port` - The UDP port to listen on (binds to `0.0.0.0:{port}`)
-/// * `sender` - Channel to forward received packets to the packet processor
-///
-/// # Returns
-///
-/// * `Ok(())` - Never returns this in practice (loops forever)
-/// * `Err(FailedToBind)` - Could not bind to the specified port
-/// * `Err(Internal)` - Channel to packet processor closed
-///
-/// # Note
-///
-/// This function is designed to be forcefully aborted by the supervisor on shutdown,
-/// as it has no mechanism for graceful termination.
-pub async fn init(port: u16, sender: Sender<Result<ReceivedPacket>>) -> ErrResult {
+pub async fn init(port: u16, sender: InboundSender) -> ErrResult {
     const MAX_ALLOWED_FAILS: u32 = 10;
     let socket = UdpSocket::bind(format!("0.0.0.0:{port}"))
         .await
@@ -35,28 +16,29 @@ pub async fn init(port: u16, sender: Sender<Result<ReceivedPacket>>) -> ErrResul
     loop {
         let mut buffer = vec![0u8; MAX_PACKET_SIZE];
 
-        let (stripped_buffer, addr) = loop {
+        let addr = loop {
             if let Ok((read, addr)) = socket.recv_from(&mut buffer).await {
-                break (&buffer[..read], addr);
-            }
-
-            if fail_count >= MAX_ALLOWED_FAILS {
-                return Err(TransportError::RecvFailedTooManyTimes.into());
+                fail_count = 0;
+                buffer.truncate(read);
+                break addr;
             }
 
             fail_count += 1;
 
-            if let Ok((read, addr)) = socket.recv_from(&mut buffer).await {
-                fail_count = 0;
-                break (&buffer[..read], addr);
+            if fail_count >= MAX_ALLOWED_FAILS {
+                return Err(TransportError::RecvFailedTooManyTimes.into());
             }
         };
 
         let packet = ReceivedPacket {
             src_addr: addr,
-            data: stripped_buffer.to_vec(),
+            data: buffer,
         };
 
-        send_to_processing_layer(sender.clone(), Ok(packet)).await?;
+        send_to_processing_layer(
+            sender.clone(),
+            Ok(PacketProcessingMessage::ReceivedPacket(packet)),
+        )
+        .await?;
     }
 }
