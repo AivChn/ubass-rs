@@ -1,28 +1,15 @@
 use crate::prelude::*;
-use crate::transport::types::{InboundSender, OutboundReceiver, TransportChannels};
-use crate::{
-    dispatch, manager::types::AddressSessionMonitor, packet_processor::types::ProcessedPacket,
-    packetizer::types::SessionId,
-};
-use std::sync::LazyLock;
-use std::{collections::HashMap, sync::Arc, vec};
+use crate::transport::types::OutboundReceiver;
+use crate::{dispatch, packet_processor::types::ProcessedPacket};
+use std::{sync::Arc, vec};
 use tokio::{
     net::UdpSocket,
-    sync::mpsc::{Receiver, Sender},
     time::{Duration, Instant, timeout},
 };
 
-use super::send_to_processing_layer;
-use super::types::{
-    BUFFER_TIMEOUT, MAX_CONCURRENT_SENDS, MAX_PACKET_BUFFER_SIZE, OutboundSockets, ReceivedPacket,
-};
+use super::types::{BUFFER_TIMEOUT, MAX_CONCURRENT_SENDS, MAX_PACKET_BUFFER_SIZE, OutboundSockets};
 
-pub async fn init(
-    TransportChannels {
-        mut receiver,
-        sender,
-    }: TransportChannels,
-) -> ErrResult {
+pub async fn init(mut receiver: OutboundReceiver) -> ErrResult {
     // set up handle monitor
     let monitor = Arc::from(HandleMonitor::default());
     HandleMonitor::init(monitor.clone()).await;

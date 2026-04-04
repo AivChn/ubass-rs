@@ -1,7 +1,7 @@
 use crate::prelude::*;
 use crate::transport::types::InboundSender;
 
-use tokio::{net::UdpSocket, sync::mpsc::Sender};
+use tokio::net::UdpSocket;
 
 use super::send_to_processing_layer;
 use super::types::{MAX_PACKET_SIZE, ReceivedPacket};

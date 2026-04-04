@@ -8,13 +8,10 @@ pub mod types;
 use crate::{
     manager::types::{EncryptionMonitor, FingerprintMonitor, PendingAckMonitor},
     packet_processor::types::{InboundReceiver, InboundSender, OutboundReceiver, OutboundSender},
-    packetizer::types::PacketWrapper,
     prelude::*,
 };
 
-use tokio::sync::mpsc::{Receiver, Sender};
-
-use types::{InboundChannels, OutboundChannels, Packet, ReceivedPacket};
+use types::{InboundChannels, OutboundChannels};
 /// initialize the packet processor
 ///
 /// # Errors

@@ -8,19 +8,14 @@ use std::{
     time::Duration,
 };
 
-use aes_gcm_siv::{Aes256GcmSiv, Nonce};
-use futures::future::pending;
+use aes_gcm_siv::Aes256GcmSiv;
 use tokio::sync::{
     Mutex, RwLock,
     mpsc::{Receiver, Sender},
 };
 
 use crate::{
-    packet_processor::fec::RecoverdPacket,
-    packetizer::{
-        fingerprint,
-        types::{PacketFingerprint, PacketWrapper, SessionId, Timestamp},
-    },
+    packetizer::types::{PacketFingerprint, PacketWrapper, SessionId, Timestamp},
     prelude::*,
 };
 
@@ -169,7 +164,7 @@ impl FingerprintWindow {
     }
 
     pub async fn add(&self, fingerprint: Box<PacketFingerprint>) -> bool {
-        let ptr = 'add_to_set: {
+        let ptr = {
             let mut fingerprints = self.fingerprints.write().await;
             let ptr = FingerprintPtr::from_box(&fingerprint);
             if fingerprints.insert(fingerprint) {
@@ -183,7 +178,7 @@ impl FingerprintWindow {
             return false;
         };
 
-        'add_to_queue: {
+        {
             let mut queue = self.queue.lock().await;
             queue.push_back((Timestamp::now(), ptr));
         }
@@ -195,7 +190,7 @@ impl FingerprintWindow {
         let mut expired = Vec::with_capacity(256);
         while !self.canceled.load(Ordering::Relaxed) {
             let top_timestamp;
-            'pop_queue: {
+            {
                 let mut queue = self.queue.lock().await;
                 while queue
                     .front()
@@ -214,7 +209,7 @@ impl FingerprintWindow {
                 }
             }
 
-            'remove: {
+            {
                 let mut fingerprints = self.fingerprints.write().await;
                 expired
                     .drain(..)

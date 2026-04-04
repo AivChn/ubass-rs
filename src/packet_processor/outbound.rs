@@ -1,9 +1,4 @@
-use std::{net::SocketAddr, process::Output, sync::Arc, time::Duration};
-
-use tokio::{
-    sync::mpsc::{Receiver, Sender},
-    time::timeout,
-};
+use std::{net::SocketAddr, sync::Arc};
 
 use crate::{
     dispatch,
@@ -11,28 +6,23 @@ use crate::{
     packet_processor::{
         encryption::{self, Encryptable},
         fec::{self, FECCompatible},
-        serialize::{self, Serialize},
-        types::{
-            InboundReceiver, InboundSender, OutboundReceiver, OutboundSender, ProcessedPacket,
-        },
+        serialize::Serialize,
+        types::{InboundSender, OutboundSender, ProcessedPacket},
     },
-    packetizer::{
-        fingerprint::{self, Fingerprint, Payload},
-        types::{
-            BatchID, DataPacket, ErrorType, OptionFlags, PacketFingerprint, PacketType,
-            PacketWrapper, ParityPacket, SessionId, Timestamp,
-        },
+    packetizer::types::{
+        BatchID, OptionFlags, Packet, PacketFingerprint, PacketType, PacketWrapper, ParityPacket,
+        SessionId, Timestamp,
     },
     prelude::*,
     unwrap_or_return,
 };
 
-use super::types::{OutboundChannels, Packet};
+use super::types::OutboundChannels;
 
 macro_rules! serialize {
     ($packet:ident -> $buffer:ident) => {
         $buffer = vec![0u8; $packet.sized()];
-        $packet.serialize(&mut $buffer);
+        _ = $packet.serialize(&mut $buffer);
     };
 }
 
@@ -90,7 +80,7 @@ pub async fn init(
                 }
                 PacketProcessingMessage::Close => {
                     monitor.flush().await;
-                    t_sender.send(TransportMessage::Close).await;
+                    _ = t_sender.send(TransportMessage::Close).await;
                     return Ok(());
                 }
                 PacketProcessingMessage::ReceivedPacket(_) => unreachable!(
@@ -153,7 +143,7 @@ async fn handle_packet(
     let processed = match packet.packet {
         // fec + encrypted
         // could be acked
-        Packet::DataPacket(mut packet) => {
+        Packet::DataPacket(packet) => {
             add_ack!(for DataPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             dispatch!(handle_fec(
@@ -166,54 +156,37 @@ async fn handle_packet(
             );
 
             let session_id = packet.session_id;
-            let timestamp = packet.timestamp;
-            process_encrypted(packet, session_id, addr, timestamp, encryption_monitor)
+            process_encrypted(packet, session_id, addr, encryption_monitor)
         }
 
         //encrypted
-        Packet::TrackRequestPacket(mut packet) => {
+        Packet::TrackRequestPacket(packet) => {
             add_ack!(for TrackRequestPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            let timestamp = packet.timestamp;
-            process_encrypted(packet, session_id, addr, timestamp, encryption_monitor)
+            process_encrypted(packet, session_id, addr, encryption_monitor)
         }
-        Packet::AppRejectErrorPacket(mut packet) => {
+        Packet::AppRejectErrorPacket(packet) => {
             add_ack!(for AppRejectErrorPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            let timestamp = packet.timestamp;
-            process_encrypted(packet, session_id, addr, timestamp, encryption_monitor)
+            process_encrypted(packet, session_id, addr, encryption_monitor)
         }
 
         // authenticated
-        Packet::RetransmitPacket(mut packet) => {
+        Packet::RetransmitPacket(packet) => {
             add_ack!(for RetransmitPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            let timestamp = packet.timestamp;
-            process_authenticated(
-                packet.as_ref(),
-                session_id,
-                addr,
-                timestamp,
-                encryption_monitor,
-            )
+            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor)
         }
-        Packet::PlaybackStatusPacket(mut packet) => {
+        Packet::PlaybackStatusPacket(packet) => {
             add_ack!(for PlaybackStatusPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            let timestamp = packet.timestamp;
-            process_authenticated(
-                packet.as_ref(),
-                session_id,
-                addr,
-                timestamp,
-                encryption_monitor,
-            )
+            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor)
         }
-        Packet::SessionDoesNotExistErrorPacket(mut packet) => {
+        Packet::SessionDoesNotExistErrorPacket(packet) => {
             add_ack!(
                 for SessionDoesNotExistErrorPacket(packet),
                 sent to addr,
@@ -221,41 +194,20 @@ async fn handle_packet(
             );
 
             let session_id = packet.session_id;
-            let timestamp = packet.timestamp;
-            process_authenticated(
-                packet.as_ref(),
-                session_id,
-                addr,
-                timestamp,
-                encryption_monitor,
-            )
+            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor)
         }
         // could not be acked
-        Packet::UnexpectedPacketErrorPacket(mut packet) => {
+        Packet::UnexpectedPacketErrorPacket(packet) => {
             let session_id = packet.session_id;
-            let timestamp = packet.timestamp;
-            process_authenticated(
-                packet.as_ref(),
-                session_id,
-                addr,
-                timestamp,
-                encryption_monitor,
-            )
+            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor)
         }
-        Packet::AckPacket(mut packet) => {
+        Packet::AckPacket(packet) => {
             let session_id = packet.session_id;
-            let timestamp = packet.timestamp;
-            process_authenticated(
-                packet.as_ref(),
-                session_id,
-                addr,
-                timestamp,
-                encryption_monitor,
-            )
+            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor)
         }
 
         // nothing
-        Packet::HelloPacket(mut packet) => {
+        Packet::HelloPacket(packet) => {
             let mut serialized;
             serialize!(packet -> serialized);
 
@@ -279,7 +231,7 @@ async fn handle_packet(
         }
 
         // later
-        Packet::MetadataPacket(mut packet) => unimplemented!(),
+        Packet::MetadataPacket(_) => unimplemented!(),
 
         // never
         Packet::ParityPacket(_) => {
@@ -294,7 +246,6 @@ fn process_encrypted(
     mut packet: Box<impl Encryptable + Serialize>,
     session_id: SessionId,
     addr: SocketAddr,
-    timestamp: Timestamp,
     encryption_monitor: &'static EncryptionMonitor<'_>,
 ) -> ProcessedPacket {
     encryption::encrypt(packet.as_mut(), session_id, encryption_monitor);
@@ -308,7 +259,6 @@ fn process_authenticated(
     packet: &impl Serialize,
     session_id: SessionId,
     addr: SocketAddr,
-    timestamp: Timestamp,
     encryption_monitor: &'static EncryptionMonitor<'_>,
 ) -> ProcessedPacket {
     let mut serialized;
@@ -372,10 +322,12 @@ async fn handle_parity(
         data: buffer,
         duplicate_count: 1,
     };
+
+    send_packet_to_transport(processed_packet, t_sender, p_sender).await;
 }
 
 async fn send_to_manager(msg: Result<ManagerMessage>, p_sender: InboundSender) {
-    p_sender.send(msg).await;
+    _ = p_sender.send(msg).await;
 }
 
 async fn send_packet_to_transport(

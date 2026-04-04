@@ -1,14 +1,8 @@
 use crate::{
-    packet_processor::types::ProcessedPacket,
     prelude::*,
     utils::messages::{PacketProcessingMessage, TransportMessage},
 };
-use std::{
-    cmp::min,
-    fmt::Debug,
-    net::{SocketAddr, SocketAddrV4},
-    sync::Arc,
-};
+use std::{fmt::Debug, net::SocketAddr, sync::Arc};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{Receiver, Sender};
 

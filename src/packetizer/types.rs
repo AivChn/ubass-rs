@@ -2,11 +2,10 @@ use crate::prelude::*;
 
 use std::{
     fmt::Display,
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    net::{SocketAddr, SocketAddrV4},
 };
 
 use crate::packet_processor::serialize::Serialize;
-use aes_gcm_siv::aead::generic_array::sequence::Concat;
 use derive_more::Display;
 use tokio::time::Instant;
 use ubass_macros::Serialize;

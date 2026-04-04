@@ -3,18 +3,14 @@
 use crate::{
     manager::types::{EncryptionMonitor, FingerprintMonitor},
     packet_processor::{encryption, serialize::Serialize},
-    packetizer::{
-        fingerprint::{self, Fingerprint, Headers},
-        types::*,
-    },
+    packetizer::{fingerprint::Headers, types::*},
     prelude::*,
+    transport::types::ReceivedPacket,
     unwrap_or_return,
 };
 
-use super::types::{InboundChannels, InboundReceiver, InboundSender, ReceivedPacket};
+use super::types::{InboundChannels, InboundSender};
 use crate::packetizer::types::Packet;
-
-use tokio::sync::mpsc::Sender;
 
 const SESSION_ID_OFFSET: usize = 8;
 const PACKET_TYPE_OFFSET: usize = 4;
@@ -39,7 +35,7 @@ pub async fn init(
             let packet = match message {
                 Ok(PacketProcessingMessage::ReceivedPacket(packet)) => packet,
                 Ok(PacketProcessingMessage::Closed) => {
-                    p_sender.send(Ok(ManagerMessage::Closed)).await;
+                    _ = p_sender.send(Ok(ManagerMessage::Closed)).await;
                     return Ok(());
                 }
                 Ok(_) => unreachable!(
@@ -65,7 +61,7 @@ pub async fn init(
 }
 
 async fn handle_packet(
-    mut packet: ReceivedPacket,
+    packet: ReceivedPacket,
     sender: InboundSender,
     encryption_monitor: &'static EncryptionMonitor<'_>,
     fingerprint_monitor: &'static FingerprintMonitor<'_>,
@@ -138,7 +134,7 @@ async fn deserialize_and_decrypt(
             let data = dedup_no_payload(data, session_id, fingerprint_monitor)
                 .await
                 .ok_or(())?;
-            let mut packet = Packet::AckPacket(Box::new(AckPacket::deserialize(&data)?));
+            let packet = Packet::AckPacket(Box::new(AckPacket::deserialize(&data)?));
 
             Ok(packet)
         }
@@ -299,5 +295,5 @@ async fn dedup_with_payload<T: Headers>(
 }
 
 async fn send_up(message: Result<ManagerMessage>, sender: InboundSender) {
-    sender.send(message).await;
+    _ = sender.send(message).await;
 }

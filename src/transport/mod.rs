@@ -2,13 +2,9 @@ mod inbound;
 mod outbound;
 pub mod types;
 
-use crate::{
-    packet_processor::types::OutboundChannels, prelude::*, transport::types::InboundSender,
-};
+use crate::{prelude::*, transport::types::InboundSender};
 
-use tokio::sync::mpsc::Sender;
-
-use types::{ReceivedPacket, TransportChannels};
+use types::TransportChannels;
 
 /// initialize the transport layer
 ///
@@ -22,10 +18,7 @@ pub async fn init(
     TransportChannels { receiver, sender }: TransportChannels,
 ) -> ErrResult {
     let mut recv_handle = tokio::spawn(inbound::init(port, sender.clone()));
-    let mut send_handle = tokio::spawn(outbound::init(TransportChannels {
-        receiver,
-        sender: sender.clone(),
-    }));
+    let mut send_handle = tokio::spawn(outbound::init(receiver));
 
     tokio::select! {
         res = &mut recv_handle, if !recv_handle.is_finished() => {

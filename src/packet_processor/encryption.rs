@@ -1,11 +1,11 @@
 use crate::manager::types::EncryptionMonitor;
 use crate::packetizer::fingerprint::{Headers, Payload};
 use crate::packetizer::types::{
-    AppRejectErrorPacket, DataPacket, ParityPacket, RetransmitPacket, SessionId, TrackRequestPacket,
+    AppRejectErrorPacket, DataPacket, ParityPacket, SessionId, TrackRequestPacket,
 };
 use crate::prelude::*;
 
-use aes_gcm_siv::{AeadInPlace, Aes256GcmSiv, Nonce};
+use aes_gcm_siv::{AeadInPlace, Nonce};
 
 pub trait Encryptable: Payload + Headers {}
 
@@ -28,7 +28,7 @@ pub fn encrypt(packet: &mut impl Encryptable, session_id: SessionId, monitor: &E
     let (cipher, counter) = monitor.get(&session_id);
     let nonce = Nonce::from(get_nonce(session_id, counter));
 
-    cipher.encrypt_in_place(&nonce, &aad, payload);
+    _ = cipher.encrypt_in_place(&nonce, &aad, payload);
 
     payload.extend(counter);
 }
@@ -63,7 +63,7 @@ pub fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: &EncryptionMoni
 
     let mut tag = vec![];
 
-    cipher.encrypt_in_place(&nonce, packet, &mut tag);
+    _ = cipher.encrypt_in_place(&nonce, packet, &mut tag);
     packet.append(&mut tag);
     packet.extend(counter);
 }
