@@ -1,29 +1,62 @@
-use std::{process::Output, sync::Arc};
+use std::{net::SocketAddr, process::Output, sync::Arc, time::Duration};
 
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::{
+    sync::mpsc::{Receiver, Sender},
+    time::timeout,
+};
 
 use crate::{
     dispatch,
-    manager::types::EncryptionMonitor,
+    manager::types::{EncryptionMonitor, PendingAckMonitor},
     packet_processor::{
         encryption::{self, Encryptable},
         fec::{self, FECCompatible},
         serialize::{self, Serialize},
-        types::{InboundSender, OutboundSender, ProcessedPacket},
+        types::{
+            InboundReceiver, InboundSender, OutboundReceiver, OutboundSender, ProcessedPacket,
+        },
     },
     packetizer::{
-        fingerprint::Payload,
-        types::{DataPacket, ErrorType, PacketWrapper, ParityPacket, SessionId},
+        fingerprint::{self, Fingerprint, Payload},
+        types::{
+            BatchID, DataPacket, ErrorType, OptionFlags, PacketFingerprint, PacketType,
+            PacketWrapper, ParityPacket, SessionId, Timestamp,
+        },
     },
     prelude::*,
+    unwrap_or_return,
 };
 
-use super::types::{OutboundChannels, PacketProcessingMessage, Packets, TransportMessage};
+use super::types::{OutboundChannels, Packet};
 
 macro_rules! serialize {
     ($packet:ident -> $buffer:ident) => {
         $buffer = vec![0u8; $packet.sized()];
         $packet.serialize(&mut $buffer);
+    };
+}
+
+macro_rules! processed {
+    ($serialized:ident to $addr:ident as $packet_type:ident $duplicate:literal times) => {
+        ProcessedPacket {
+            dest_addr: $addr,
+            packet_type: PacketType::$packet_type,
+            data: $serialized,
+            duplicate_count: $duplicate,
+        }
+    };
+}
+
+macro_rules! add_ack {
+    (for $packet_type:ident($packet:ident), sent to $addr:ident, saved to $pending_ack_monitor:ident) => {
+        if $packet.opts.contains(OptionFlags::RequireAck) {
+            add_pending_ack(
+                PacketWrapper::new($addr, Packet::$packet_type($packet.clone())),
+                $packet.timestamp,
+                $pending_ack_monitor,
+            )
+            .await
+        }
     };
 }
 
@@ -34,7 +67,9 @@ pub async fn init(
         mut p_receiver,
     }: OutboundChannels,
     encryption_monitor: &'static EncryptionMonitor<'_>,
-) -> (Receiver<PacketProcessingMessage>, ErrResult) {
+    pending_ack_monitor: &'static PendingAckMonitor<'_>,
+) -> ErrResult {
+    // initialize handle monitor
     let monitor = Arc::from(HandleMonitor::default());
     tokio::spawn(HandleMonitor::init(monitor.clone()));
 
@@ -42,20 +77,31 @@ pub async fn init(
         let mut buffer = Vec::with_capacity(16);
         let received = p_receiver.recv_many(&mut buffer, 16).await;
         if received == 0 {
-            return (
-                p_receiver,
-                Err(ChannelError::ChannelClosed(Outbound).into()),
-            );
+            return Err(ChannelError::ChannelClosed(Outbound).into());
         }
 
         let mut packets = Vec::with_capacity(received);
 
         for msg in buffer {
-            let packet = match msg {
-                PacketProcessingMessage::Close => return (p_receiver, Ok(())),
-                PacketProcessingMessage::SendPacket(packet_wrapper) => packet_wrapper,
-            };
-            packets.push(packet);
+            match msg {
+                PacketProcessingMessage::SendPacket(packet_wrapper) => packets.push(packet_wrapper),
+                PacketProcessingMessage::Recover(session_id, batch_id) => {
+                    dispatch!(recover(session_id, batch_id, p_sender.clone()) => monitor);
+                }
+                PacketProcessingMessage::Close => {
+                    monitor.flush().await;
+                    t_sender.send(TransportMessage::Close).await;
+                    return Ok(());
+                }
+                PacketProcessingMessage::ReceivedPacket(_) => unreachable!(
+                    "Invariant broken while receiving from Manager:\
+                received a `ReceivedPacket` variant."
+                ),
+                PacketProcessingMessage::Closed => unreachable!(
+                    "Invariant broken while receiveing from Manager:\
+                    received a `Closed` variant."
+                ),
+            }
         }
 
         dispatch!(
@@ -64,7 +110,8 @@ pub async fn init(
                 p_sender.clone(),
                 t_sender.clone(),
                 monitor.clone(),
-                encryption_monitor
+                encryption_monitor,
+                pending_ack_monitor
             ) => monitor
         );
     }
@@ -73,107 +120,228 @@ pub async fn init(
 #[allow(clippy::unused_async)]
 async fn handle_received(
     buffer: Box<[PacketWrapper]>,
-    p_sender: Sender<Result<PacketWrapper>>,
-    t_sender: Sender<TransportMessage>,
+    p_sender: InboundSender,
+    t_sender: OutboundSender,
     handle_monitor: Arc<HandleMonitor>,
     encryption_monitor: &'static EncryptionMonitor<'_>,
+    pending_ack_monitor: &'static PendingAckMonitor<'_>,
 ) {
-    // TODO: implement this!!!
-    // 1. serialize
-    // 2. [fec]
-    // 3. encrypt
-    // 4. send to transport
-    //
-    // - fec process:
-    //  1. sent()
-    //  2. if received back a packet, send it
-
     for packet in buffer {
-        dispatch!(handle_packet(packet, p_sender.clone(), t_sender.clone(), encryption_monitor, handle_monitor.clone()) => handle_monitor);
+        dispatch!(
+            handle_packet(
+                packet,
+                p_sender.clone(),
+                t_sender.clone(),
+                encryption_monitor,
+                handle_monitor.clone(),
+                pending_ack_monitor
+            ) => handle_monitor
+        );
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_packet(
     packet: PacketWrapper,
     p_sender: InboundSender,
     t_sender: OutboundSender,
     encryption_monitor: &'static EncryptionMonitor<'_>,
     handle_monitor: Arc<HandleMonitor>,
+    pending_ack_monitor: &'static PendingAckMonitor<'_>,
 ) {
-    let mut serialized;
-    match packet.packet {
-        // fec
-        Packets::DataPacket(mut packet) => {
-            let session_id = packet.session_id;
+    let addr = packet.addr;
+    let processed = match packet.packet {
+        // fec + encrypted
+        // could be acked
+        Packet::DataPacket(mut packet) => {
+            add_ack!(for DataPacket(packet), sent to addr, saved to pending_ack_monitor);
+
             dispatch!(handle_fec(
-                    (*packet).clone(), 
-                    p_sender.clone(), 
-                    t_sender.clone(), 
-                    encryption_monitor,
-                    handle_monitor.clone()) => handle_monitor);
-            encryption::encrypt(packet.as_mut(), session_id, encryption_monitor);
-            serialize!(packet -> serialized);
+                *packet.clone(),
+                addr,
+                p_sender.clone(),
+                t_sender.clone(),
+                encryption_monitor,
+                handle_monitor.clone()) => handle_monitor
+            );
+
+            let session_id = packet.session_id;
+            let timestamp = packet.timestamp;
+            process_encrypted(packet, session_id, addr, timestamp, encryption_monitor)
         }
 
         //encrypted
-        Packets::TrackRequestPacket(mut packet) => {
+        Packet::TrackRequestPacket(mut packet) => {
+            add_ack!(for TrackRequestPacket(packet), sent to addr, saved to pending_ack_monitor);
+
             let session_id = packet.session_id;
-            encryption::encrypt(packet.as_mut(), session_id, encryption_monitor);
-            serialize!(packet -> serialized);
+            let timestamp = packet.timestamp;
+            process_encrypted(packet, session_id, addr, timestamp, encryption_monitor)
         }
-        Packets::AppRejectErrorPacket(mut packet) => {
+        Packet::AppRejectErrorPacket(mut packet) => {
+            add_ack!(for AppRejectErrorPacket(packet), sent to addr, saved to pending_ack_monitor);
+
             let session_id = packet.session_id;
-            encryption::encrypt(packet.as_mut(), session_id, encryption_monitor);
-            serialize!(packet -> serialized);
+            let timestamp = packet.timestamp;
+            process_encrypted(packet, session_id, addr, timestamp, encryption_monitor)
         }
 
         // authenticated
-        Packets::RetransmitPacket(mut packet) => {
-            let mut session_id = packet.session_id;
-            serialize!(packet -> serialized);
-            encryption::tag(&mut serialized, session_id, encryption_monitor);
+        Packet::RetransmitPacket(mut packet) => {
+            add_ack!(for RetransmitPacket(packet), sent to addr, saved to pending_ack_monitor);
+
+            let session_id = packet.session_id;
+            let timestamp = packet.timestamp;
+            process_authenticated(
+                packet.as_ref(),
+                session_id,
+                addr,
+                timestamp,
+                encryption_monitor,
+            )
         }
-        Packets::AckPacket(mut packet) => {
-            let mut session_id = packet.session_id;
-            serialize!(packet -> serialized);
-            encryption::tag(&mut serialized, session_id, encryption_monitor);
+        Packet::PlaybackStatusPacket(mut packet) => {
+            add_ack!(for PlaybackStatusPacket(packet), sent to addr, saved to pending_ack_monitor);
+
+            let session_id = packet.session_id;
+            let timestamp = packet.timestamp;
+            process_authenticated(
+                packet.as_ref(),
+                session_id,
+                addr,
+                timestamp,
+                encryption_monitor,
+            )
         }
-        Packets::PlaybackStatusPacket(mut packet) => {
-            let mut session_id = packet.session_id;
-            serialize!(packet -> serialized);
-            encryption::tag(&mut serialized, session_id, encryption_monitor);
+        Packet::SessionDoesNotExistErrorPacket(mut packet) => {
+            add_ack!(
+                for SessionDoesNotExistErrorPacket(packet),
+                sent to addr,
+                saved to pending_ack_monitor
+            );
+
+            let session_id = packet.session_id;
+            let timestamp = packet.timestamp;
+            process_authenticated(
+                packet.as_ref(),
+                session_id,
+                addr,
+                timestamp,
+                encryption_monitor,
+            )
         }
-        Packets::SessionDoesNotExistErrorPacket(mut packet) => {
-            let mut session_id = packet.session_id;
-            serialize!(packet -> serialized);
-            encryption::tag(&mut serialized, session_id, encryption_monitor);
+        // could not be acked
+        Packet::UnexpectedPacketErrorPacket(mut packet) => {
+            let session_id = packet.session_id;
+            let timestamp = packet.timestamp;
+            process_authenticated(
+                packet.as_ref(),
+                session_id,
+                addr,
+                timestamp,
+                encryption_monitor,
+            )
         }
-        Packets::UnexpectedPacketErrorPacket(mut packet) => {
-            let mut session_id = packet.session_id;
-            serialize!(packet -> serialized);
-            encryption::tag(&mut serialized, session_id, encryption_monitor);
+        Packet::AckPacket(mut packet) => {
+            let session_id = packet.session_id;
+            let timestamp = packet.timestamp;
+            process_authenticated(
+                packet.as_ref(),
+                session_id,
+                addr,
+                timestamp,
+                encryption_monitor,
+            )
         }
 
         // nothing
-        Packets::HelloPacket(mut packet) => {
+        Packet::HelloPacket(mut packet) => {
+            let mut serialized;
             serialize!(packet -> serialized);
+
+            ProcessedPacket {
+                dest_addr: addr,
+                packet_type: PacketType::Host,
+                data: serialized,
+                duplicate_count: 7,
+            }
         }
-        Packets::IncompatibleVersion(packet) => {
+        Packet::IncompatibleVersion(packet) => {
+            let mut serialized;
             serialize!(packet -> serialized);
+
+            ProcessedPacket {
+                dest_addr: addr,
+                packet_type: PacketType::Host,
+                data: serialized,
+                duplicate_count: 7,
+            }
         }
 
         // later
-        Packets::MetadataPacket(mut packet) => todo!(),
+        Packet::MetadataPacket(mut packet) => unimplemented!(),
 
         // never
-        Packets::ParityPacket(_) => {
+        Packet::ParityPacket(_) => {
             unreachable!("A ParityPacket must never be sent from the manager layer");
         }
-    }
+    };
+
+    send_packet_to_transport(processed, t_sender, p_sender).await;
+}
+
+fn process_encrypted(
+    mut packet: Box<impl Encryptable + Serialize>,
+    session_id: SessionId,
+    addr: SocketAddr,
+    timestamp: Timestamp,
+    encryption_monitor: &'static EncryptionMonitor<'_>,
+) -> ProcessedPacket {
+    encryption::encrypt(packet.as_mut(), session_id, encryption_monitor);
+
+    let mut serialized;
+    serialize!(packet -> serialized);
+    processed!(serialized to addr as Error 3 times)
+}
+
+fn process_authenticated(
+    packet: &impl Serialize,
+    session_id: SessionId,
+    addr: SocketAddr,
+    timestamp: Timestamp,
+    encryption_monitor: &'static EncryptionMonitor<'_>,
+) -> ProcessedPacket {
+    let mut serialized;
+    serialize!(packet -> serialized);
+
+    encryption::tag(&mut serialized, session_id, encryption_monitor);
+    processed!(serialized to addr as Error 3 times)
+}
+
+async fn recover(session_id: SessionId, batch_id: BatchID, sender: InboundSender) {
+    let message = match fec::recover(batch_id, session_id).await {
+        Some(recovered) => Ok(ManagerMessage::Recovered(recovered)),
+        None => Err(PacketProcessingError::RecoveryNotReady(session_id, batch_id).into()),
+    };
+
+    send_to_manager(message, sender).await;
+}
+
+async fn add_pending_ack(
+    packet: PacketWrapper,
+    timestamp: Timestamp,
+    pending_ack_monitor: &'static PendingAckMonitor<'_>,
+) {
+    let fingerprint: PacketFingerprint = unwrap_or_return!((&packet.packet).try_into());
+
+    pending_ack_monitor
+        .add(fingerprint, (packet, timestamp))
+        .await;
 }
 
 async fn handle_fec(
     packet: impl FECCompatible,
+    dest_addr: SocketAddr,
     p_sender: InboundSender,
     t_sender: OutboundSender,
     encryption_monitor: &'static EncryptionMonitor<'_>,
@@ -181,7 +349,7 @@ async fn handle_fec(
 ) {
     if let Some(parity_packets) = fec::sent(packet).await {
         for packet in parity_packets {
-            dispatch!(handle_parity(packet, t_sender.clone(), p_sender.clone(), encryption_monitor) => handle_monitor);
+            dispatch!(handle_parity(packet, dest_addr, t_sender.clone(), p_sender.clone(), encryption_monitor) => handle_monitor);
         }
     }
 }
@@ -189,6 +357,7 @@ async fn handle_fec(
 #[allow(clippy::unused_async)] // async is for spawning the function
 async fn handle_parity(
     mut packet: ParityPacket,
+    dest_addr: SocketAddr,
     t_sender: OutboundSender,
     p_sender: InboundSender,
     encryption_monitor: &'static EncryptionMonitor<'_>,
@@ -198,16 +367,15 @@ async fn handle_parity(
     encryption::encrypt(&mut packet, session_id, encryption_monitor);
     serialize!(packet -> buffer);
     let processed_packet = ProcessedPacket {
-        dest_addr: todo!(),
-        packet_id: todo!(),
-        packet_type: todo!(),
-        data: todo!(),
-        duplicate_count: todo!(),
+        dest_addr,
+        packet_type: PacketType::Parity,
+        data: buffer,
+        duplicate_count: 1,
     };
 }
 
-async fn send_to_packetizer(err: Error, p_sender: InboundSender) {
-    p_sender.send(Err(err)).await;
+async fn send_to_manager(msg: Result<ManagerMessage>, p_sender: InboundSender) {
+    p_sender.send(msg).await;
 }
 
 async fn send_packet_to_transport(
@@ -215,7 +383,11 @@ async fn send_packet_to_transport(
     t_sender: OutboundSender,
     p_sender: InboundSender,
 ) {
-    if t_sender.send(TransportMessage::Data(packet)).await.is_err() {
-        send_to_packetizer(ChannelError::ChannelFailed(Outbound).into(), p_sender).await;
+    if t_sender
+        .send(TransportMessage::SendPacket(packet))
+        .await
+        .is_err()
+    {
+        send_to_manager(Err(ChannelError::ChannelFailed(Outbound).into()), p_sender).await;
     }
 }
