@@ -62,7 +62,7 @@ impl TryFrom<&[u8]> for RecoverdPacket {
             Ok(RecoverdPacket {
                 byte_range_start: <u32>::deserialize(&value[..4]).expect("Exact size"),
                 payload: Box::new(
-                    <[u8; MAX_PAYLOAD_LENGTH]>::try_from(&value[4..MAX_PAYLOAD_LENGTH])
+                    <[u8; MAX_PAYLOAD_LENGTH]>::try_from(&value[4..4 + MAX_PAYLOAD_LENGTH])
                         .expect("Exact size"),
                 ),
             })
@@ -104,7 +104,7 @@ impl From<DataPacket> for FECPacket {
     fn from(value: DataPacket) -> Self {
         let mut data = FECData::default();
         value.byte_range_start.serialize(&mut data.0[..]);
-        value.payload.serialize(&mut data.0[4..MAX_PAYLOAD_LENGTH]);
+        value.payload.serialize(&mut data.0[4..]);
         FECPacket {
             is_parity: false,
             session_id: value.session_id,
