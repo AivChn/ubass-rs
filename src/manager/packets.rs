@@ -6,9 +6,12 @@ use std::{
 };
 
 use crate::packet_processor::serialize::Serialize;
-use derive_more::Display;
+use aes_gcm_siv::aead::{OsRng, rand_core::RngCore};
+use derive_more::{Deref, Display};
+use rand::Rng;
 use tokio::time::Instant;
 
+use crate::manager::AppId;
 use crate::packet_processor::fingerprint::{Fingerprint, Headers, Payload};
 
 pub const MAX_PAYLOAD_LENGTH: usize = 1384;
@@ -67,8 +70,8 @@ pub struct HelloPacket {
     pub proposed_session_id: SessionId,
     pub timestamp: Timestamp,
     pub public_key: PublicKey,
-    pub app_id: AppId,
     pub host_address: SocketAddrV4,
+    pub app_id: AppId,
 }
 
 impl HelloPacket {
@@ -687,49 +690,11 @@ impl BufferSize {
 
 #[derive(Serialize)]
 #[repr(transparent)]
-pub struct AppId(pub u64);
-
-#[derive(Serialize)]
-#[repr(transparent)]
 pub struct PublicKey(pub [u8; 32]);
 
 #[derive(Serialize, Debug, Clone, Copy, Display)]
 #[repr(transparent)]
 pub struct BytePosition(pub u32);
-
-#[derive(Serialize, Clone, Copy, PartialEq, Debug)]
-#[repr(transparent)]
-pub struct Timestamp(u64);
-
-impl Timestamp {
-    /// returns the current time since `PROTOCOL_EPOCH`
-    ///
-    /// # Panics
-    /// This function panics if `PROTOCOL_EPOCH` is not yet initialized - an invariant
-    pub fn now() -> Self {
-        #[allow(clippy::cast_possible_truncation)]
-        Self(
-            Instant::now()
-                .duration_since(*PROTOCOL_EPOCH.get().expect(
-                    "Invariant broken while constructing `Timestamp`: \
-        `PROTOCOL_EPOCH` is not initialized",
-                ))
-                .as_millis() as u64,
-        )
-    }
-
-    pub fn been_longer_than(&self, millis: u64) -> bool {
-        Self::now().0 - self.0 > millis
-    }
-
-    pub fn none() -> Self {
-        Timestamp(0)
-    }
-
-    pub fn get(&self) -> u64 {
-        self.0
-    }
-}
 
 #[derive(Clone, Copy)]
 pub struct Reserved<const N: usize>;
@@ -902,9 +867,11 @@ pub struct BatchID(pub u16);
 #[repr(transparent)]
 pub struct Options(u16);
 
-impl Options {
+impl Flags for Options {
+    type FlagType = OptionFlags;
+
     #[inline]
-    pub fn construct(flags: &[OptionFlags]) -> Self {
+    fn construct(flags: &[Self::FlagType]) -> Self {
         Self(
             flags
                 .iter()
@@ -915,24 +882,25 @@ impl Options {
     }
 
     #[must_use]
-    pub const fn unset(mut self, flag: OptionFlags) -> Self {
+    fn unset(mut self, flag: Self::FlagType) -> Self {
         self.0 &= !(flag as u16);
         self
     }
 
     #[must_use]
-    pub const fn set(mut self, flag: OptionFlags) -> Self {
+    fn set(mut self, flag: Self::FlagType) -> Self {
         self.0 |= flag as u16;
         self
     }
 
     #[inline]
-    pub const fn contains(&self, flag: OptionFlags) -> bool {
+    fn contains(self, flag: Self::FlagType) -> bool {
         self.0 & (flag as u16) != 0
     }
 
-    pub fn deconstruct(&self) -> Vec<OptionFlags> {
-        OptionFlags::VARIANTS
+    #[inline]
+    fn deconstruct(self) -> Vec<Self::FlagType> {
+        Self::FlagType::VARIANTS
             .iter()
             .copied()
             .filter(|e| (*e as u16) & self.0 != 0)
@@ -949,8 +917,16 @@ pub enum OptionFlags {
 }
 
 #[repr(transparent)]
-#[derive(Serialize, Debug, PartialEq, Eq, Hash, Clone, Copy, Display)]
-pub struct SessionId(pub u64);
+#[derive(Serialize, Deref, Debug, PartialEq, Eq, Hash, Clone, Copy, Display)]
+pub struct SessionId(u64);
+
+impl SessionId {
+    #[inline]
+    pub fn new() -> Self {
+        let mut rng = rand::rng();
+        Self(rng.next_u64())
+    }
+}
 
 #[repr(C)]
 #[derive(Serialize, Clone, Copy, Debug, PartialEq)]
