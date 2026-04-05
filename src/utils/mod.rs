@@ -27,6 +27,17 @@ macro_rules! dispatch {
     };
 }
 
+pub trait Flags {
+    type FlagType;
+    fn construct(flags: &[Self::FlagType]) -> Self;
+    fn deconstruct(self) -> Vec<Self::FlagType>;
+    #[must_use]
+    fn set(self, flag: Self::FlagType) -> Self;
+    #[must_use]
+    fn unset(self, flag: Self::FlagType) -> Self;
+    fn contains(self, flag: Self::FlagType) -> bool;
+}
+
 pub struct W<T>(pub T);
 
 pub struct HandleMonitor {
