@@ -1,16 +1,17 @@
 #![allow(clippy::wildcard_imports)]
 
 use crate::{
-    manager::types::{EncryptionMonitor, FingerprintMonitor},
+    manager::{
+        packets::{fingerprint::Headers, types::*},
+        types::{EncryptionMonitor, FingerprintMonitor},
+    },
     packet_processor::{encryption, serialize::Serialize},
-    packetizer::{fingerprint::Headers, types::*},
     prelude::*,
     transport::types::ReceivedPacket,
     unwrap_or_return,
 };
 
 use super::types::{InboundChannels, InboundSender};
-use crate::packetizer::types::Packet;
 
 const SESSION_ID_OFFSET: usize = 8;
 const PACKET_TYPE_OFFSET: usize = 4;

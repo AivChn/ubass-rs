@@ -1,4 +1,7 @@
+mod inbound;
 mod key_exchange;
+mod outbound;
+pub mod packets;
 pub mod types;
 
 use crate::prelude::*;

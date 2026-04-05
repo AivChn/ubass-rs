@@ -8,7 +8,6 @@ use std::{
 use crate::packet_processor::serialize::Serialize;
 use derive_more::Display;
 use tokio::time::Instant;
-use ubass_macros::Serialize;
 
 use super::fingerprint::{Fingerprint, Headers, Payload};
 
@@ -17,15 +16,6 @@ pub const MAX_PAYLOAD_LENGTH: usize = 1384;
 pub struct PacketWrapper {
     pub addr: SocketAddr,
     pub packet: Packet,
-}
-
-impl PacketWrapper {
-    pub fn new(src_addr: SocketAddr, packet: Packet) -> Self {
-        Self {
-            addr: src_addr,
-            packet,
-        }
-    }
 }
 
 pub enum Packet {
@@ -44,8 +34,8 @@ pub enum Packet {
 }
 
 impl Packet {
-    pub fn wrap(self, src_addr: SocketAddr) -> PacketWrapper {
-        PacketWrapper::new(src_addr, self)
+    pub fn wrap(self, addr: SocketAddr) -> PacketWrapper {
+        PacketWrapper { addr, packet: self }
     }
 }
 

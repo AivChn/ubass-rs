@@ -1,5 +1,4 @@
 use crate::packet_processor::{inbound, outbound};
-use crate::packetizer::types::{BatchID, FECInfo, Options, PacketType};
 use crate::prelude::*;
 
 use std::collections::HashMap;
@@ -13,8 +12,8 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::{
+    manager::packets::types::{BatchID, DataPacket, FECInfo, Options, PacketType, SessionId},
     packet_processor::serialize::Serialize,
-    packetizer::types::{DataPacket, SessionId},
 };
 
 use super::{FECData, FECPacket, ParityPacket, RecoverdPacket};

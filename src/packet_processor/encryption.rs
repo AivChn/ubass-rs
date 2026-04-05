@@ -1,8 +1,8 @@
-use crate::manager::types::EncryptionMonitor;
-use crate::packetizer::fingerprint::{Headers, Payload};
-use crate::packetizer::types::{
+use crate::manager::packets::fingerprint::{Headers, Payload};
+use crate::manager::packets::types::{
     AppRejectErrorPacket, DataPacket, ParityPacket, SessionId, TrackRequestPacket,
 };
+use crate::manager::types::EncryptionMonitor;
 use crate::prelude::*;
 
 use aes_gcm_siv::{AeadInPlace, Nonce};

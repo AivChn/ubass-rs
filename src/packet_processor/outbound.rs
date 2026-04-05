@@ -2,16 +2,18 @@ use std::{net::SocketAddr, sync::Arc};
 
 use crate::{
     dispatch,
-    manager::types::{EncryptionMonitor, PendingAckMonitor},
+    manager::{
+        packets::types::{
+            BatchID, OptionFlags, Packet, PacketFingerprint, PacketType, PacketWrapper,
+            ParityPacket, SessionId, Timestamp,
+        },
+        types::{EncryptionMonitor, PendingAckMonitor},
+    },
     packet_processor::{
         encryption::{self, Encryptable},
         fec::{self, FECCompatible},
         serialize::Serialize,
         types::{InboundSender, OutboundSender, ProcessedPacket},
-    },
-    packetizer::types::{
-        BatchID, OptionFlags, Packet, PacketFingerprint, PacketType, PacketWrapper, ParityPacket,
-        SessionId, Timestamp,
     },
     prelude::*,
     unwrap_or_return,
@@ -41,7 +43,10 @@ macro_rules! add_ack {
     (for $packet_type:ident($packet:ident), sent to $addr:ident, saved to $pending_ack_monitor:ident) => {
         if $packet.opts.contains(OptionFlags::RequireAck) {
             add_pending_ack(
-                PacketWrapper::new($addr, Packet::$packet_type($packet.clone())),
+                PacketWrapper {
+                    addr: $addr,
+                    packet: Packet::$packet_type($packet.clone()),
+                },
                 $packet.timestamp,
                 $pending_ack_monitor,
             )

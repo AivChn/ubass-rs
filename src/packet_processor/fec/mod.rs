@@ -8,8 +8,8 @@ use std::sync::LazyLock;
 
 use crate::packet_processor::serialize::Serialize;
 
-use crate::packetizer::types::{BatchID, DataPacket, FECInfo, MAX_PAYLOAD_LENGTH};
-use crate::packetizer::types::{ParityPacket, SessionId};
+use crate::manager::packets::types::{BatchID, DataPacket, FECInfo, MAX_PAYLOAD_LENGTH};
+use crate::manager::packets::types::{ParityPacket, SessionId};
 use crate::transport::types::ReceivedPacket;
 
 use tokio::sync::OnceCell;

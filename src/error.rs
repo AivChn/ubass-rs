@@ -1,6 +1,6 @@
 use std::net::SocketAddr;
 
-use crate::packetizer::types::{BatchID, SessionId, Version};
+use crate::manager::packets::types::{BatchID, SessionId, Version};
 pub type Result<T> = core::result::Result<T, Error>;
 pub type ErrResult = Result<()>;
 pub type EmptyResult = core::result::Result<(), ()>;
