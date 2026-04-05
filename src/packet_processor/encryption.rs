@@ -1,5 +1,5 @@
-use crate::manager::packets::fingerprint::{Headers, Payload};
-use crate::manager::packets::types::{
+use super::fingerprint::{Headers, Payload};
+use crate::manager::packets::{
     AppRejectErrorPacket, DataPacket, ParityPacket, SessionId, TrackRequestPacket,
 };
 use crate::manager::types::EncryptionMonitor;

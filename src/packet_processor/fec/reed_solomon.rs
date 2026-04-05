@@ -6,9 +6,7 @@ use tokio::time::Instant;
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 
 use crate::{
-    manager::packets::types::{
-        BatchID, FECInfo, Options, PacketType, ParityPacket, SessionId, Version,
-    },
+    manager::packets::{BatchID, FECInfo, Options, PacketType, ParityPacket, SessionId, Version},
     packet_processor::fec::FECPacket,
     prelude::*,
 };

@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 use crate::{
     dispatch,
     manager::{
-        packets::types::{
+        packets::{
             BatchID, OptionFlags, Packet, PacketFingerprint, PacketType, PacketWrapper,
             ParityPacket, SessionId, Timestamp,
         },

@@ -1,7 +1,9 @@
 mod encryption;
-pub mod fec;
 mod inbound;
 mod outbound;
+
+pub mod fec;
+pub mod fingerprint;
 pub mod serialize;
 pub mod types;
 

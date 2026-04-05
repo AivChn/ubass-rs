@@ -2,10 +2,10 @@
 
 use crate::{
     manager::{
-        packets::{fingerprint::Headers, types::*},
+        packets::*,
         types::{EncryptionMonitor, FingerprintMonitor},
     },
-    packet_processor::{encryption, serialize::Serialize},
+    packet_processor::{encryption, fingerprint::Headers, serialize::Serialize},
     prelude::*,
     transport::types::ReceivedPacket,
     unwrap_or_return,

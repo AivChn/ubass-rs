@@ -1,6 +1,6 @@
 use crate::prelude::*;
 use crate::{
-    manager::packets::types::{BatchID, PacketWrapper, SessionId},
+    manager::packets::{BatchID, PacketWrapper, SessionId},
     packet_processor::{fec::RecoverdPacket, types::ProcessedPacket},
     transport::types::ReceivedPacket,
 };

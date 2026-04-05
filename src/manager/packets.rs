@@ -9,7 +9,7 @@ use crate::packet_processor::serialize::Serialize;
 use derive_more::Display;
 use tokio::time::Instant;
 
-use super::fingerprint::{Fingerprint, Headers, Payload};
+use crate::packet_processor::fingerprint::{Fingerprint, Headers, Payload};
 
 pub const MAX_PAYLOAD_LENGTH: usize = 1384;
 

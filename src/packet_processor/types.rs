@@ -4,7 +4,7 @@ use crate::prelude::*;
 
 use tokio::sync::mpsc::{Receiver, Sender};
 
-use crate::manager::packets::types::PacketType;
+use crate::manager::packets::PacketType;
 
 // TYPES
 

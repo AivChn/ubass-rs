@@ -15,7 +15,7 @@ use tokio::sync::{
 };
 
 use crate::{
-    manager::packets::types::{PacketFingerprint, PacketWrapper, SessionId, Timestamp},
+    manager::packets::{PacketFingerprint, PacketWrapper, SessionId, Timestamp},
     prelude::*,
 };
 

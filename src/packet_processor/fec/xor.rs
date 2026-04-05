@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 use tokio::time::Instant;
 
 use crate::{
-    manager::packets::types::{BatchID, DataPacket, FECInfo, Options, PacketType, SessionId},
+    manager::packets::{BatchID, DataPacket, FECInfo, Options, PacketType, SessionId},
     packet_processor::serialize::Serialize,
 };
 
