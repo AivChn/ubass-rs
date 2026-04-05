@@ -3,11 +3,11 @@ use std::{net::SocketAddr, sync::Arc};
 use crate::{
     dispatch,
     manager::{
+        EncryptionMonitor, PendingAckMonitor,
         packets::{
             BatchID, OptionFlags, Packet, PacketFingerprint, PacketType, PacketWrapper,
-            ParityPacket, SessionId, Timestamp,
+            ParityPacket, SessionId,
         },
-        types::{EncryptionMonitor, PendingAckMonitor},
     },
     packet_processor::{
         encryption::{self, Encryptable},

@@ -1,10 +1,7 @@
 #![allow(clippy::wildcard_imports)]
 
 use crate::{
-    manager::{
-        packets::*,
-        types::{EncryptionMonitor, FingerprintMonitor},
-    },
+    manager::{EncryptionMonitor, FingerprintMonitor, packets::*},
     packet_processor::{encryption, fingerprint::Headers, serialize::Serialize},
     prelude::*,
     transport::types::ReceivedPacket,

@@ -1,8 +1,8 @@
 use super::fingerprint::{Headers, Payload};
+use crate::manager::EncryptionMonitor;
 use crate::manager::packets::{
     AppRejectErrorPacket, DataPacket, ParityPacket, SessionId, TrackRequestPacket,
 };
-use crate::manager::types::EncryptionMonitor;
 use crate::prelude::*;
 
 use aes_gcm_siv::{AeadInPlace, Nonce};
@@ -16,7 +16,7 @@ impl Encryptable for AppRejectErrorPacket {}
 
 fn get_nonce(session_id: SessionId, counter: [u8; 8]) -> [u8; 12] {
     let mut result = [0u8; 12];
-    let session_part = &session_id.0.to_be_bytes()[..4];
+    let session_part = &session_id.to_be_bytes()[..4];
     result[..4].copy_from_slice(session_part);
     result[4..].copy_from_slice(&counter);
     result

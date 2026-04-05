@@ -8,7 +8,7 @@ pub mod serialize;
 pub mod types;
 
 use crate::{
-    manager::types::{EncryptionMonitor, FingerprintMonitor, PendingAckMonitor},
+    manager::{EncryptionMonitor, FingerprintMonitor, PendingAckMonitor},
     packet_processor::types::{InboundReceiver, InboundSender, OutboundReceiver, OutboundSender},
     prelude::*,
 };
