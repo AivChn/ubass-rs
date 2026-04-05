@@ -8,9 +8,11 @@ name = "ubass"
 path = "src/lib.rs"
 
 [features]
-default = ["fec_xor"]
+default = ["fec_xor", "rust-api"]
 fec_xor = []
 fec_rs = []
+rust-api = []
+uniffi-api = []
 
 [dependencies]
 thiserror = "1"
@@ -25,6 +27,8 @@ async-trait = "0.1.89"
 x25519-dalek = "2.0.1"
 rand_core = "0.10.0"
 xxhash-rust = {version = "0.8.15", features = ["xxh3"]}
+rand = "0.10.0"
+rustc-hash = "2.1.2"
 
 [build-dependencies]
 uniffi = { version = "0.31.0", features = ["build"]}
