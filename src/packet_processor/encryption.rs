@@ -22,10 +22,14 @@ fn get_nonce(session_id: SessionId, counter: [u8; 8]) -> [u8; 12] {
     result
 }
 
-pub fn encrypt(packet: &mut impl Encryptable, session_id: SessionId, monitor: &EncryptionMonitor) {
+pub async fn encrypt(
+    packet: &mut impl Encryptable,
+    session_id: SessionId,
+    monitor: &EncryptionMonitor<'_>,
+) {
     let (aad, payload) = (packet.headers(), packet.payload());
 
-    let (cipher, counter) = monitor.get(&session_id);
+    let (cipher, counter) = monitor.get(&session_id).await;
     let nonce = Nonce::from(get_nonce(session_id, counter));
 
     _ = cipher.encrypt_in_place(&nonce, &aad, payload);
@@ -33,10 +37,10 @@ pub fn encrypt(packet: &mut impl Encryptable, session_id: SessionId, monitor: &E
     payload.extend(counter);
 }
 
-pub fn decrypt(
+pub async fn decrypt(
     packet: &mut impl Encryptable,
     session_id: SessionId,
-    monitor: &EncryptionMonitor,
+    monitor: &EncryptionMonitor<'_>,
 ) -> EmptyResult {
     let (aad, payload) = (packet.headers(), packet.payload());
 
@@ -45,7 +49,7 @@ pub fn decrypt(
         return Err(());
     }
 
-    let cipher = monitor.get_cipher(&session_id);
+    let cipher = monitor.get_cipher(&session_id).await;
     let counter: [u8; 8] = payload[payload.len() - 8..]
         .try_into()
         .expect("length is guaranteed");
@@ -57,8 +61,8 @@ pub fn decrypt(
         .map_err(|_| ())
 }
 
-pub fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: &EncryptionMonitor) {
-    let (cipher, counter) = monitor.get(&session_id);
+pub async fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: &EncryptionMonitor<'_>) {
+    let (cipher, counter) = monitor.get(&session_id).await;
     let nonce = Nonce::from(get_nonce(session_id, counter));
 
     let mut tag = vec![];
@@ -68,12 +72,12 @@ pub fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: &EncryptionMoni
     packet.extend(counter);
 }
 
-pub fn authenticate(
+pub async fn authenticate(
     packet: &mut Vec<u8>,
     session_id: SessionId,
-    monitor: &EncryptionMonitor,
+    monitor: &EncryptionMonitor<'_>,
 ) -> bool {
-    let cipher = monitor.get_cipher(&session_id);
+    let cipher = monitor.get_cipher(&session_id).await;
     let counter: [u8; 8] = packet[packet.len() - 8..]
         .try_into()
         .expect("length is guaranteed");

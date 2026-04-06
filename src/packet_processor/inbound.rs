@@ -117,18 +117,18 @@ async fn deserialize_and_decrypt(
         // Single types
         PacketType::Data => {
             let mut packet = Box::new(DataPacket::deserialize(&data)?);
-            encryption::decrypt(packet.as_mut(), session_id, encryption_monitor)?;
+            encryption::decrypt(packet.as_mut(), session_id, encryption_monitor).await?;
             Ok(Packet::DataPacket(packet))
         }
 
         PacketType::Parity => {
             let mut packet = Box::new(ParityPacket::deserialize(&data)?);
-            encryption::decrypt(packet.as_mut(), session_id, encryption_monitor)?;
+            encryption::decrypt(packet.as_mut(), session_id, encryption_monitor).await?;
             Ok(Packet::ParityPacket(packet))
         }
 
         PacketType::Ack => {
-            authenticate(&mut data, session_id, encryption_monitor)?;
+            authenticate(&mut data, session_id, encryption_monitor).await?;
             let data = dedup_no_payload(data, session_id, fingerprint_monitor)
                 .await
                 .ok_or(())?;
@@ -172,7 +172,7 @@ async fn deserialize_and_auth_control_packet(
         match ControlType::deserialize(&data[SECONDARY_TYPE_OFFSET..])? {
             // host
             ControlType::Host(HostControlType::Hello) => {
-                authenticate(&mut data, session_id, encryption_monitor)?;
+                authenticate(&mut data, session_id, encryption_monitor).await?;
                 let data = dedup_no_payload(data, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
@@ -182,7 +182,7 @@ async fn deserialize_and_auth_control_packet(
             //session
             ControlType::Session(SessionControlType::Retransmit) => {
                 let packet = Box::new(RetransmitPacket::deserialize(&data)?);
-                authenticate(&mut packet.headers(), session_id, encryption_monitor)?;
+                authenticate(&mut packet.headers(), session_id, encryption_monitor).await?;
                 let packet = dedup_with_payload(packet, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
@@ -190,7 +190,7 @@ async fn deserialize_and_auth_control_packet(
             }
             ControlType::Session(SessionControlType::TrackRequest) => {
                 let mut packet = Box::new(TrackRequestPacket::deserialize(&data)?);
-                encryption::decrypt(packet.as_mut(), session_id, encryption_monitor)?;
+                encryption::decrypt(packet.as_mut(), session_id, encryption_monitor).await?;
                 let packet = dedup_with_payload(packet, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
@@ -200,7 +200,7 @@ async fn deserialize_and_auth_control_packet(
 
             //playback
             ControlType::Playback(_) => {
-                authenticate(&mut data, session_id, encryption_monitor)?;
+                authenticate(&mut data, session_id, encryption_monitor).await?;
                 let data = dedup_no_payload(data, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
@@ -220,7 +220,7 @@ async fn deserialize_and_auth_error_packet(
         match ErrorType::deserialize(&data[SECONDARY_TYPE_OFFSET..])? {
             ErrorType::AppReject => {
                 let mut packet = Box::new(AppRejectErrorPacket::deserialize(&data)?);
-                encryption::decrypt(packet.as_mut(), session_id, encryption_monitor)?;
+                encryption::decrypt(packet.as_mut(), session_id, encryption_monitor).await?;
                 let packet = dedup_with_payload(packet, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
@@ -228,7 +228,7 @@ async fn deserialize_and_auth_error_packet(
             }
 
             ErrorType::UnexpectedPacket | ErrorType::IncomprehensiblePacket => {
-                authenticate(&mut data, session_id, encryption_monitor)?;
+                authenticate(&mut data, session_id, encryption_monitor).await?;
                 let data = dedup_no_payload(data, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
@@ -238,7 +238,7 @@ async fn deserialize_and_auth_error_packet(
             }
 
             ErrorType::SessionDoesNotExist => {
-                authenticate(&mut data, session_id, encryption_monitor)?;
+                authenticate(&mut data, session_id, encryption_monitor).await?;
                 let data = dedup_no_payload(data, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
@@ -250,12 +250,12 @@ async fn deserialize_and_auth_error_packet(
     )
 }
 
-fn authenticate(
+async fn authenticate(
     packet: &mut Vec<u8>,
     session_id: SessionId,
     encryption_monitor: &'static EncryptionMonitor<'_>,
 ) -> core::result::Result<(), ()> {
-    if encryption::authenticate(packet, session_id, encryption_monitor) {
+    if encryption::authenticate(packet, session_id, encryption_monitor).await {
         Ok(())
     } else {
         Err(())
