@@ -1,14 +1,18 @@
-use aes_gcm_siv::Aes256GcmSiv;
+#![allow(private_interfaces)]
+use aes_gcm_siv::{Aes256GcmSiv, aead::generic_array::sequence};
 use derive_more::Deref;
 use tokio::sync::{Mutex, RwLock};
+use x25519_dalek::EphemeralSecret;
 
 use crate::{
     manager::packets::{BatchID, PacketFingerprint, PacketWrapper, SessionId},
     prelude::*,
+    read_lock, write_lock,
 };
 use std::{
     collections::{HashSet, VecDeque},
-    net::SocketAddr,
+    marker::PhantomData,
+    net::{SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -18,37 +22,93 @@ use std::{
 
 const PACKET_DISCARD_TIME_MS: u64 = 7 * 1000;
 
-type GeneralStateTable = RwLock<HashMap<SessionId, GeneralSessionState>>;
-type PendingAckTable = RwLock<HashMap<PacketFingerprint, PendingAck>>;
+pub type GeneralStateTable = RwLock<HashMap<SessionId, GeneralSessionState>>;
+pub type PendingAckTable = RwLock<HashMap<PacketFingerprint, PendingAck>>;
 // encryption doesnt need a lock because key rotation semantics guarantee no read-write overlaps
-type EncryptionTable = HashMap<SessionId, EncryptionWindow>;
-type FingerprintTable = RwLock<HashMap<SessionId, Arc<FingerprintWindow>>>;
-type FecStateTable = RwLock<HashMap<SessionId, SessionFecState>>;
-type SessionAppIdTable = RwLock<HashMap<SessionId, AppId>>;
+pub type EncryptionTable = RwLock<HashMap<SessionId, EncryptionWindow>>;
+pub type FingerprintTable = RwLock<HashMap<SessionId, Arc<FingerprintWindow>>>;
+pub type FecStateTable = RwLock<HashMap<SessionId, SessionFecState>>;
+pub type SessionAppIdTable = RwLock<HashMap<SessionId, AppId>>;
 #[derive(Deref)]
-struct SessionAddressTable(RwLock<HashMap<SessionId, SocketAddr>>);
+pub struct SessionPortTable(RwLock<HashMap<SessionId, SocketAddr>>);
 
-struct SessionStates {
-    general: GeneralStateTable,
-    ack: PendingAckTable,
-    encryption: EncryptionTable,
-    fingerprints: FingerprintTable,
-    addresses: SessionAddressTable,
-    fec: FecStateTable,
-    app_ids: SessionAppIdTable,
+pub struct SessionStates {
+    pub port: RwLock<Port>,
+    pub general: GeneralStateTable,
+    pub ack: PendingAckTable,
+    pub encryption: EncryptionTable,
+    pub fingerprints: FingerprintTable,
+    pub addresses: SessionPortTable,
+    pub fec: FecStateTable,
+    pub app_ids: SessionAppIdTable,
 }
 
-impl Default for SessionStates {
-    fn default() -> Self {
+impl SessionStates {
+    pub async fn session_exists(&self, session_id: SessionId) -> bool {
+        read_lock!(self.general).contains_key(&session_id)
+    }
+
+    pub async fn new_session(&self, session_id: SessionId, mut address: SocketAddr, app_id: AppId) {
+        write_lock!(self.general).insert(
+            session_id,
+            GeneralSessionState {
+                last_activity_time: Timestamp::now(),
+                last_key_rotation_time: Timestamp::now(),
+                flags: SessionStateFlags::construct(&[SessionStateFlag::Handshake]),
+            },
+        );
+
+        write_lock!(self.app_ids).insert(session_id, app_id);
+
+        write_lock!(self.fingerprints).insert(session_id, Arc::new(FingerprintWindow::default()));
+
+        write_lock!(self.addresses).insert(session_id, address);
+
+        write_lock!(self.fec).insert(session_id, SessionFecState::default());
+    }
+
+    pub async fn port(&self) -> Port {
+        read_lock!(self.port).clone()
+    }
+}
+
+impl SessionStates {
+    pub fn new(port: Port) -> Self {
         Self {
+            port: RwLock::new(port),
             general: GeneralStateTable::default(),
             ack: PendingAckTable::default(),
             encryption: EncryptionTable::default(),
             fingerprints: FingerprintTable::default(),
-            addresses: SessionAddressTable::default(),
+            addresses: SessionPortTable::default(),
             fec: FecStateTable::default(),
             app_ids: SessionAppIdTable::default(),
         }
+    }
+}
+
+#[derive(Serialize, Deref, Clone, Copy)]
+#[repr(transparent)]
+pub struct Port(u16);
+
+impl From<SocketAddr> for Port {
+    fn from(value: SocketAddr) -> Self {
+        match value {
+            SocketAddr::V4(socket_addr_v4) => Port(socket_addr_v4.port()),
+            SocketAddr::V6(socket_addr_v6) => Port(socket_addr_v6.port()),
+        }
+    }
+}
+
+impl From<SocketAddrV4> for Port {
+    fn from(value: SocketAddrV4) -> Self {
+        Port(value.port())
+    }
+}
+
+impl From<SocketAddrV6> for Port {
+    fn from(value: SocketAddrV6) -> Self {
+        Port(value.port())
     }
 }
 
@@ -112,11 +172,88 @@ impl Flags for SessionStateFlags {
     }
 }
 
+struct HandshakeStateTable(HashMap<SocketAddr, AnyHandshakeState>);
+
+impl HandshakeStateTable {
+    pub fn get_secret(&mut self, mut address: SocketAddr) -> Option<EphemeralSecret> {
+        address.set_port(0);
+        if !self.0.contains_key(&address) {
+            return None;
+        }
+        let entry = self
+            .0
+            .remove(&address)
+            .expect("Just checked the value is here");
+
+        match entry {
+            AnyHandshakeState::WithSecret(handshake_state) => {
+                let (new, secret) = handshake_state.secret();
+                self.0
+                    .insert(address, AnyHandshakeState::WithoutSecret(new));
+                secret
+            }
+            AnyHandshakeState::WithoutSecret(_) => None,
+        }
+    }
+}
+
+enum AnyHandshakeState {
+    WithSecret(HandshakeState<WithSecret>),
+    WithoutSecret(HandshakeState<WithoutSecret>),
+}
+
+struct WithSecret;
+struct WithoutSecret;
+trait HandshakeStateState {}
+impl HandshakeStateState for WithSecret {}
+impl HandshakeStateState for WithoutSecret {}
+
+struct HandshakeState<Secret: HandshakeStateState + ?Sized> {
+    current_session_id: SessionId,
+    ephemeral_secret: Option<EphemeralSecret>,
+    _state: PhantomData<Secret>,
+}
+
+impl<Secret: HandshakeStateState> HandshakeState<Secret> {
+    pub fn new(
+        session_id: SessionId,
+        ephemeral_secret: EphemeralSecret,
+    ) -> HandshakeState<WithSecret> {
+        HandshakeState::<WithSecret> {
+            current_session_id: session_id,
+            ephemeral_secret: Some(ephemeral_secret),
+            _state: PhantomData,
+        }
+    }
+
+    pub fn has_secret(&self) -> bool {
+        self.ephemeral_secret.is_some()
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        self.current_session_id
+    }
+}
+
+impl HandshakeState<WithSecret> {
+    pub fn secret(self) -> (HandshakeState<WithoutSecret>, Option<EphemeralSecret>) {
+        (
+            HandshakeState::<WithoutSecret> {
+                current_session_id: self.current_session_id,
+                ephemeral_secret: None,
+                _state: PhantomData,
+            },
+            self.ephemeral_secret,
+        )
+    }
+}
+
+#[derive(Clone)]
 #[repr(transparent)]
 pub struct AppId(String);
 
 impl AppId {
-    fn new(id: String) -> Self {
+    pub fn new(id: String) -> Self {
         debug_assert!(
             id.is_ascii(),
             "Invairant broken while constructing `AppId`: \
@@ -162,19 +299,23 @@ impl Serialize for AppId {
     }
 }
 
-impl Default for SessionAddressTable {
+impl Default for SessionPortTable {
     fn default() -> Self {
         Self(RwLock::default())
     }
 }
 
-impl SessionAddressTable {
+impl SessionPortTable {
     pub async fn contains(&self, id: SessionId) -> bool {
         self.read().await.contains_key(&id)
     }
 
-    pub async fn update(&self, id: SessionId, address: SocketAddr) {
-        self.write().await.insert(id, address);
+    pub async fn update(&self, id: SessionId, mut address: SocketAddr) {
+        self.write()
+            .await
+            .entry(id)
+            .or_insert(address)
+            .set_ip(address.ip());
     }
 }
 
@@ -449,27 +590,27 @@ impl FingerprintWindow {
 }
 
 pub struct EncryptionWindow {
-    cipher: Aes256GcmSiv,
+    cipher: Arc<Aes256GcmSiv>,
     nonce: AtomicU64,
 }
 
 impl EncryptionWindow {
     pub fn new(cipher: Aes256GcmSiv) -> Self {
         Self {
-            cipher,
+            cipher: Arc::new(cipher),
             nonce: AtomicU64::new(0),
         }
     }
 
-    pub fn get(&self) -> (&Aes256GcmSiv, [u8; 8]) {
+    pub fn get(&self) -> (Arc<Aes256GcmSiv>, [u8; 8]) {
         let x = self
             .nonce
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        (&self.cipher, x.to_be_bytes())
+        (self.cipher.clone(), x.to_be_bytes())
     }
 
-    pub fn get_cipher(&self) -> &Aes256GcmSiv {
-        &self.cipher
+    pub fn get_cipher(&self) -> Arc<Aes256GcmSiv> {
+        self.cipher.clone()
     }
 }
 
@@ -486,8 +627,10 @@ impl<'a> EncryptionMonitor<'a> {
     ///
     /// # Panics
     /// This function panics if the key is not yet created, which should be impossible
-    pub fn get(&self, session_id: &SessionId) -> (&Aes256GcmSiv, [u8; 8]) {
+    pub async fn get(&self, session_id: &SessionId) -> (Arc<Aes256GcmSiv>, [u8; 8]) {
         self.table
+            .write()
+            .await
             .get(session_id)
             .unwrap_or_else(|| {
                 panic!(
@@ -502,8 +645,10 @@ impl<'a> EncryptionMonitor<'a> {
     ///
     /// # Panics
     /// This function panics if the key is not yet created, which should be impossible
-    pub fn get_cipher(&self, session_id: &SessionId) -> &Aes256GcmSiv {
+    pub async fn get_cipher(&self, session_id: &SessionId) -> Arc<Aes256GcmSiv> {
         self.table
+            .read()
+            .await
             .get(session_id)
             .unwrap_or_else(|| {
                 panic!(
