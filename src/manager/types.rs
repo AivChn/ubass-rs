@@ -23,8 +23,10 @@ use crate::{
     prelude::*,
 };
 
-type OutboundReceiver = Receiver<Result<ManagerMessage>>;
-type OutboundSender = Sender<PacketProcessingMessage>;
+pub type OutboundReceiver = Receiver<Result<ManagerMessage>>;
+pub type OutboundSender = Sender<PacketProcessingMessage>;
+
+pub type AppSender = Sender<AppRequest>;
 
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
 #[repr(transparent)]
