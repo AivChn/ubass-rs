@@ -1,5 +1,6 @@
-use crate::prelude::*;
+use crate::{manager::state::Port, prelude::*};
 
+use core::ops::Deref;
 use std::{
     fmt::Display,
     net::{SocketAddr, SocketAddrV4},
@@ -60,7 +61,7 @@ impl TryFrom<&Packet> for PacketFingerprint {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Headers)]
 pub struct HelloPacket {
     pub version: Version,
     pub opts: Options,
@@ -70,7 +71,7 @@ pub struct HelloPacket {
     pub proposed_session_id: SessionId,
     pub timestamp: Timestamp,
     pub public_key: PublicKey,
-    pub host_address: SocketAddrV4,
+    pub receiving_port: Port,
     pub app_id: AppId,
 }
 
@@ -80,7 +81,7 @@ impl HelloPacket {
         proposed_session_id: SessionId,
         public_key: PublicKey,
         app_id: AppId,
-        host_address: SocketAddrV4,
+        receiving_port: Port,
     ) -> Self {
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Host;
@@ -97,8 +98,8 @@ impl HelloPacket {
             proposed_session_id,
             timestamp,
             public_key,
+            receiving_port,
             app_id,
-            host_address,
         }
     }
 }
@@ -611,14 +612,11 @@ pub struct IncompatibleVersionPacket {
 
 impl IncompatibleVersionPacket {
     pub const HEADER_SIZE: usize = size_of::<Self>();
-    pub fn packet() -> [u8; Self::HEADER_SIZE] {
-        let mut buffer = [0u8; Self::HEADER_SIZE];
+    pub fn packet() -> Self {
         Self {
             zero_version: Version::new(0, 0, 0),
             min_version: Version::MIN_COMPATIBLE_VERSION,
         }
-        .serialize(&mut buffer);
-        buffer
     }
 }
 
@@ -690,7 +688,21 @@ impl BufferSize {
 
 #[derive(Serialize)]
 #[repr(transparent)]
-pub struct PublicKey(pub [u8; 32]);
+pub struct PublicKey([u8; 32]);
+
+impl PublicKey {
+    pub fn new(key: x25519_dalek::PublicKey) -> Self {
+        Self(key.to_bytes())
+    }
+}
+
+impl Deref for PublicKey {
+    type Target = [u8; 32];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 #[derive(Serialize, Debug, Clone, Copy, Display)]
 #[repr(transparent)]
