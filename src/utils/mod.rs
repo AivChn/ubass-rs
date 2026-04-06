@@ -27,6 +27,20 @@ macro_rules! dispatch {
     };
 }
 
+#[macro_export]
+macro_rules! read_lock {
+    ($field:expr) => {
+        $field.read().await
+    };
+}
+
+#[macro_export]
+macro_rules! write_lock {
+    ($field:expr) => {
+        $field.write().await
+    };
+}
+
 pub trait Flags {
     type FlagType;
     fn construct(flags: &[Self::FlagType]) -> Self;
