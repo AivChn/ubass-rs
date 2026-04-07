@@ -50,7 +50,6 @@ impl OutboundSockets {
     /// Creates a new `OutboundSockets` struct
     ///
     /// # Errors
-    ///
     /// This function may erorr if it failed to create a socket.
     pub async fn new() -> Result<Self> {
         let sockets = vec![Arc::new(
@@ -78,7 +77,6 @@ impl OutboundSockets {
     /// Updates all the meters based on the time it took for a buffer to be sent.
     ///
     /// # Errors
-    ///
     /// This function may erorr if creating a new socket has failed
     pub async fn update(&mut self, elapsed: u64) -> ErrResult {
         #[allow(clippy::cast_possible_truncation)]
@@ -128,7 +126,6 @@ impl OutboundSockets {
     /// Adds a socket to the buffer
     ///
     /// # Errors
-    ///
     /// can return a `FailedToBind` error if socket binding failed
     async fn new_socket() -> Result<Arc<UdpSocket>> {
         Ok(Arc::new(

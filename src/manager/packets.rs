@@ -22,6 +22,7 @@ pub struct PacketWrapper {
     pub packet: Packet,
 }
 
+#[derive(Clone)]
 pub enum Packet {
     HelloPacket(Box<HelloPacket>),
     TrackRequestPacket(Box<TrackRequestPacket>),
@@ -61,7 +62,7 @@ impl TryFrom<&Packet> for PacketFingerprint {
     }
 }
 
-#[derive(Serialize, Headers)]
+#[derive(Clone, Serialize, Headers)]
 pub struct HelloPacket {
     pub version: Version,
     pub opts: Options,
@@ -204,7 +205,7 @@ impl DataPacket {
     }
 }
 
-#[derive(Headers, Payload, Serialize)]
+#[derive(Clone, Headers, Payload, Serialize)]
 pub struct MetadataPacket {
     pub version: Version,
     pub opts: Options,
@@ -257,7 +258,7 @@ impl MetadataPacket {
     }
 }
 
-#[derive(Headers, Payload, Serialize)]
+#[derive(Clone, Headers, Payload, Serialize)]
 pub struct ParityPacket {
     pub version: Version,
     pub opts: Options,
@@ -347,7 +348,7 @@ impl PlaybackStatusPacket {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 pub struct AckPacket {
     pub version: Version,
     pub opts: Options,
@@ -366,7 +367,7 @@ impl AckPacket {
         debug_assert!(
             !opts.contains(OptionFlags::RequireAck),
             "Invariant broken while constructing `AckPacket`: \
-            flag `RequireAck` was present, which should not be allowed."
+            flag `RequireAck` is present, but an ack packet must never be acked"
         );
 
         let version = Version::CURRENT_VERSION;
@@ -470,7 +471,7 @@ impl SessionDoesNotExistErrorPacket {
     }
 }
 
-#[derive(Serialize, Headers)]
+#[derive(Clone, Serialize, Headers)]
 pub struct UnexpectedPacketErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -604,7 +605,7 @@ impl AppRejectErrorPacket {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 pub struct IncompatibleVersionPacket {
     pub zero_version: Version,
     pub min_version: Version,
@@ -620,7 +621,7 @@ impl IncompatibleVersionPacket {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 #[repr(transparent)]
 pub struct SecondaryType([u8; 2]);
 
@@ -666,7 +667,7 @@ impl BufferId {
     }
 }
 
-#[derive(Serialize, Display)]
+#[derive(Clone, Copy, Serialize, Display)]
 #[repr(transparent)]
 pub struct BufferSize(u32);
 
@@ -686,13 +687,19 @@ impl BufferSize {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone, Copy)]
 #[repr(transparent)]
 pub struct PublicKey([u8; 32]);
 
-impl PublicKey {
-    pub fn new(key: x25519_dalek::PublicKey) -> Self {
-        Self(key.to_bytes())
+impl From<x25519_dalek::PublicKey> for PublicKey {
+    fn from(value: x25519_dalek::PublicKey) -> Self {
+        PublicKey(value.to_bytes())
+    }
+}
+
+impl From<PublicKey> for x25519_dalek::PublicKey {
+    fn from(value: PublicKey) -> Self {
+        x25519_dalek::PublicKey::from(*value)
     }
 }
 
@@ -893,6 +900,11 @@ impl Flags for Options {
         )
     }
 
+    #[inline]
+    fn none() -> Self {
+        Self(0)
+    }
+
     #[must_use]
     fn unset(mut self, flag: Self::FlagType) -> Self {
         self.0 &= !(flag as u16);
@@ -934,7 +946,7 @@ pub struct SessionId(u64);
 
 impl SessionId {
     #[inline]
-    pub fn new() -> Self {
+    pub fn generate() -> Self {
         let mut rng = rand::rng();
         Self(rng.next_u64())
     }

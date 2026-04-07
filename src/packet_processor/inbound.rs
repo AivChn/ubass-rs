@@ -4,8 +4,8 @@ use crate::{
     manager::{EncryptionMonitor, FingerprintMonitor, packets::*},
     packet_processor::{encryption, fingerprint::Headers, serialize::Serialize},
     prelude::*,
+    r_unwrap_or_return,
     transport::types::ReceivedPacket,
-    unwrap_or_return,
 };
 
 use super::types::{InboundChannels, InboundSender};
@@ -64,10 +64,11 @@ async fn handle_packet(
     encryption_monitor: &'static EncryptionMonitor<'_>,
     fingerprint_monitor: &'static FingerprintMonitor<'_>,
 ) {
-    let version = unwrap_or_return!(Version::deserialize(&packet.data));
+    let version = r_unwrap_or_return!(Version::deserialize(&packet.data));
 
     if version.is_zero() {
-        let ready_packet = unwrap_or_return!(IncompatibleVersionPacket::deserialize(&packet.data));
+        let ready_packet =
+            r_unwrap_or_return!(IncompatibleVersionPacket::deserialize(&packet.data));
         tokio::spawn(send_up(
             Ok(ManagerMessage::Packet(
                 Packet::IncompatibleVersion(Box::new(ready_packet)).wrap(packet.src_addr),
@@ -86,9 +87,9 @@ async fn handle_packet(
     }
 
     let packet_type =
-        unwrap_or_return!(PacketType::deserialize(&packet.data[PACKET_TYPE_OFFSET..]));
+        r_unwrap_or_return!(PacketType::deserialize(&packet.data[PACKET_TYPE_OFFSET..]));
 
-    let ready_packet = unwrap_or_return!(
+    let ready_packet = r_unwrap_or_return!(
         deserialize_and_decrypt(
             packet_type,
             packet.data,

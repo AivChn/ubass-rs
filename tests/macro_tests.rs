@@ -12,12 +12,12 @@ enum TestEnum {
 
 impl PartialEq for TestEnum {
     fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
+        matches!(
+            (self, other),
             (TestEnum::One, TestEnum::One)
-            | (TestEnum::Two, TestEnum::Two)
-            | (TestEnum::Three, TestEnum::Three) => true,
-            _ => false,
-        }
+                | (TestEnum::Two, TestEnum::Two)
+                | (TestEnum::Three, TestEnum::Three)
+        )
     }
 }
 

@@ -10,7 +10,17 @@ pub mod messages;
 pub use messages::*;
 
 #[macro_export]
-macro_rules! unwrap_or_return {
+macro_rules! o_unwrap_or_return {
+    ($result:expr) => {
+        match $result {
+            Some(val) => val,
+            None => return,
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! r_unwrap_or_return {
     ($result:expr) => {
         match $result {
             Ok(val) => val,
@@ -28,16 +38,16 @@ macro_rules! dispatch {
 }
 
 #[macro_export]
-macro_rules! read_lock {
-    ($field:expr) => {
-        $field.read().await
+macro_rules! lock_read {
+    ($to_lock:expr) => {
+        $to_lock.read().await
     };
 }
 
 #[macro_export]
-macro_rules! write_lock {
-    ($field:expr) => {
-        $field.write().await
+macro_rules! lock_write {
+    ($to_lock:expr) => {
+        $to_lock.write().await
     };
 }
 
@@ -45,6 +55,7 @@ pub trait Flags {
     type FlagType;
     fn construct(flags: &[Self::FlagType]) -> Self;
     fn deconstruct(self) -> Vec<Self::FlagType>;
+    fn none() -> Self;
     #[must_use]
     fn set(self, flag: Self::FlagType) -> Self;
     #[must_use]

@@ -16,7 +16,7 @@ use crate::{
         types::{InboundSender, OutboundSender, ProcessedPacket},
     },
     prelude::*,
-    unwrap_or_return,
+    r_unwrap_or_return,
 };
 
 use super::types::OutboundChannels;
@@ -287,7 +287,7 @@ async fn add_pending_ack(
     timestamp: Timestamp,
     pending_ack_monitor: &'static PendingAckMonitor<'_>,
 ) {
-    let fingerprint: PacketFingerprint = unwrap_or_return!((&packet.packet).try_into());
+    let fingerprint: PacketFingerprint = r_unwrap_or_return!((&packet.packet).try_into());
 
     pending_ack_monitor
         .add(fingerprint, (packet, timestamp))
