@@ -5,10 +5,13 @@ use tokio::sync::{Mutex, RwLock};
 use x25519_dalek::EphemeralSecret;
 
 use crate::{
+    lock_read, lock_write,
     manager::packets::{BatchID, PacketFingerprint, PacketWrapper, SessionId},
+    o_unwrap_or_return,
     prelude::*,
-    read_lock, write_lock,
+    r_unwrap_or_return,
 };
+use core::panic;
 use std::{
     collections::{HashSet, VecDeque},
     marker::PhantomData,
@@ -29,12 +32,15 @@ pub type EncryptionTable = RwLock<HashMap<SessionId, EncryptionWindow>>;
 pub type FingerprintTable = RwLock<HashMap<SessionId, Arc<FingerprintWindow>>>;
 pub type FecStateTable = RwLock<HashMap<SessionId, SessionFecState>>;
 pub type SessionAppIdTable = RwLock<HashMap<SessionId, AppId>>;
-#[derive(Deref)]
+pub type HandshakeStateTable = RwLock<HashMap<SocketAddr, HandshakeState>>;
+#[derive(Default, Deref)]
 pub struct SessionPortTable(RwLock<HashMap<SessionId, SocketAddr>>);
 
 pub struct SessionStates {
-    pub port: RwLock<Port>,
+    app_id: AppId,
+    port: Port,
     pub general: GeneralStateTable,
+    pub handshakes: HandshakeStateTable,
     pub ack: PendingAckTable,
     pub encryption: EncryptionTable,
     pub fingerprints: FingerprintTable,
@@ -44,39 +50,12 @@ pub struct SessionStates {
 }
 
 impl SessionStates {
-    pub async fn session_exists(&self, session_id: SessionId) -> bool {
-        read_lock!(self.general).contains_key(&session_id)
-    }
-
-    pub async fn new_session(&self, session_id: SessionId, mut address: SocketAddr, app_id: AppId) {
-        write_lock!(self.general).insert(
-            session_id,
-            GeneralSessionState {
-                last_activity_time: Timestamp::now(),
-                last_key_rotation_time: Timestamp::now(),
-                flags: SessionStateFlags::construct(&[SessionStateFlag::Handshake]),
-            },
-        );
-
-        write_lock!(self.app_ids).insert(session_id, app_id);
-
-        write_lock!(self.fingerprints).insert(session_id, Arc::new(FingerprintWindow::default()));
-
-        write_lock!(self.addresses).insert(session_id, address);
-
-        write_lock!(self.fec).insert(session_id, SessionFecState::default());
-    }
-
-    pub async fn port(&self) -> Port {
-        read_lock!(self.port).clone()
-    }
-}
-
-impl SessionStates {
-    pub fn new(port: Port) -> Self {
+    pub fn new(port: Port, app_id: AppId) -> Self {
         Self {
-            port: RwLock::new(port),
+            app_id,
+            port,
             general: GeneralStateTable::default(),
+            handshakes: HandshakeStateTable::default(),
             ack: PendingAckTable::default(),
             encryption: EncryptionTable::default(),
             fingerprints: FingerprintTable::default(),
@@ -84,6 +63,62 @@ impl SessionStates {
             fec: FecStateTable::default(),
             app_ids: SessionAppIdTable::default(),
         }
+    }
+
+    pub async fn new_handshake(&self, src_addr: SocketAddr, ephemeral_secret: EphemeralSecret) {
+        lock_write!(self.handshakes).insert(src_addr, HandshakeState { ephemeral_secret });
+    }
+
+    pub async fn promote_handshake(
+        &self,
+        new_session_id: SessionId,
+        address: SocketAddr,
+        app_id: AppId,
+    ) -> EphemeralSecret {
+        let HandshakeState { ephemeral_secret } = lock_write!(self.handshakes)
+            .remove(&address)
+            .unwrap_or_else(|| {
+                panic!(
+                    "Invariant broken while promoting handshake: \
+                    handshake with {address} did not exist in state."
+                )
+            });
+
+        self.new_session(new_session_id, address, app_id).await;
+
+        ephemeral_secret
+    }
+
+    pub fn app_id(&self) -> AppId {
+        self.app_id.clone()
+    }
+
+    pub fn port(&self) -> Port {
+        self.port
+    }
+
+    pub async fn session_exists(&self, session_id: SessionId) -> bool {
+        lock_read!(self.general).contains_key(&session_id)
+    }
+
+    pub async fn new_session(&self, session_id: SessionId, address: SocketAddr, app_id: AppId) {
+        lock_write!(self.handshakes).remove(&address);
+        lock_write!(self.general).insert(
+            session_id,
+            GeneralSessionState {
+                last_activity_time: Timestamp::now(),
+                last_key_rotation_time: Timestamp::now(),
+                flags: SessionStateFlags::none(),
+            },
+        );
+
+        lock_write!(self.app_ids).insert(session_id, app_id);
+
+        lock_write!(self.fingerprints).insert(session_id, Arc::new(FingerprintWindow::default()));
+
+        lock_write!(self.addresses).insert(session_id, address);
+
+        lock_write!(self.fec).insert(session_id, SessionFecState::default());
     }
 }
 
@@ -122,7 +157,6 @@ struct GeneralSessionState {
 #[repr(u32)]
 #[variants_array]
 enum SessionStateFlag {
-    Handshake = 1 << 0,
     CurrentlyStreamingFrom = 1 << 5,
     CurrentlyStreamingTo = 1 << 6,
 }
@@ -143,6 +177,10 @@ impl Flags for SessionStateFlags {
                 .reduce(|f1, f2| f1 | f2)
                 .unwrap_or(0),
         )
+    }
+
+    fn none() -> Self {
+        Self(0)
     }
 
     #[must_use]
@@ -172,79 +210,13 @@ impl Flags for SessionStateFlags {
     }
 }
 
-struct HandshakeStateTable(HashMap<SocketAddr, AnyHandshakeState>);
-
-impl HandshakeStateTable {
-    pub fn get_secret(&mut self, mut address: SocketAddr) -> Option<EphemeralSecret> {
-        address.set_port(0);
-        if !self.0.contains_key(&address) {
-            return None;
-        }
-        let entry = self
-            .0
-            .remove(&address)
-            .expect("Just checked the value is here");
-
-        match entry {
-            AnyHandshakeState::WithSecret(handshake_state) => {
-                let (new, secret) = handshake_state.secret();
-                self.0
-                    .insert(address, AnyHandshakeState::WithoutSecret(new));
-                secret
-            }
-            AnyHandshakeState::WithoutSecret(_) => None,
-        }
-    }
+pub struct HandshakeState {
+    ephemeral_secret: EphemeralSecret,
 }
 
-enum AnyHandshakeState {
-    WithSecret(HandshakeState<WithSecret>),
-    WithoutSecret(HandshakeState<WithoutSecret>),
-}
-
-struct WithSecret;
-struct WithoutSecret;
-trait HandshakeStateState {}
-impl HandshakeStateState for WithSecret {}
-impl HandshakeStateState for WithoutSecret {}
-
-struct HandshakeState<Secret: HandshakeStateState + ?Sized> {
-    current_session_id: SessionId,
-    ephemeral_secret: Option<EphemeralSecret>,
-    _state: PhantomData<Secret>,
-}
-
-impl<Secret: HandshakeStateState> HandshakeState<Secret> {
-    pub fn new(
-        session_id: SessionId,
-        ephemeral_secret: EphemeralSecret,
-    ) -> HandshakeState<WithSecret> {
-        HandshakeState::<WithSecret> {
-            current_session_id: session_id,
-            ephemeral_secret: Some(ephemeral_secret),
-            _state: PhantomData,
-        }
-    }
-
-    pub fn has_secret(&self) -> bool {
-        self.ephemeral_secret.is_some()
-    }
-
-    pub fn session_id(&self) -> SessionId {
-        self.current_session_id
-    }
-}
-
-impl HandshakeState<WithSecret> {
-    pub fn secret(self) -> (HandshakeState<WithoutSecret>, Option<EphemeralSecret>) {
-        (
-            HandshakeState::<WithoutSecret> {
-                current_session_id: self.current_session_id,
-                ephemeral_secret: None,
-                _state: PhantomData,
-            },
-            self.ephemeral_secret,
-        )
+impl HandshakeState {
+    pub fn new(ephemeral_secret: EphemeralSecret) -> Self {
+        Self { ephemeral_secret }
     }
 }
 
@@ -256,15 +228,11 @@ impl AppId {
     pub fn new(id: String) -> Self {
         debug_assert!(
             id.is_ascii(),
-            "Invairant broken while constructing `AppId`: \
+            "Invariant broken while constructing `AppId`: \
             The ID is not a valid ascii sequence: {id}"
         );
 
         Self(id)
-    }
-
-    fn from_slice(id: &str) -> Self {
-        id.into()
     }
 }
 
@@ -272,7 +240,7 @@ impl From<&str> for AppId {
     fn from(value: &str) -> Self {
         debug_assert!(
             value.is_ascii(),
-            "Invairant broken while constructing `AppId` from &str: \
+            "Invariant broken while constructing `AppId` from &str: \
             The ID is not a valid ascii sequence: {value}"
         );
 
@@ -285,7 +253,7 @@ impl Serialize for AppId {
         if buf.len() < self.0.len() {
             Err(())
         } else {
-            buf.copy_from_slice(&self.0.as_bytes());
+            buf.copy_from_slice(self.0.as_bytes());
             Ok(())
         }
     }
@@ -296,12 +264,6 @@ impl Serialize for AppId {
 
     fn sized(&self) -> usize {
         self.0.len()
-    }
-}
-
-impl Default for SessionPortTable {
-    fn default() -> Self {
-        Self(RwLock::default())
     }
 }
 
@@ -319,16 +281,9 @@ impl SessionPortTable {
     }
 }
 
+#[derive(Default)]
 struct SessionFecState {
     table: RwLock<HashMap<BatchID, FecBatchWindow>>,
-}
-
-impl Default for SessionFecState {
-    fn default() -> Self {
-        Self {
-            table: RwLock::default(),
-        }
-    }
 }
 
 struct FecBatchWindow {
@@ -355,31 +310,25 @@ impl FecBatchWindow {
 
     #[inline]
     fn add_data(&mut self, index: usize) {
-        self.data_arrived.set(index);
+        self.data_arrived.set_bit(index);
     }
 
     #[inline]
     fn add_parity(&mut self, index: usize) {
         #[cfg(feature = "fec_xor")]
-        self.recovery_arrived.set(0);
+        self.recovery_arrived.set_bit(0);
 
         #[cfg(feature = "fec_rs")]
-        self.recovery_arrived.set(index);
+        self.recovery_arrived.set_bit(index);
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Default, Clone, Copy)]
 struct FecArrivedBitMap([u128; 2]);
-
-impl Default for FecArrivedBitMap {
-    fn default() -> Self {
-        Self([0; 2])
-    }
-}
 
 impl FecArrivedBitMap {
     #[inline]
-    fn set(&mut self, index: usize) {
+    fn set_bit(&mut self, index: usize) {
         self.0[index / 128] |= 1 << (index % 128);
     }
 
@@ -487,12 +436,12 @@ impl<'a> FingerprintMonitor<'a> {
     /// returns an Arc to the window for this session
     ///
     /// # Panics
-    /// This function panics if the session is not yet initialized - an invairant
+    /// This function panics if the session is not yet initialized - an Invariant
     pub async fn get(&self, session_id: &SessionId) -> Arc<FingerprintWindow> {
         let table = self.table.read().await;
         let Some(window) = table.get(session_id) else {
             panic!(
-                "Invairant broken while trying to get a `FingerprintWindow`:\
+                "Invariant broken while trying to get a `FingerprintWindow`:\
             {session_id} is not a valid session"
             );
         };
@@ -634,7 +583,7 @@ impl<'a> EncryptionMonitor<'a> {
             .get(session_id)
             .unwrap_or_else(|| {
                 panic!(
-                    "Invairant broken while accessing session table: \
+                    "Invariant broken while accessing session table: \
         session ({session_id}) does not have a key but is being accessed for encryption",
                 )
             })
@@ -652,7 +601,7 @@ impl<'a> EncryptionMonitor<'a> {
             .get(session_id)
             .unwrap_or_else(|| {
                 panic!(
-                    "Invairant broken while accessing session table: \
+                    "Invariant broken while accessing session table: \
         session ({session_id}) does not have a key but is being accessed for encryption",
                 )
             })
