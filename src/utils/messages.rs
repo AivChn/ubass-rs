@@ -8,20 +8,34 @@ use crate::{
     transport::types::ReceivedPacket,
 };
 
+pub struct AppResponseReceiver(oneshot::Receiver<AppResponse>);
+
+impl AppResponseReceiver {
+    pub async fn recv(self) -> AppResponse {
+        match self.0.await {
+            Err(_) => unreachable!(
+                "Invariant broken while receiving on oneshot from app layer: \
+                the sender was dropped before sending"
+            ),
+            Ok(response) => response,
+        }
+    }
+}
+
 pub struct OneShot<T: Send> {
     data: T,
     reply: oneshot::Sender<AppResponse>,
 }
 
 impl<T: Send> OneShot<T> {
-    pub fn new(value: T) -> (Self, oneshot::Receiver<AppResponse>) {
+    pub fn new(value: T) -> (Self, AppResponseReceiver) {
         let (sender, receiver) = oneshot::channel();
         (
             Self {
                 data: value,
                 reply: sender,
             },
-            receiver,
+            AppResponseReceiver(receiver),
         )
     }
 }
