@@ -2,6 +2,7 @@ mod inbound;
 mod key_exchange;
 mod outbound;
 pub mod packets;
+mod routines;
 mod state;
 pub mod types;
 
@@ -19,6 +20,7 @@ use crate::{
             IncompatibleVersionPacket, OptionFlags, Options, Packet, PacketFingerprint, PacketType,
             PublicKey, SessionId, Version,
         },
+        routines::*,
         state::{EncryptionTable, EncryptionWindow, GeneralStateTable, Port, SessionStates},
     },
     o_unwrap_or_return,
@@ -32,9 +34,10 @@ use tokio::{sync::RwLock, time::Instant};
 pub use state::{AppId, EncryptionMonitor, FingerprintMonitor, PendingAckMonitor};
 use types::*;
 
-static STATE: OnceLock<SessionStates> = OnceLock::new();
+pub static STATE: OnceLock<SessionStates> = OnceLock::new();
 
-macro_rules! state {
+#[macro_export]
+macro_rules! get_state {
     () => {
         STATE.get().expect("State accessed before protocol open")
     };
@@ -80,34 +83,13 @@ async fn connect(address: SocketAddr, other_app_id: AppId, outbound_sender: Outb
     let session_id = SessionId::generate();
     let (ephemeral_secret, public_key) = key_exchange::create();
 
-    state!()
+    get_state!()
         .new_session(session_id, address, other_app_id)
         .await;
 
-    state!().new_handshake(address, ephemeral_secret);
+    get_state!().new_handshake(address, ephemeral_secret);
 
     send_hello_packet(address, session_id, public_key, outbound_sender).await;
-}
-
-async fn send_hello_packet(
-    address: SocketAddr,
-    session_id: SessionId,
-    public_key: impl Into<PublicKey>,
-    sender: OutboundSender,
-) {
-    let hello_packet = Box::new(HelloPacket::new(
-        Options::none(),
-        session_id,
-        public_key.into(),
-        state!().app_id(),
-        state!().port(),
-    ));
-
-    sender
-        .send(PacketProcessingMessage::SendPacket(
-            Packet::HelloPacket(hello_packet).wrap(address),
-        ))
-        .await;
 }
 
 /// Routine to handle the case of receiving any [`HelloPacket`].
@@ -125,7 +107,7 @@ async fn received_hello_packet(
 ) {
     // setting the address to the one saved in state
     src_addr.set_port(*packet.receiving_port);
-    if lock_read!(state!().handshakes).contains_key(&src_addr) {
+    if lock_read!(get_state!().handshakes).contains_key(&src_addr) {
         received_hello_packet_as_initializer(packet, src_addr, outbound_sender, app_sender).await;
     } else {
         received_hello_packet_as_receiver(packet, src_addr, outbound_sender, app_sender).await;
@@ -156,40 +138,40 @@ async fn received_hello_packet_as_receiver(
     match receiver.recv().await {
         // send back app rejected error
         AppResponse::AppRejected(message) => {
-            let rejected_packet = Box::new(AppRejectErrorPacket::new(
+            send_app_rejected_error_packet(
+                src_addr,
                 Options::none(),
                 packet.proposed_session_id,
                 PacketType::Host,
                 ControlType::Host(HostControlType::Hello),
-                PacketFingerprint::from(&packet),
+                &packet,
                 message,
-            ));
-
-            outbound_sender
-                .send(PacketProcessingMessage::SendPacket(
-                    Packet::AppRejectErrorPacket(rejected_packet).wrap(src_addr),
-                ))
-                .await;
+                outbound_sender,
+            )
+            .await;
         }
 
         // create session and send back hello packet
         AppResponse::AppApproved(host_app_id) => {
             // handle collisions
-            let session_id = if state!().session_exists(packet.proposed_session_id).await {
+            let session_id = if get_state!()
+                .session_exists(packet.proposed_session_id)
+                .await
+            {
                 SessionId::generate()
             } else {
                 packet.proposed_session_id
             };
 
             // create session
-            state!()
+            get_state!()
                 .new_session(session_id, src_addr, packet.app_id)
                 .await;
 
             // create encryption entry
             let (ephemeral_secret, public_key) = key_exchange::create();
             let key = key_exchange::get_shared_secret(ephemeral_secret, packet.public_key);
-            lock_write!(state!().encryption).insert(
+            lock_write!(get_state!().encryption).insert(
                 session_id,
                 EncryptionWindow::new(Aes256GcmSiv::new((&key).into())),
             );
@@ -224,7 +206,10 @@ async fn received_hello_packet_as_initializer(
 ) {
     // if the session ID is already used that means that there was overlap on both hosts on both
     // attempts. This astronomically unlikely but is possible, so it's accounted for by restarting.
-    if state!().session_exists(packet.proposed_session_id).await {
+    if get_state!()
+        .session_exists(packet.proposed_session_id)
+        .await
+    {
         connect(src_addr, packet.app_id, outbound_sender).await;
         return;
     }
@@ -232,14 +217,14 @@ async fn received_hello_packet_as_initializer(
     // get packet fingerprint before any partial moves
     let fingerprint = PacketFingerprint::from(&packet);
 
-    let secret = state!()
+    let secret = get_state!()
         .promote_handshake(packet.proposed_session_id, src_addr, packet.app_id)
         .await;
     let key = key_exchange::get_shared_secret(secret, packet.public_key);
     let cipher = Aes256GcmSiv::new(&key.into());
 
     // insert cipher to state for any future encryption
-    lock_write!(state!().encryption)
+    lock_write!(get_state!().encryption)
         .insert(packet.proposed_session_id, EncryptionWindow::new(cipher));
 
     // construct ack and send

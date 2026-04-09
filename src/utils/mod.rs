@@ -63,6 +63,12 @@ pub trait Flags {
     fn contains(self, flag: Self::FlagType) -> bool;
 }
 
+pub trait SendPacket {
+    type Sender;
+
+    fn send(self: Box<Self>, sender: Self::Sender);
+}
+
 pub struct W<T>(pub T);
 
 pub struct HandleMonitor {
