@@ -66,7 +66,7 @@ impl From<&FECPacket> for Arc<Mutex<OutboundBatchData>> {
 impl From<(u8, &FECPacket, &[u8])> for ParityPacket {
     fn from(value: (u8, &FECPacket, &[u8])) -> Self {
         let (i, packet, payload) = value;
-        ParityPacket::new(
+        *ParityPacket::new(
             Options::construct(&[]),
             packet.batch_id,
             FECInfo::new(

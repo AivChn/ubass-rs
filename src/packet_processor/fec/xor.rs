@@ -214,7 +214,7 @@ impl Xor {
             let fec_info = FECInfo::new(packet.fec_info.batch_size, 0, 1);
             let session_id = packet.session_id;
 
-            Some(vec![ParityPacket::new(
+            Some(vec![*ParityPacket::new(
                 opts,
                 packet.batch_id,
                 fec_info,
