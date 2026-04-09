@@ -14,6 +14,7 @@ use crate::{
 };
 
 use types::{InboundChannels, OutboundChannels};
+
 /// initialize the packet processor
 ///
 /// # Errors
@@ -25,9 +26,9 @@ pub async fn init(
     p_sender: InboundSender,
     t_receiver: InboundReceiver,
     t_sender: OutboundSender,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
-    fingerprint_monitor: &'static FingerprintMonitor<'_>,
-    pending_ack_monitor: &'static PendingAckMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
+    fingerprint_monitor: FingerprintMonitor,
+    pending_ack_monitor: PendingAckMonitor,
 ) -> ErrResult {
     let mut inbound_handle = tokio::spawn(inbound::init(
         InboundChannels {
@@ -48,13 +49,16 @@ pub async fn init(
     ));
 
     tokio::select! {
-        res = &mut inbound_handle, if !inbound_handle.is_finished() => {
+        res = &mut inbound_handle => {
+            _ = t_sender.send(TransportMessage::Close).await;
+            _ = outbound_handle.await;
             match res {
                 Err(_) => Err(TaskError::TaskFailed.into()),
                 Ok(res) =>  res,
             }
         },
-        res = &mut outbound_handle, if !outbound_handle.is_finished() => {
+        res = &mut outbound_handle => {
+            inbound_handle.abort();
             match res {
                 Err(_) => Err(TaskError::TaskFailed.into()),
                 Ok(res) => res,

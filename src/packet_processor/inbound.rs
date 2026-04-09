@@ -19,8 +19,8 @@ pub async fn init(
         mut t_receiver,
         p_sender,
     }: InboundChannels,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
-    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
+    fingerprint_monitor: FingerprintMonitor,
 ) -> ErrResult {
     loop {
         let mut buffer = Vec::with_capacity(16);
@@ -61,8 +61,8 @@ pub async fn init(
 async fn handle_packet(
     packet: ReceivedPacket,
     sender: InboundSender,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
-    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
+    fingerprint_monitor: FingerprintMonitor,
 ) {
     let version = r_unwrap_or_return!(Version::deserialize(&packet.data));
 
@@ -71,7 +71,7 @@ async fn handle_packet(
             r_unwrap_or_return!(IncompatibleVersionPacket::deserialize(&packet.data));
         tokio::spawn(send_up(
             Ok(ManagerMessage::Packet(
-                Packet::IncompatibleVersion(Box::new(ready_packet)).wrap(packet.src_addr),
+                Packet::IncompatibleVersionPacket(Box::new(ready_packet)).wrap(packet.src_addr),
             )),
             sender.clone(),
         ));
@@ -109,8 +109,8 @@ async fn handle_packet(
 async fn deserialize_and_decrypt(
     packet_type: PacketType,
     mut data: Vec<u8>,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
-    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
+    fingerprint_monitor: FingerprintMonitor,
 ) -> core::result::Result<Packet, ()> {
     let session_id = SessionId::deserialize(&data[SESSION_ID_OFFSET..])?;
 
@@ -166,8 +166,8 @@ async fn deserialize_and_decrypt(
 async fn deserialize_and_auth_control_packet(
     mut data: Vec<u8>,
     session_id: SessionId,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
-    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
+    fingerprint_monitor: FingerprintMonitor,
 ) -> core::result::Result<Packet, ()> {
     Ok(
         match ControlType::deserialize(&data[SECONDARY_TYPE_OFFSET..])? {
@@ -214,8 +214,8 @@ async fn deserialize_and_auth_control_packet(
 async fn deserialize_and_auth_error_packet(
     mut data: Vec<u8>,
     session_id: SessionId,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
-    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
+    fingerprint_monitor: FingerprintMonitor,
 ) -> core::result::Result<Packet, ()> {
     Ok(
         match ErrorType::deserialize(&data[SECONDARY_TYPE_OFFSET..])? {
@@ -254,7 +254,7 @@ async fn deserialize_and_auth_error_packet(
 async fn authenticate(
     packet: &mut Vec<u8>,
     session_id: SessionId,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
 ) -> core::result::Result<(), ()> {
     if encryption::authenticate(packet, session_id, encryption_monitor).await {
         Ok(())
@@ -266,7 +266,7 @@ async fn authenticate(
 async fn dedup_no_payload(
     packet: Vec<u8>,
     session_id: SessionId,
-    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+    fingerprint_monitor: FingerprintMonitor,
 ) -> Option<Vec<u8>> {
     let fingerprint = Box::new((&packet).into());
     let window = fingerprint_monitor.get(&session_id).await;
@@ -281,7 +281,7 @@ async fn dedup_no_payload(
 async fn dedup_with_payload<T: Headers>(
     packet: Box<T>,
     session_id: SessionId,
-    fingerprint_monitor: &'static FingerprintMonitor<'_>,
+    fingerprint_monitor: FingerprintMonitor,
 ) -> Option<Box<T>> {
     let window = fingerprint_monitor.get(&session_id).await;
     let fingerprint: Box<PacketFingerprint> = Box::new(packet.as_ref().into());

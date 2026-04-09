@@ -61,8 +61,8 @@ pub async fn init(
         p_sender,
         mut p_receiver,
     }: OutboundChannels,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
-    pending_ack_monitor: &'static PendingAckMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
+    pending_ack_monitor: PendingAckMonitor,
 ) -> ErrResult {
     // initialize handle monitor
     let monitor = Arc::from(HandleMonitor::default());
@@ -118,8 +118,8 @@ async fn handle_received(
     p_sender: InboundSender,
     t_sender: OutboundSender,
     handle_monitor: Arc<HandleMonitor>,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
-    pending_ack_monitor: &'static PendingAckMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
+    pending_ack_monitor: PendingAckMonitor,
 ) {
     for packet in buffer {
         dispatch!(
@@ -140,9 +140,9 @@ async fn handle_packet(
     packet: PacketWrapper,
     p_sender: InboundSender,
     t_sender: OutboundSender,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
     handle_monitor: Arc<HandleMonitor>,
-    pending_ack_monitor: &'static PendingAckMonitor<'_>,
+    pending_ack_monitor: PendingAckMonitor,
 ) {
     let addr = packet.addr;
     let processed = match packet.packet {
@@ -161,7 +161,7 @@ async fn handle_packet(
             );
 
             let session_id = packet.session_id;
-            process_encrypted(packet, session_id, addr, encryption_monitor)
+            process_encrypted(packet, session_id, addr, encryption_monitor).await
         }
 
         //encrypted
@@ -169,13 +169,13 @@ async fn handle_packet(
             add_ack!(for TrackRequestPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            process_encrypted(packet, session_id, addr, encryption_monitor)
+            process_encrypted(packet, session_id, addr, encryption_monitor).await
         }
         Packet::AppRejectErrorPacket(packet) => {
             add_ack!(for AppRejectErrorPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            process_encrypted(packet, session_id, addr, encryption_monitor)
+            process_encrypted(packet, session_id, addr, encryption_monitor).await
         }
 
         // authenticated
@@ -183,13 +183,13 @@ async fn handle_packet(
             add_ack!(for RetransmitPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor)
+            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
         Packet::PlaybackStatusPacket(packet) => {
             add_ack!(for PlaybackStatusPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor)
+            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
         Packet::SessionDoesNotExistErrorPacket(packet) => {
             add_ack!(
@@ -199,16 +199,16 @@ async fn handle_packet(
             );
 
             let session_id = packet.session_id;
-            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor)
+            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
         // could not be acked
         Packet::UnexpectedPacketErrorPacket(packet) => {
             let session_id = packet.session_id;
-            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor)
+            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
         Packet::AckPacket(packet) => {
             let session_id = packet.session_id;
-            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor)
+            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
 
         // nothing
@@ -223,7 +223,7 @@ async fn handle_packet(
                 duplicate_count: 7,
             }
         }
-        Packet::IncompatibleVersion(packet) => {
+        Packet::IncompatibleVersionPacket(packet) => {
             let mut serialized;
             serialize!(packet -> serialized);
 
@@ -247,29 +247,29 @@ async fn handle_packet(
     send_packet_to_transport(processed, t_sender, p_sender).await;
 }
 
-fn process_encrypted(
+async fn process_encrypted(
     mut packet: Box<impl Encryptable + Serialize>,
     session_id: SessionId,
     addr: SocketAddr,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
 ) -> ProcessedPacket {
-    encryption::encrypt(packet.as_mut(), session_id, encryption_monitor);
+    encryption::encrypt(packet.as_mut(), session_id, encryption_monitor).await;
 
     let mut serialized;
     serialize!(packet -> serialized);
     processed!(serialized to addr as Error 3 times)
 }
 
-fn process_authenticated(
+async fn process_authenticated(
     packet: &impl Serialize,
     session_id: SessionId,
     addr: SocketAddr,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
 ) -> ProcessedPacket {
     let mut serialized;
     serialize!(packet -> serialized);
 
-    encryption::tag(&mut serialized, session_id, encryption_monitor);
+    encryption::tag(&mut serialized, session_id, encryption_monitor).await;
     processed!(serialized to addr as Error 3 times)
 }
 
@@ -285,7 +285,7 @@ async fn recover(session_id: SessionId, batch_id: BatchID, sender: InboundSender
 async fn add_pending_ack(
     packet: PacketWrapper,
     timestamp: Timestamp,
-    pending_ack_monitor: &'static PendingAckMonitor<'_>,
+    pending_ack_monitor: PendingAckMonitor,
 ) {
     let fingerprint: PacketFingerprint = r_unwrap_or_return!((&packet.packet).try_into());
 
@@ -299,7 +299,7 @@ async fn handle_fec(
     dest_addr: SocketAddr,
     p_sender: InboundSender,
     t_sender: OutboundSender,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
     handle_monitor: Arc<HandleMonitor>,
 ) {
     if let Some(parity_packets) = fec::sent(packet).await {
@@ -315,11 +315,11 @@ async fn handle_parity(
     dest_addr: SocketAddr,
     t_sender: OutboundSender,
     p_sender: InboundSender,
-    encryption_monitor: &'static EncryptionMonitor<'_>,
+    encryption_monitor: EncryptionMonitor,
 ) {
     let mut buffer;
     let session_id = packet.session_id;
-    encryption::encrypt(&mut packet, session_id, encryption_monitor);
+    encryption::encrypt(&mut packet, session_id, encryption_monitor).await;
     serialize!(packet -> buffer);
     let processed_packet = ProcessedPacket {
         dest_addr,
