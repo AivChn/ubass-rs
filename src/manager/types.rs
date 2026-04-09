@@ -1,32 +1,22 @@
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    hash::Hash,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::net::SocketAddr;
 
-use aes_gcm_siv::Aes256GcmSiv;
 use tokio::{
-    sync::{
-        Mutex, RwLock,
-        mpsc::{Receiver, Sender},
-    },
+    sync::mpsc::{Receiver, Sender},
     time::Instant,
 };
 
-use crate::{
-    manager::packets::{PacketFingerprint, PacketWrapper, SessionId},
-    packet_processor::serialize::Serialize,
-    prelude::*,
-};
+use crate::prelude::*;
 
-pub type OutboundReceiver = Receiver<Result<ManagerMessage>>;
+// processor channels
 pub type OutboundSender = Sender<PacketProcessingMessage>;
+pub type InboundReceiver = Receiver<Result<ManagerMessage>>;
 
-pub type AppSender = Sender<AppRequest>;
+// api channels
+pub type InboundSender = Sender<Result<AppMessage>>;
+pub type OutboundReceiver = Receiver<Result<ManagerMessage>>;
+
+#[derive(Clone, Copy)]
+pub struct Address(SocketAddr);
 
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
 #[repr(transparent)]
