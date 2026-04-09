@@ -25,7 +25,7 @@ fn get_nonce(session_id: SessionId, counter: [u8; 8]) -> [u8; 12] {
 pub async fn encrypt(
     packet: &mut impl Encryptable,
     session_id: SessionId,
-    monitor: &EncryptionMonitor<'_>,
+    monitor: EncryptionMonitor,
 ) {
     let (aad, payload) = (packet.headers(), packet.payload());
 
@@ -40,7 +40,7 @@ pub async fn encrypt(
 pub async fn decrypt(
     packet: &mut impl Encryptable,
     session_id: SessionId,
-    monitor: &EncryptionMonitor<'_>,
+    monitor: EncryptionMonitor,
 ) -> EmptyResult {
     let (aad, payload) = (packet.headers(), packet.payload());
 
@@ -61,7 +61,7 @@ pub async fn decrypt(
         .map_err(|_| ())
 }
 
-pub async fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: &EncryptionMonitor<'_>) {
+pub async fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: EncryptionMonitor) {
     let (cipher, counter) = monitor.get(&session_id).await;
     let nonce = Nonce::from(get_nonce(session_id, counter));
 
@@ -75,7 +75,7 @@ pub async fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: &Encrypti
 pub async fn authenticate(
     packet: &mut Vec<u8>,
     session_id: SessionId,
-    monitor: &EncryptionMonitor<'_>,
+    monitor: EncryptionMonitor,
 ) -> bool {
     let cipher = monitor.get_cipher(&session_id).await;
     let counter: [u8; 8] = packet[packet.len() - 8..]
