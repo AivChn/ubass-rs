@@ -10,28 +10,33 @@ path = "src/lib.rs"
 [features]
 default = ["fec_xor", "rust-api"]
 fec_xor = []
-fec_rs = []
 rust-api = []
 uniffi-api = []
 
 [dependencies]
-thiserror = "1"
-ubass_macros = { path = "ubass_macros"}
-uniffi = { version = "0.31.0", features = ["cli"]}
+thiserror = "2"
+ubass_macros = { path = "ubass_macros" }
+uniffi = { version = "0.31.0", features = ["cli"] }
 aes-gcm-siv = "0.11.1"
 futures = "0.3.31"
 reed-solomon-simd = "3.1.0"
-tokio = {version = "1.49.0", features=["full"]}
-derive_more = { version="2.1.1", features=["full"]}
+tokio = { version = "1.49.0", features = [
+  "rt",
+  "net",
+  "sync",
+  "time",
+  "macros",
+] }
+derive_more = { version = "2.1.1", features = ["full"] }
 async-trait = "0.1.89"
 x25519-dalek = "2.0.1"
 rand_core = "0.10.0"
-xxhash-rust = {version = "0.8.15", features = ["xxh3"]}
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 rand = "0.10.0"
 rustc-hash = "2.1.2"
 
 [build-dependencies]
-uniffi = { version = "0.31.0", features = ["build"]}
+uniffi = { version = "0.31.0", features = ["build"] }
 
 [dev-dependencies]
 anyhow = "1"

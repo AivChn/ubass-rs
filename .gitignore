@@ -4,3 +4,4 @@ claude.MD
 local
 cargo.lock
 /ubass_macros/target
+/Cargo.lock
