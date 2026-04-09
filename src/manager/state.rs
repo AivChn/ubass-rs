@@ -1,5 +1,5 @@
 #![allow(private_interfaces)]
-use aes_gcm_siv::{Aes256GcmSiv, aead::generic_array::sequence};
+use aes_gcm_siv::Aes256GcmSiv;
 use derive_more::Deref;
 use tokio::sync::{Mutex, RwLock};
 use x25519_dalek::EphemeralSecret;
@@ -7,19 +7,17 @@ use x25519_dalek::EphemeralSecret;
 use crate::{
     lock_read, lock_write,
     manager::packets::{BatchID, PacketFingerprint, PacketWrapper, SessionId},
-    o_unwrap_or_return,
     prelude::*,
-    r_unwrap_or_return,
 };
 use core::panic;
 use std::{
     collections::{HashSet, VecDeque},
-    marker::PhantomData,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -39,6 +37,7 @@ pub struct SessionPortTable(RwLock<HashMap<SessionId, SocketAddr>>);
 pub struct SessionStates {
     app_id: AppId,
     port: Port,
+    handles: Option<LayerHandles>,
     pub general: GeneralStateTable,
     pub handshakes: HandshakeStateTable,
     pub ack: PendingAckTable,
@@ -50,10 +49,16 @@ pub struct SessionStates {
 }
 
 impl SessionStates {
-    pub fn new(port: Port, app_id: AppId) -> Self {
+    pub fn new(
+        port: Port,
+        app_id: AppId,
+        transport_handle: JoinHandle<()>,
+        processor_handle: JoinHandle<()>,
+    ) -> Self {
         Self {
             app_id,
             port,
+            handles: Some(LayerHandles::new(transport_handle, processor_handle)),
             general: GeneralStateTable::default(),
             handshakes: HandshakeStateTable::default(),
             ack: PendingAckTable::default(),
@@ -67,6 +72,20 @@ impl SessionStates {
 
     pub async fn new_handshake(&self, src_addr: SocketAddr, ephemeral_secret: EphemeralSecret) {
         lock_write!(self.handshakes).insert(src_addr, HandshakeState { ephemeral_secret });
+    }
+
+    /// Joins both layer threads.
+    /// **DANGEROUS**: This function blocks the entire async runtime, only use if the protocol is
+    /// shutting down, when no other tasks need to be done.
+    pub fn join_layers(&mut self) {
+        let handles = self.handles.take().unwrap_or_else(|| {
+            panic!(
+                "Invariant broken while joining the layer threads: \
+            function was called more than once"
+            )
+        });
+
+        handles.blocking_join();
     }
 
     pub async fn promote_handshake(
@@ -84,7 +103,8 @@ impl SessionStates {
                 )
             });
 
-        self.new_session(new_session_id, address, app_id).await;
+        self.new_session(SessionStateFlags::none(), new_session_id, address, app_id)
+            .await;
 
         ephemeral_secret
     }
@@ -101,14 +121,20 @@ impl SessionStates {
         lock_read!(self.general).contains_key(&session_id)
     }
 
-    pub async fn new_session(&self, session_id: SessionId, address: SocketAddr, app_id: AppId) {
+    pub async fn new_session(
+        &self,
+        flags: SessionStateFlags,
+        session_id: SessionId,
+        address: SocketAddr,
+        app_id: AppId,
+    ) {
         lock_write!(self.handshakes).remove(&address);
         lock_write!(self.general).insert(
             session_id,
             GeneralSessionState {
                 last_activity_time: Timestamp::now(),
                 last_key_rotation_time: Timestamp::now(),
-                flags: SessionStateFlags::none(),
+                flags,
             },
         );
 
@@ -122,9 +148,37 @@ impl SessionStates {
     }
 }
 
+struct LayerHandles {
+    transport: JoinHandle<()>,
+    processor: JoinHandle<()>,
+}
+
+impl LayerHandles {
+    fn new(transport: JoinHandle<()>, processor: JoinHandle<()>) -> Self {
+        Self {
+            transport,
+            processor,
+        }
+    }
+
+    /// Joins both layers
+    /// **DANGEROUS**: This function blocks the entire async runtime, only use if the protocol is
+    /// shutting down, when no other tasks need to be done.
+    fn blocking_join(self) {
+        self.transport.join();
+        self.processor.join();
+    }
+}
+
 #[derive(Serialize, Deref, Clone, Copy)]
 #[repr(transparent)]
 pub struct Port(u16);
+
+impl Port {
+    pub fn new(port: u16) -> Self {
+        Port(port)
+    }
+}
 
 impl From<SocketAddr> for Port {
     fn from(value: SocketAddr) -> Self {
@@ -156,14 +210,15 @@ struct GeneralSessionState {
 #[derive(PartialEq, Clone, Copy)]
 #[repr(u32)]
 #[variants_array]
-enum SessionStateFlag {
+pub enum SessionStateFlag {
+    Hanshake = 1 << 1,
     CurrentlyStreamingFrom = 1 << 5,
     CurrentlyStreamingTo = 1 << 6,
 }
 
 #[derive(Serialize, Debug, PartialEq, Clone, Copy)]
 #[repr(transparent)]
-struct SessionStateFlags(u32);
+pub struct SessionStateFlags(u32);
 
 impl Flags for SessionStateFlags {
     type FlagType = SessionStateFlag;
@@ -183,13 +238,11 @@ impl Flags for SessionStateFlags {
         Self(0)
     }
 
-    #[must_use]
     fn unset(mut self, flag: Self::FlagType) -> Self {
         self.0 &= !(flag as u32);
         self
     }
 
-    #[must_use]
     fn set(mut self, flag: Self::FlagType) -> Self {
         self.0 |= flag as u32;
         self
@@ -240,10 +293,9 @@ impl From<&str> for AppId {
     fn from(value: &str) -> Self {
         debug_assert!(
             value.is_ascii(),
-            "Invariant broken while constructing `AppId` from &str: \
+            "Invariant broken while constructing `AppId`: \
             The ID is not a valid ascii sequence: {value}"
         );
-
         Self(String::from(value))
     }
 }
@@ -259,7 +311,12 @@ impl Serialize for AppId {
     }
 
     fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
-        Ok(AppId(String::from_utf8(Vec::from(bytes)).map_err(|_| ())?))
+        let id = String::from_utf8(Vec::from(bytes)).map_err(|_| ())?;
+        if id.is_ascii() {
+            Ok(AppId::new(id))
+        } else {
+            Err(())
+        }
     }
 
     fn sized(&self) -> usize {
@@ -272,7 +329,7 @@ impl SessionPortTable {
         self.read().await.contains_key(&id)
     }
 
-    pub async fn update(&self, id: SessionId, mut address: SocketAddr) {
+    pub async fn update(&self, id: SessionId, address: SocketAddr) {
         self.write()
             .await
             .entry(id)
@@ -318,7 +375,7 @@ impl FecBatchWindow {
         #[cfg(feature = "fec_xor")]
         self.recovery_arrived.set_bit(0);
 
-        #[cfg(feature = "fec_rs")]
+        #[cfg(not(feature = "fec_xor"))]
         self.recovery_arrived.set_bit(index);
     }
 }
@@ -327,18 +384,21 @@ impl FecBatchWindow {
 struct FecArrivedBitMap([u128; 2]);
 
 impl FecArrivedBitMap {
+    /// Sets the bit of the given index
     #[inline]
     fn set_bit(&mut self, index: usize) {
         self.0[index / 128] |= 1 << (index % 128);
     }
 
+    /// Returns true if enough bits are set based on a specified threshold
     #[inline]
     fn enough_set(&self, threshold: u8) -> bool {
         self.0[0].count_ones() + self.0[1].count_ones() >= threshold as u32
     }
 
+    /// Returns true if the bit under the specified index is set
     #[inline]
-    fn contains(&self, index: usize) -> bool {
+    fn is_set(&self, index: usize) -> bool {
         (self.0[index / 128] >> (index % 128)) % 2 == 1
     }
 }
@@ -374,12 +434,13 @@ impl PendingAck {
     }
 }
 
-pub struct PendingAckMonitor<'a> {
-    table: &'a PendingAckTable,
+#[derive(Clone, Copy)]
+pub struct PendingAckMonitor {
+    table: &'static PendingAckTable,
 }
 
-impl<'a> PendingAckMonitor<'a> {
-    pub fn new(table: &'a PendingAckTable) -> Self {
+impl PendingAckMonitor {
+    pub fn new(table: &'static PendingAckTable) -> Self {
         Self { table }
     }
 
@@ -419,12 +480,13 @@ impl core::hash::Hash for FingerprintPtr {
     }
 }
 
-pub struct FingerprintMonitor<'a> {
-    table: &'a FingerprintTable,
+#[derive(Clone, Copy)]
+pub struct FingerprintMonitor {
+    table: &'static FingerprintTable,
 }
 
-impl<'a> FingerprintMonitor<'a> {
-    pub fn new(table: &'a FingerprintTable) -> Self {
+impl FingerprintMonitor {
+    pub fn new(table: &'static FingerprintTable) -> Self {
         Self { table }
     }
 
@@ -563,12 +625,13 @@ impl EncryptionWindow {
     }
 }
 
-pub struct EncryptionMonitor<'a> {
-    table: &'a EncryptionTable,
+#[derive(Clone, Copy)]
+pub struct EncryptionMonitor {
+    table: &'static EncryptionTable,
 }
 
-impl<'a> EncryptionMonitor<'a> {
-    fn new(table: &'a EncryptionTable) -> Self {
+impl EncryptionMonitor {
+    pub fn new(table: &'static EncryptionTable) -> Self {
         Self { table }
     }
 
