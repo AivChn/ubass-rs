@@ -7,32 +7,37 @@ mod state;
 pub mod types;
 
 use std::{
-    cell::OnceCell,
     net::SocketAddr,
-    sync::{LazyLock, OnceLock},
+    sync::{OnceLock, mpsc as std_mpsc},
+    thread::JoinHandle,
 };
 
 use crate::{
-    DEFAULT_PORT, lock_read, lock_write,
+    DEFAULT_PORT,
+    api::ApiErrors,
+    lock_read, lock_write,
     manager::{
+        self,
         packets::{
             AckPacket, AppRejectErrorPacket, ControlType, HelloPacket, HostControlType,
-            IncompatibleVersionPacket, OptionFlags, Options, Packet, PacketFingerprint, PacketType,
-            PublicKey, SessionId, Version,
+            IncompatibleVersionPacket, Options, PacketFingerprint, PacketType, SessionId, Version,
         },
-        routines::*,
-        state::{EncryptionTable, EncryptionWindow, GeneralStateTable, Port, SessionStates},
+        state::{EncryptionWindow, Port, SessionStateFlag, SessionStateFlags, SessionStates},
     },
-    o_unwrap_or_return,
-    packet_processor::fingerprint,
+    packet_processor::{self},
     prelude::*,
+    transport::{self, types::TransportChannels},
 };
 
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
-use tokio::{sync::RwLock, time::Instant};
+use tokio::{runtime::Builder as RuntimeBuilder, sync::mpsc, time::Instant};
 
 pub use state::{AppId, EncryptionMonitor, FingerprintMonitor, PendingAckMonitor};
 use types::*;
+
+/// random number, might change
+// TODO: put some thought into this number
+const CHANNEL_BUFFER_SIZE: usize = 128;
 
 pub static STATE: OnceLock<SessionStates> = OnceLock::new();
 
@@ -43,53 +48,215 @@ macro_rules! get_state {
     };
 }
 
-pub fn init() {
-    PROTOCOL_EPOCH.get_or_init(Instant::now);
+pub fn open(
+    port: u16,
+    app_id: AppId,
+) -> core::result::Result<JoinHandle<core::result::Result<(), ApiErrors>>, ApiErrors> {
+    let (mos, mor): (std_mpsc::SyncSender<core::result::Result<(), ApiErrors>>, _) =
+        std_mpsc::sync_channel(1);
+
+    // ============= manager =======================
+    let manager_handle = std::thread::spawn(move || {
+        let thread_name = "Manager";
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .thread_name(thread_name)
+            .build()
+            .map_err(ApiErrors::FailedToBuildRuntime);
+
+        match runtime {
+            Err(e) => {
+                mos.send(Err(e));
+                Err(ApiErrors::ThreadFailed(thread_name))
+            }
+            Ok(runtime) => {
+                mos.send(Ok(()));
+                runtime.block_on(async { init(port, app_id).await })
+            }
+        }
+    });
+
+    mor.recv().expect(
+        "Invariant broken while receiving on sync oneshot channel for manager:\
+                            Channel closed before sending",
+    )?;
+
+    Ok(manager_handle)
 }
 
-pub fn open(port: Port, app_id: AppId) {
-    STATE.set(SessionStates::new(port, app_id));
+#[inline]
+pub fn encryption_monitor() -> EncryptionMonitor {
+    EncryptionMonitor::new(&get_state!().encryption)
+}
+
+#[inline]
+pub fn fingerprint_monitor() -> FingerprintMonitor {
+    FingerprintMonitor::new(&get_state!().fingerprints)
+}
+
+#[inline]
+pub fn pending_ack_monitor() -> PendingAckMonitor {
+    PendingAckMonitor::new(&get_state!().ack)
+}
+
+async fn setup_layers(
+    port: u16,
+    processor_to_manager: packet_processor::types::InboundSender,
+    processor_from_manager: packet_processor::types::OutboundReceiver,
+) -> core::result::Result<(JoinHandle<()>, JoinHandle<()>), ApiErrors> {
+    // create all the channels for the layers
+    let (transport_to_processor, processor_from_transport): (transport::types::InboundSender, _) =
+        mpsc::channel(CHANNEL_BUFFER_SIZE);
+    let (processor_to_transport, transport_from_processor): (
+        packet_processor::types::OutboundSender,
+        _,
+    ) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+
+    // ============= packet_processor =======================
+    // create psuedo oneshot channel to get errors without disrupting the thread if succeeded
+    let (pos, por): (std_mpsc::SyncSender<core::result::Result<(), ApiErrors>>, _) =
+        std_mpsc::sync_channel(1);
+
+    // initialize the processor layer
+    let processor_handle = std::thread::spawn(move || {
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .thread_name("Packet Processor")
+            .build()
+            .map_err(ApiErrors::FailedToBuildRuntime);
+
+        match runtime {
+            Err(e) => _ = pos.send(Err(e)),
+            Ok(runtime) => {
+                pos.send(Ok(()));
+                runtime.block_on(async {
+                    packet_processor::init(
+                        processor_from_manager,
+                        processor_to_manager,
+                        processor_from_transport,
+                        processor_to_transport,
+                        encryption_monitor(),
+                        fingerprint_monitor(),
+                        pending_ack_monitor(),
+                    )
+                    .await;
+                })
+            }
+        };
+    });
+
+    // wait on response from channel and return if error
+    por.recv().expect(
+        "Invariant broken while receiving on sync oneshot channel for packet processor:\
+                            Channel closed before sending",
+    )?;
+
+    // ============= transport =======================
+    let (tos, tor): (std_mpsc::SyncSender<core::result::Result<(), ApiErrors>>, _) =
+        std_mpsc::sync_channel(1);
+
+    // initialize the transport layer
+    let transport_handle = std::thread::spawn(move || {
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .thread_name("Transport")
+            .build()
+            .map_err(ApiErrors::FailedToBuildRuntime);
+
+        match runtime {
+            Err(e) => _ = tos.send(Err(e)),
+            Ok(runtime) => {
+                tos.send(Ok(()));
+                runtime.block_on(async {
+                    transport::init(
+                        port,
+                        TransportChannels {
+                            receiver: transport_from_processor,
+                            sender: transport_to_processor,
+                        },
+                    )
+                    .await
+                });
+            }
+        };
+    });
+
+    tor.recv().expect(
+        "Invariant broken while receiving on sync oneshot channel for transport:\
+                            Channel closed before sending",
+    )?;
+
+    Ok((transport_handle, processor_handle))
+}
+
+pub async fn init(port: u16, app_id: AppId) -> core::result::Result<(), ApiErrors> {
+    // try to create receiving socket
+    std::net::UdpSocket::bind(format!("0.0.0.0:{port}"))
+        .map_err(|_| ApiErrors::PortAlreadyInUse(port))?;
+
+    let (manager_to_processor, processor_from_manager): (manager::OutboundSender, _) =
+        mpsc::channel(CHANNEL_BUFFER_SIZE);
+    let (processor_to_manager, manager_from_processor): (
+        packet_processor::types::InboundSender,
+        _,
+    ) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+
+    let (transport_handle, processor_handle) =
+        setup_layers(port, processor_to_manager, processor_from_manager).await?;
+
+    STATE.set(SessionStates::new(
+        Port::new(port),
+        app_id,
+        transport_handle,
+        processor_handle,
+    ));
+    PROTOCOL_EPOCH.set(Instant::now());
+
+    // TODO: implement selecting logic for manager layer
+
+    Ok(())
 }
 
 /// Routine to handle an incompatible version error, occuring during deserialization.
 /// The function sends an `IncompatibleVersionPacket` to the source, doing a reasonable effort to
 /// make sure the packet arrives by sending it to the default port as well.
-// TODO: Finish this
 async fn received_incompatible_version_error(
-    version: Version,
+    _version: Version,
     src_addr: SocketAddr,
     sender: OutboundSender,
 ) {
-    let packet = Packet::IncompatibleVersion(Box::new(IncompatibleVersionPacket::packet()));
+    let packet = IncompatibleVersionPacket::packet();
 
     if src_addr.port() != DEFAULT_PORT {
         let mut alternative_address = src_addr;
         alternative_address.set_port(DEFAULT_PORT);
-        sender
-            .send(PacketProcessingMessage::SendPacket(
-                packet.clone().wrap(alternative_address),
-            ))
+        packet
+            .clone()
+            .send(sender.clone(), alternative_address)
             .await;
     }
 
-    sender
-        .send(PacketProcessingMessage::SendPacket(
-            packet.clone().wrap(src_addr),
-        ))
-        .await;
+    packet.send(sender, src_addr).await;
 }
 
-async fn connect(address: SocketAddr, other_app_id: AppId, outbound_sender: OutboundSender) {
+/// Root Routine for the [`API::connect`] endpoint.
+/// This function creates a handshake entry and sends a [`HelloPacket`] to the given address,
+/// assuming that is the receiving port for the host.
+async fn connect(address: SocketAddr, outbound_sender: OutboundSender) {
     let session_id = SessionId::generate();
     let (ephemeral_secret, public_key) = key_exchange::create();
 
-    get_state!()
-        .new_session(session_id, address, other_app_id)
-        .await;
-
     get_state!().new_handshake(address, ephemeral_secret);
 
-    send_hello_packet(address, session_id, public_key, outbound_sender).await;
+    HelloPacket::new(
+        Options::none(),
+        session_id,
+        public_key.into(),
+        get_state!().app_id(),
+        get_state!().port(),
+    )
+    .send(outbound_sender, address)
+    .await;
 }
 
 /// Routine to handle the case of receiving any [`HelloPacket`].
@@ -103,12 +270,12 @@ async fn received_hello_packet(
     packet: HelloPacket,
     mut src_addr: SocketAddr,
     outbound_sender: OutboundSender,
-    app_sender: AppSender,
+    app_sender: InboundSender,
 ) {
     // setting the address to the one saved in state
     src_addr.set_port(*packet.receiving_port);
     if lock_read!(get_state!().handshakes).contains_key(&src_addr) {
-        received_hello_packet_as_initializer(packet, src_addr, outbound_sender, app_sender).await;
+        received_hello_packet_as_initializer(packet, src_addr, outbound_sender).await;
     } else {
         received_hello_packet_as_receiver(packet, src_addr, outbound_sender, app_sender).await;
     }
@@ -126,33 +293,32 @@ async fn received_hello_packet(
 /// invariant is broken
 async fn received_hello_packet_as_receiver(
     packet: HelloPacket,
-    mut src_addr: SocketAddr,
+    src_addr: SocketAddr,
     outbound_sender: OutboundSender,
-    app_sender: AppSender,
+    app_sender: InboundSender,
 ) {
     // ask for permission to communicate with the giveb app ID
     let (request, receiver) = OneShot::new(packet.app_id.clone());
-    let wrapped = AppRequest::HelloAppId(request);
-    _ = app_sender.send(wrapped).await;
+    let wrapped = AppMessage::HelloAppId(request);
+    _ = app_sender.send(Ok(wrapped)).await;
 
     match receiver.recv().await {
         // send back app rejected error
         AppResponse::AppRejected(message) => {
-            send_app_rejected_error_packet(
-                src_addr,
+            AppRejectErrorPacket::new(
                 Options::none(),
                 packet.proposed_session_id,
                 PacketType::Host,
                 ControlType::Host(HostControlType::Hello),
-                &packet,
+                PacketFingerprint::from(&packet),
                 message,
-                outbound_sender,
             )
+            .send(outbound_sender, src_addr)
             .await;
         }
 
         // create session and send back hello packet
-        AppResponse::AppApproved(host_app_id) => {
+        AppResponse::AppApproved => {
             // handle collisions
             let session_id = if get_state!()
                 .session_exists(packet.proposed_session_id)
@@ -165,7 +331,12 @@ async fn received_hello_packet_as_receiver(
 
             // create session
             get_state!()
-                .new_session(session_id, src_addr, packet.app_id)
+                .new_session(
+                    SessionStateFlags::construct(&[SessionStateFlag::Hanshake]),
+                    session_id,
+                    src_addr,
+                    packet.app_id,
+                )
                 .await;
 
             // create encryption entry
@@ -176,7 +347,15 @@ async fn received_hello_packet_as_receiver(
                 EncryptionWindow::new(Aes256GcmSiv::new((&key).into())),
             );
 
-            send_hello_packet(src_addr, session_id, public_key, outbound_sender).await;
+            HelloPacket::new(
+                Options::none(),
+                session_id,
+                public_key.into(),
+                get_state!().app_id(),
+                get_state!().port(),
+            )
+            .send(outbound_sender, src_addr)
+            .await;
         }
     }
 }
@@ -202,7 +381,6 @@ async fn received_hello_packet_as_initializer(
     packet: HelloPacket,
     src_addr: SocketAddr,
     outbound_sender: OutboundSender,
-    app_sender: AppSender,
 ) {
     // if the session ID is already used that means that there was overlap on both hosts on both
     // attempts. This astronomically unlikely but is possible, so it's accounted for by restarting.
@@ -210,7 +388,7 @@ async fn received_hello_packet_as_initializer(
         .session_exists(packet.proposed_session_id)
         .await
     {
-        connect(src_addr, packet.app_id, outbound_sender).await;
+        connect(src_addr, outbound_sender).await;
         return;
     }
 
@@ -228,15 +406,7 @@ async fn received_hello_packet_as_initializer(
         .insert(packet.proposed_session_id, EncryptionWindow::new(cipher));
 
     // construct ack and send
-    let ack = Box::new(AckPacket::new(
-        Options::none(),
-        packet.proposed_session_id,
-        fingerprint,
-    ));
-
-    outbound_sender
-        .send(PacketProcessingMessage::SendPacket(
-            Packet::AckPacket(ack).wrap(src_addr),
-        ))
+    AckPacket::new(Options::none(), packet.proposed_session_id, fingerprint)
+        .send(outbound_sender, src_addr)
         .await;
 }
