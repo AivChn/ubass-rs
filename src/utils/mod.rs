@@ -1,8 +1,10 @@
 use std::{
+    net::SocketAddr,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 
+use async_trait::async_trait;
 use tokio::{sync::Mutex, task::JoinHandle};
 
 pub mod messages;
@@ -63,10 +65,11 @@ pub trait Flags {
     fn contains(self, flag: Self::FlagType) -> bool;
 }
 
+#[async_trait]
 pub trait SendPacket {
     type Sender;
 
-    fn send(self: Box<Self>, sender: Self::Sender);
+    async fn send(self: Box<Self>, sender: Self::Sender, address: SocketAddr);
 }
 
 pub struct W<T>(pub T);
