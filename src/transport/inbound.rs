@@ -7,10 +7,15 @@ use super::send_to_processing_layer;
 use super::types::{MAX_PACKET_SIZE, ReceivedPacket};
 
 pub async fn init(port: u16, sender: InboundSender) -> ErrResult {
+    let socket = match UdpSocket::bind(format!("0.0.0.0:{port}")).await {
+        Ok(socket) => socket,
+        Err(_) => {
+            _ = send_to_processing_layer(sender, Err(TransportError::FailedToBind.into())).await;
+            return Err(TransportError::FailedToBind.into());
+        }
+    };
+
     const MAX_ALLOWED_FAILS: u32 = 10;
-    let socket = UdpSocket::bind(format!("0.0.0.0:{port}"))
-        .await
-        .map_err(|_| TransportError::FailedToBind)?;
     let mut fail_count = 0u32;
 
     loop {
