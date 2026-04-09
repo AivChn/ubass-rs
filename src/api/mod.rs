@@ -1,8 +1,12 @@
+mod core;
+mod error;
 mod rust;
 mod uniffi;
 
-#[feature("rust-api")]
+pub(crate) use error::ApiErrors;
+
+#[cfg(feature = "rust-api")]
 pub use rust::*;
 
-#[feature("uniffi-api")]
+#[cfg(feature = "rust-api")]
 pub use uniffi::*;
