@@ -134,10 +134,10 @@ pub trait FECCompatible: Into<FECPacket> {}
 impl FECCompatible for DataPacket {}
 impl FECCompatible for ParityPacket {}
 
-#[cfg(all(feature = "fec_xor", not(feature = "fec_rs")))]
+#[cfg(feature = "fec_xor")]
 type FECImpl = xor::Xor;
 
-#[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
+#[cfg(not(feature = "fec_xor"))]
 type FECImpl = reed_solomon::RS;
 
 static FEC: LazyLock<FECImpl> = LazyLock::new(FECImpl::new);
