@@ -1,16 +1,15 @@
-use crate::{manager::state::Port, prelude::*};
-
-use core::ops::Deref;
-use std::{
-    fmt::Display,
-    net::{SocketAddr, SocketAddrV4},
+use crate::{
+    manager::{OutboundSender, state::Port},
+    prelude::*,
 };
 
+use core::ops::Deref;
+use std::{fmt::Display, net::SocketAddr};
+
 use crate::packet_processor::serialize::Serialize;
-use aes_gcm_siv::aead::{OsRng, rand_core::RngCore};
+use async_trait::async_trait;
 use derive_more::{Deref, Display};
 use rand::Rng;
-use tokio::time::Instant;
 
 use crate::manager::AppId;
 use crate::packet_processor::fingerprint::{Fingerprint, Headers, Payload};
@@ -32,7 +31,7 @@ pub enum Packet {
     AckPacket(Box<AckPacket>),
     RetransmitPacket(Box<RetransmitPacket>),
     PlaybackStatusPacket(Box<PlaybackStatusPacket>),
-    IncompatibleVersion(Box<IncompatibleVersionPacket>),
+    IncompatibleVersionPacket(Box<IncompatibleVersionPacket>),
     SessionDoesNotExistErrorPacket(Box<SessionDoesNotExistErrorPacket>),
     UnexpectedPacketErrorPacket(Box<UnexpectedPacketErrorPacket>),
     AppRejectErrorPacket(Box<AppRejectErrorPacket>),
@@ -62,7 +61,7 @@ impl TryFrom<&Packet> for PacketFingerprint {
     }
 }
 
-#[derive(Clone, Serialize, Headers)]
+#[derive(SendPacket, Clone, Serialize, Headers)]
 pub struct HelloPacket {
     pub version: Version,
     pub opts: Options,
@@ -83,14 +82,14 @@ impl HelloPacket {
         public_key: PublicKey,
         app_id: AppId,
         receiving_port: Port,
-    ) -> Self {
+    ) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Host;
         let control_type = ControlType::Host(HostControlType::Hello);
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -101,11 +100,11 @@ impl HelloPacket {
             public_key,
             receiving_port,
             app_id,
-        }
+        })
     }
 }
 
-#[derive(Headers, Payload, Serialize, Clone)]
+#[derive(SendPacket, Headers, Payload, Serialize, Clone)]
 pub struct TrackRequestPacket {
     pub version: Version,
     pub opts: Options,
@@ -119,7 +118,7 @@ pub struct TrackRequestPacket {
 
 impl TrackRequestPacket {
     #[must_use]
-    pub fn request_track(opts: Options, session_id: SessionId, payload: Vec<u8>) -> Self {
+    pub fn request_track(opts: Options, session_id: SessionId, payload: Vec<u8>) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
         let packet_type = PacketType::Session;
@@ -127,7 +126,7 @@ impl TrackRequestPacket {
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -136,11 +135,11 @@ impl TrackRequestPacket {
             session_id,
             timestamp,
             payload,
-        }
+        })
     }
 
     #[must_use]
-    pub fn request_metadata(opts: Options, session_id: SessionId, payload: Vec<u8>) -> Self {
+    pub fn request_metadata(opts: Options, session_id: SessionId, payload: Vec<u8>) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
         let packet_type = PacketType::Session;
@@ -148,7 +147,7 @@ impl TrackRequestPacket {
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -157,11 +156,11 @@ impl TrackRequestPacket {
             session_id,
             timestamp,
             payload,
-        }
+        })
     }
 }
 
-#[derive(Headers, Payload, Serialize, Clone)]
+#[derive(SendPacket, Headers, Payload, Serialize, Clone)]
 pub struct DataPacket {
     pub version: Version,
     pub opts: Options,
@@ -186,12 +185,12 @@ impl DataPacket {
         session_id: SessionId,
         byte_range_start: BytePosition,
         payload: Vec<u8>,
-    ) -> Self {
+    ) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Data;
         let timestamp = Timestamp::now();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -201,11 +200,11 @@ impl DataPacket {
             timestamp,
             byte_range_start,
             payload,
-        }
+        })
     }
 }
 
-#[derive(Clone, Headers, Payload, Serialize)]
+#[derive(SendPacket, Clone, Headers, Payload, Serialize)]
 pub struct MetadataPacket {
     pub version: Version,
     pub opts: Options,
@@ -231,7 +230,7 @@ impl MetadataPacket {
         buffer_size: BufferSize,
         position: BytePosition,
         payload: Vec<u8>,
-    ) -> Self {
+    ) -> Box<Self> {
         debug_assert!(
             position.0 < buffer_size.0,
             "Invariant broken while constructing `MetadataPacket`: \
@@ -242,7 +241,7 @@ impl MetadataPacket {
         let packet_type = PacketType::Metadata;
         let timestamp = Timestamp::now();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -254,11 +253,11 @@ impl MetadataPacket {
             buffer_size,
             position,
             payload,
-        }
+        })
     }
 }
 
-#[derive(Clone, Headers, Payload, Serialize)]
+#[derive(SendPacket, Clone, Headers, Payload, Serialize)]
 pub struct ParityPacket {
     pub version: Version,
     pub opts: Options,
@@ -282,12 +281,12 @@ impl ParityPacket {
         fec_info: FECInfo,
         session_id: SessionId,
         payload: Vec<u8>,
-    ) -> Self {
+    ) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Parity;
         let timestamp = Timestamp::now();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -296,11 +295,11 @@ impl ParityPacket {
             session_id,
             timestamp,
             payload,
-        }
+        })
     }
 }
 
-#[derive(Clone, Serialize, Headers)]
+#[derive(SendPacket, Clone, Serialize, Headers)]
 pub struct PlaybackStatusPacket {
     pub version: Version,
     pub opts: Options,
@@ -313,7 +312,7 @@ pub struct PlaybackStatusPacket {
 
 impl PlaybackStatusPacket {
     #[inline]
-    fn new(opts: Options, session_id: SessionId, playback_type: PlaybackControlType) -> Self {
+    fn new(opts: Options, session_id: SessionId, playback_type: PlaybackControlType) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
         let packet_type = PacketType::Playback;
@@ -321,7 +320,7 @@ impl PlaybackStatusPacket {
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -329,26 +328,26 @@ impl PlaybackStatusPacket {
             reserved,
             session_id,
             timestamp,
-        }
+        })
     }
 
     #[inline]
-    pub fn play(opts: Options, session_id: SessionId) -> Self {
+    pub fn play(opts: Options, session_id: SessionId) -> Box<Self> {
         Self::new(opts, session_id, PlaybackControlType::Play)
     }
 
     #[inline]
-    pub fn pause(opts: Options, session_id: SessionId) -> Self {
+    pub fn pause(opts: Options, session_id: SessionId) -> Box<Self> {
         Self::new(opts, session_id, PlaybackControlType::Pause)
     }
 
     #[inline]
-    pub fn stop(opts: Options, session_id: SessionId) -> Self {
+    pub fn stop(opts: Options, session_id: SessionId) -> Box<Self> {
         Self::new(opts, session_id, PlaybackControlType::Stop)
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(SendPacket, Clone, Serialize)]
 pub struct AckPacket {
     pub version: Version,
     pub opts: Options,
@@ -363,7 +362,7 @@ impl AckPacket {
     pub const HEADER_SIZE: usize = size_of::<AckPacket>();
     pub const MIN_SIZE: usize = AckPacket::HEADER_SIZE;
 
-    pub fn new(opts: Options, session_id: SessionId, fingerprint: PacketFingerprint) -> Self {
+    pub fn new(opts: Options, session_id: SessionId, fingerprint: PacketFingerprint) -> Box<Self> {
         debug_assert!(
             !opts.contains(OptionFlags::RequireAck),
             "Invariant broken while constructing `AckPacket`: \
@@ -375,7 +374,7 @@ impl AckPacket {
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -383,11 +382,11 @@ impl AckPacket {
             session_id,
             timestamp,
             fingerprint,
-        }
+        })
     }
 }
 
-#[derive(Headers, Serialize, Clone)]
+#[derive(SendPacket, Headers, Serialize, Clone)]
 pub struct RetransmitPacket {
     pub version: Version,
     pub opts: Options,
@@ -409,7 +408,7 @@ impl RetransmitPacket {
         buffer_id: Option<BufferId>,
         session_id: SessionId,
         payload: Vec<ByteRange>,
-    ) -> Self {
+    ) -> Box<Self> {
         debug_assert!(
             payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
             "Invariant broken while constructing a `RetransmitPacket`: payload bigger than allowed max size: {} `ByteRange`s ({} bytes) > {} `ByteRange`s ({} bytes)",
@@ -425,7 +424,7 @@ impl RetransmitPacket {
         let control_type = ControlType::Session(SessionControlType::Retransmit);
         let timestamp = Timestamp::now();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -434,11 +433,11 @@ impl RetransmitPacket {
             session_id,
             timestamp,
             payload,
-        }
+        })
     }
 }
 
-#[derive(Clone, Serialize)]
+#[derive(SendPacket, Clone, Serialize)]
 pub struct SessionDoesNotExistErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -452,14 +451,14 @@ pub struct SessionDoesNotExistErrorPacket {
 impl SessionDoesNotExistErrorPacket {
     pub const HEADER_SIZE: usize = size_of::<Self>();
 
-    pub fn new(opts: Options, session_id: SessionId) -> Self {
+    pub fn new(opts: Options, session_id: SessionId) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Error;
         let error_type = ErrorType::SessionDoesNotExist;
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -467,11 +466,11 @@ impl SessionDoesNotExistErrorPacket {
             reserved,
             session_id,
             timestamp,
-        }
+        })
     }
 }
 
-#[derive(Clone, Serialize, Headers)]
+#[derive(SendPacket, Clone, Serialize, Headers)]
 pub struct UnexpectedPacketErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -495,7 +494,7 @@ impl UnexpectedPacketErrorPacket {
         received_secondary_type: SecondaryType,
         received_fingerprint: PacketFingerprint,
         incomprehensible: bool,
-    ) -> Self {
+    ) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Error;
         let error_type = if incomprehensible {
@@ -506,7 +505,7 @@ impl UnexpectedPacketErrorPacket {
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -517,7 +516,7 @@ impl UnexpectedPacketErrorPacket {
             received_packet_type,
             received_secondary_type,
             received_fingerprint,
-        }
+        })
     }
 
     pub fn unexpected(
@@ -526,7 +525,7 @@ impl UnexpectedPacketErrorPacket {
         received_packet_type: PacketType,
         received_secondary_type: SecondaryType,
         received_fingerprint: PacketFingerprint,
-    ) -> Self {
+    ) -> Box<Self> {
         Self::new(
             opts,
             session_id,
@@ -543,7 +542,7 @@ impl UnexpectedPacketErrorPacket {
         received_packet_type: PacketType,
         received_secondary_type: SecondaryType,
         received_fingerprint: PacketFingerprint,
-    ) -> Self {
+    ) -> Box<Self> {
         Self::new(
             opts,
             session_id,
@@ -555,7 +554,7 @@ impl UnexpectedPacketErrorPacket {
     }
 }
 
-#[derive(Clone, Serialize, Headers, Payload)]
+#[derive(SendPacket, Clone, Serialize, Headers, Payload)]
 pub struct AppRejectErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -580,7 +579,7 @@ impl AppRejectErrorPacket {
         received_control_type: ControlType,
         received_fingerprint: PacketFingerprint,
         message: String,
-    ) -> Self {
+    ) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
         let packet_type = PacketType::Error;
@@ -589,7 +588,7 @@ impl AppRejectErrorPacket {
         let timestamp = Timestamp::now();
         let payload = message.into_bytes();
 
-        Self {
+        Box::new(Self {
             version,
             opts,
             packet_type,
@@ -601,11 +600,11 @@ impl AppRejectErrorPacket {
             received_control_type,
             received_fingerprint,
             payload,
-        }
+        })
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(SendPacket, Clone, Copy, Serialize)]
 pub struct IncompatibleVersionPacket {
     pub zero_version: Version,
     pub min_version: Version,
@@ -613,11 +612,11 @@ pub struct IncompatibleVersionPacket {
 
 impl IncompatibleVersionPacket {
     pub const HEADER_SIZE: usize = size_of::<Self>();
-    pub fn packet() -> Self {
-        Self {
+    pub fn packet() -> Box<Self> {
+        Box::new(Self {
             zero_version: Version::new(0, 0, 0),
             min_version: Version::MIN_COMPATIBLE_VERSION,
-        }
+        })
     }
 }
 
@@ -905,13 +904,11 @@ impl Flags for Options {
         Self(0)
     }
 
-    #[must_use]
     fn unset(mut self, flag: Self::FlagType) -> Self {
         self.0 &= !(flag as u16);
         self
     }
 
-    #[must_use]
     fn set(mut self, flag: Self::FlagType) -> Self {
         self.0 |= flag as u16;
         self
