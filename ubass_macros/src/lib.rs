@@ -340,6 +340,34 @@ pub fn payload_derive_macro(item: TokenStream) -> TokenStream {
     .into()
 }
 
+#[proc_macro_derive(SendPacket)]
+pub fn send_packet_derive_macro(item: TokenStream) -> TokenStream {
+    let input = syn::parse::<DeriveInput>(item)
+        .map_err(|e| panic!("{}", e.to_string()))
+        .unwrap();
+
+    let ident = input.ident;
+    match input.data {
+        syn::Data::Struct(_) => quote! {
+            #[async_trait]
+            impl SendPacket for #ident {
+                type Sender = OutboundSender;
+
+                async fn send(self: Box<Self>, sender: Self::Sender, address: SocketAddr) {
+                    sender
+                        .send(PacketProcessingMessage::SendPacket(
+                            Packet::#ident(self).wrap(address),
+                        ))
+                        .await;
+                }
+            }
+        }
+        .into(),
+        syn::Data::Enum(_) => panic!("This trait is not meant for enums"),
+        syn::Data::Union(_) => panic!("This trait is not meant for unions"),
+    }
+}
+
 #[proc_macro_attribute]
 pub fn variants_array(_attrs: TokenStream, item: TokenStream) -> TokenStream {
     let mut item_copy = item.clone();
