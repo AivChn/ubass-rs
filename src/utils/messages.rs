@@ -40,12 +40,12 @@ impl<T: Send> OneShot<T> {
     }
 }
 
-pub enum AppRequest {
+pub enum AppMessage {
     HelloAppId(OneShot<AppId>),
 }
 
 pub enum AppResponse {
-    AppApproved(String),
+    AppApproved,
     AppRejected(String),
 }
 
