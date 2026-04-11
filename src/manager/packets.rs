@@ -877,7 +877,7 @@ pub enum ErrorType {
     SessionDoesNotExist,
 }
 
-#[derive(Deref, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Display, Deref, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct BatchID(u16);
 
@@ -893,53 +893,10 @@ impl BatchID {
     }
 }
 
-#[derive(Serialize, Debug, PartialEq, Clone, Copy)]
+#[derive(Flags, Serialize, Debug, PartialEq, Clone, Copy)]
 #[repr(transparent)]
+#[flagtype(OptionFlags)]
 pub struct Options(u16);
-
-impl Flags for Options {
-    type FlagType = OptionFlags;
-
-    #[inline]
-    fn construct(flags: &[Self::FlagType]) -> Self {
-        Self(
-            flags
-                .iter()
-                .map(|x| *x as u16)
-                .reduce(|f1, f2| f1 | f2)
-                .unwrap_or(0),
-        )
-    }
-
-    #[inline]
-    fn none() -> Self {
-        Self(0)
-    }
-
-    fn unset(mut self, flag: Self::FlagType) -> Self {
-        self.0 &= !(flag as u16);
-        self
-    }
-
-    fn set(mut self, flag: Self::FlagType) -> Self {
-        self.0 |= flag as u16;
-        self
-    }
-
-    #[inline]
-    fn contains(self, flag: Self::FlagType) -> bool {
-        self.0 & (flag as u16) != 0
-    }
-
-    #[inline]
-    fn deconstruct(self) -> Vec<Self::FlagType> {
-        Self::FlagType::VARIANTS
-            .iter()
-            .copied()
-            .filter(|e| (*e as u16) & self.0 != 0)
-            .collect()
-    }
-}
 
 #[derive(Clone, Copy, Display)]
 #[repr(u8)]

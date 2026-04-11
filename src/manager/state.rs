@@ -6,7 +6,9 @@ use x25519_dalek::EphemeralSecret;
 
 use crate::{
     lock_read, lock_write,
-    manager::packets::{BatchID, PacketFingerprint, PacketWrapper, SessionId},
+    manager::packets::{
+        BatchID, HelloPacket, MAX_PAYLOAD_LENGTH, PacketFingerprint, PacketWrapper, SessionId,
+    },
     prelude::*,
 };
 use core::panic;
@@ -25,7 +27,6 @@ const PACKET_DISCARD_TIME_MS: u64 = 7 * 1000;
 
 pub type GeneralStateTable = RwLock<HashMap<SessionId, GeneralSessionState>>;
 pub type PendingAckTable = RwLock<HashMap<PacketFingerprint, PendingAck>>;
-// encryption doesnt need a lock because key rotation semantics guarantee no read-write overlaps
 pub type EncryptionTable = RwLock<HashMap<SessionId, EncryptionWindow>>;
 pub type FingerprintTable = RwLock<HashMap<SessionId, Arc<FingerprintWindow>>>;
 pub type FecStateTable = RwLock<HashMap<SessionId, SessionFecState>>;
@@ -148,6 +149,18 @@ impl SessionStates {
     }
 }
 
+#[derive(Flags, Clone, Copy)]
+#[repr(transparent)]
+#[flagtype(AppOptionFlag)]
+pub struct AppOptions(u32);
+
+#[derive(Clone, Copy)]
+#[repr(u32)]
+#[variants_array]
+pub enum AppOptionFlag {
+    ApproveAllApps = 1 << 0,
+}
+
 struct LayerHandles {
     transport: JoinHandle<()>,
     processor: JoinHandle<()>,
@@ -216,52 +229,10 @@ pub enum SessionStateFlag {
     CurrentlyStreamingTo = 1 << 6,
 }
 
-#[derive(Serialize, Debug, PartialEq, Clone, Copy)]
+#[derive(Flags, Serialize, Debug, PartialEq, Clone, Copy)]
 #[repr(transparent)]
+#[flagtype(SessionStateFlag)]
 pub struct SessionStateFlags(u32);
-
-impl Flags for SessionStateFlags {
-    type FlagType = SessionStateFlag;
-
-    #[inline]
-    fn construct(flags: &[Self::FlagType]) -> Self {
-        Self(
-            flags
-                .iter()
-                .map(|x| *x as u32)
-                .reduce(|f1, f2| f1 | f2)
-                .unwrap_or(0),
-        )
-    }
-
-    fn none() -> Self {
-        Self(0)
-    }
-
-    fn unset(mut self, flag: Self::FlagType) -> Self {
-        self.0 &= !(flag as u32);
-        self
-    }
-
-    fn set(mut self, flag: Self::FlagType) -> Self {
-        self.0 |= flag as u32;
-        self
-    }
-
-    #[inline]
-    fn contains(self, flag: Self::FlagType) -> bool {
-        self.0 & (flag as u32) != 0
-    }
-
-    #[inline]
-    fn deconstruct(self) -> Vec<Self::FlagType> {
-        Self::FlagType::VARIANTS
-            .iter()
-            .copied()
-            .filter(|e| (*e as u32) & self.0 != 0)
-            .collect()
-    }
-}
 
 pub struct HandshakeState {
     ephemeral_secret: EphemeralSecret,
@@ -278,6 +249,7 @@ impl HandshakeState {
 pub struct AppId(String);
 
 impl AppId {
+    pub const MAX_LENGTH: usize = MAX_PAYLOAD_LENGTH;
     pub fn new(id: String) -> Self {
         debug_assert!(
             id.is_ascii(),
