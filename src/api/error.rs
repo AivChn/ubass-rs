@@ -6,6 +6,8 @@ pub enum ApiErrors {
     AlreadyOpen,
     #[error("Cannot use ports 1024 or lower, please suggest a different port.")]
     InvalidPort,
+    #[error("AppId is not a valid ID: its either too long or contains non ascii characters")]
+    InvalidAppId,
     #[error("Cannot use port {0}, already in use.")]
     PortAlreadyInUse(u16),
     #[error("Failed to build runtime: {0:?}")]
