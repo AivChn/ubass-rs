@@ -1,6 +1,5 @@
 mod inbound;
 mod key_exchange;
-mod outbound;
 pub mod packets;
 mod routines;
 mod state;
@@ -89,7 +88,11 @@ pub async fn init(port: u16, app_id: AppId) -> core::result::Result<(), ApiError
     PROTOCOL_EPOCH.set(Instant::now());
 
     // TODO: implement selecting logic for manager layer
-    let inbound_handle = tokio::spawn(inbound::init(manager_from_processor));
+    let inbound_handle = tokio::spawn(inbound::init(
+        manager_from_processor,
+        manager_to_processor.clone(),
+        todo!("get these channels"),
+    ));
     // let outbound_handle = ...
 
     // loop
