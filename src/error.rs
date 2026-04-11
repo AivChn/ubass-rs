@@ -6,21 +6,23 @@ pub type ErrResult = Result<()>;
 pub type EmptyResult = core::result::Result<(), ()>;
 
 pub use PipeDirection::*;
+use derive_more::Display;
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
-    #[error("Channel: {0:?}")]
+    #[error("Channel: {0}")]
     Channel(ChannelError),
-    #[error("Task: {0:?}")]
+    #[error("Task: {0}")]
     Task(TaskError),
-    #[error("Transport Error: {0:?}")]
+    #[error("Transport Error: {0}")]
     Transport(TransportError),
-    #[error("Packet Processing Error: {0:?}")]
+    #[error("Packet Processing Error: {0}")]
     PacketProcessor(PacketProcessingError),
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum TaskError {
+    #[error("Async task failed to finish properly")]
     TaskFailed,
 }
 
@@ -30,15 +32,17 @@ impl From<TaskError> for Error {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Display)]
 pub enum PipeDirection {
     Inbound,
     Outbound,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
+    #[error("{0} channel has failed")]
     ChannelFailed(PipeDirection),
+    #[error("{0} channel has closed unexpectedly")]
     ChannelClosed(PipeDirection),
 }
 
@@ -50,12 +54,15 @@ impl From<ChannelError> for Error {
 
 /// Errors that can occur during packet processing operations.
 /// Covers deserialization failures, version incompatibilities, and internal errors.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PacketProcessingError {
+    #[error("Received a packet with an incompatible version ({0}) from {1}")]
     IncompatibleVersion(Version, SocketAddr),
-    RecoveryNotReady(SessionId, BatchID),
-    WrongHeaderSize(usize),
+    #[error("Got a packet with an impossible header size {0} from {1}")]
+    WrongHeaderSize(usize, SocketAddr),
+    #[error("Got a packe with an invalid packet type header ({0}")]
     InvalidPacketTypeHeader(u8),
+    #[error("Faild to deserialize a packet")]
     FailedToDeserialize,
 }
 
@@ -69,10 +76,11 @@ impl From<PacketProcessingError> for Error {
 ///
 /// These errors are used both internally for task supervision and externally
 /// to communicate failures to the packet processor layer.
-#[derive(Debug, Clone)]
+#[derive(Debug, thiserror::Error)]
 pub enum TransportError {
-    /// Failed to bind a UDP socket to the requested address/port.
+    #[error("Failed to bind a socket")]
     FailedToBind,
+    #[error("Receiving failed too many times")]
     RecvFailedTooManyTimes,
 }
 
