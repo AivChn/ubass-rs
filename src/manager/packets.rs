@@ -877,9 +877,21 @@ pub enum ErrorType {
     SessionDoesNotExist,
 }
 
-#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Deref, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
-pub struct BatchID(pub u16);
+pub struct BatchID(u16);
+
+impl BatchID {
+    pub fn new(id: u16) -> Self {
+        debug_assert!(
+            id != 0,
+            "Invariant broken while constructing `BatchID`:\
+        ID must never be 0."
+        );
+
+        Self(id)
+    }
+}
 
 #[derive(Serialize, Debug, PartialEq, Clone, Copy)]
 #[repr(transparent)]
