@@ -368,6 +368,80 @@ pub fn send_packet_derive_macro(item: TokenStream) -> TokenStream {
     }
 }
 
+#[proc_macro_derive(Flags, attributes(flagtype))]
+pub fn flags_derive_macro(item: TokenStream) -> TokenStream {
+    let input: DeriveInput = syn::parse(item).unwrap_or_else(|e| panic!("{e}"));
+    let ident = input.ident;
+    let flag_type = match input
+        .attrs
+        .iter()
+        .find(|a| a.path().is_ident(&format_ident!("flagtype")))
+        .cloned()
+        .unwrap_or_else(|| panic!("flagtype attribute not provided"))
+        .meta
+    {
+        syn::Meta::List(path) => syn::parse2::<syn::Path>(path.tokens).unwrap(),
+        _ => panic!("must be a normal path"),
+    };
+    let flag_size = match input.data {
+        syn::Data::Struct(data_struct) => match data_struct.fields {
+            syn::Fields::Unnamed(fields_unnamed) => {
+                if fields_unnamed.unnamed.len() > 1 {
+                    panic!("only supports single field unit structs");
+                }
+                fields_unnamed.unnamed.get(0).unwrap().ty.clone()
+            }
+            _ => panic!("only supports single field unit structs"),
+        },
+        _ => panic!("only supports single field tuple structs"),
+    };
+
+    quote! {
+        impl Flags for #ident {
+            type FlagType = #flag_type;
+
+            #[inline]
+            fn construct(flags: &[Self::FlagType]) -> Self {
+                Self(
+                    flags
+                        .iter()
+                        .map(|e| (*e as #flag_size))
+                        .fold(0, |acc, f2| acc | f2)
+                )
+            }
+
+            fn none() -> Self {
+                Self(0)
+            }
+
+            fn unset(mut self, flag: Self::FlagType) -> Self {
+                self.0 &= !(flag as #flag_size);
+                self
+            }
+
+            fn set(mut self, flag: Self::FlagType) -> Self {
+                self.0 |= flag as #flag_size;
+                self
+            }
+
+            #[inline]
+            fn contains(self, flag: Self::FlagType) -> bool {
+                self.0 & (flag as #flag_size) != 0
+            }
+
+            #[inline]
+            fn deconstruct(self) -> Vec<Self::FlagType> {
+                Self::FlagType::VARIANTS
+                    .iter()
+                    .copied()
+                    .filter(|e| (*e as #flag_size) & self.0 != 0)
+                    .collect()
+            }
+        }
+    }
+    .into()
+}
+
 #[proc_macro_attribute]
 pub fn variants_array(_attrs: TokenStream, item: TokenStream) -> TokenStream {
     let mut item_copy = item.clone();
