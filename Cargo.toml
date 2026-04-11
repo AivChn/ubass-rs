@@ -10,6 +10,7 @@ path = "src/lib.rs"
 [features]
 default = ["fec_xor", "rust-api"]
 fec_xor = []
+fec_rs = []
 rust-api = []
 uniffi-api = []
 

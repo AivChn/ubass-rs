@@ -80,6 +80,8 @@ pub struct HandleMonitor {
 }
 
 impl HandleMonitor {
+    const PRUNE_INTERVAL: u64 = 1000;
+
     pub async fn size(&self) -> usize {
         let mut handles = self.handles.lock().await;
         handles.retain(|h| !h.is_finished());
@@ -88,7 +90,7 @@ impl HandleMonitor {
 
     pub async fn init(self: Arc<Self>) {
         while !self.destroyed.load(std::sync::atomic::Ordering::Relaxed) {
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(Duration::from_millis(Self::PRUNE_INTERVAL)).await;
             self.prune().await;
         }
     }

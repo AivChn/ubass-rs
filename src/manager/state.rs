@@ -375,7 +375,7 @@ impl FecBatchWindow {
         #[cfg(feature = "fec_xor")]
         self.recovery_arrived.set_bit(0);
 
-        #[cfg(not(feature = "fec_xor"))]
+        #[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
         self.recovery_arrived.set_bit(index);
     }
 }
