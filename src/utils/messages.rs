@@ -1,3 +1,6 @@
+use std::fmt::Display;
+
+use derive_more::Display;
 use tokio::sync::oneshot;
 
 use crate::manager::AppId;
@@ -9,10 +12,10 @@ use crate::{
     transport::types::ReceivedPacket,
 };
 
-pub struct AppResponseReceiver(oneshot::Receiver<AppResponse>);
+pub struct ResponseReceiver<T>(oneshot::Receiver<T>);
 
-impl AppResponseReceiver {
-    pub async fn recv(self) -> AppResponse {
+impl<T> ResponseReceiver<T> {
+    pub async fn recv(self) -> T {
         match self.0.await {
             Err(_) => unreachable!(
                 "Invariant broken while receiving on oneshot from app layer: \
@@ -23,26 +26,44 @@ impl AppResponseReceiver {
     }
 }
 
-pub struct OneShot<T: Send> {
-    data: T,
-    reply: oneshot::Sender<AppResponse>,
+pub struct OneShot<T: Send, Res: Send> {
+    pub data: T,
+    pub reply: oneshot::Sender<Res>,
 }
 
-impl<T: Send> OneShot<T> {
-    pub fn new(value: T) -> (Self, AppResponseReceiver) {
+impl<Req: Send> OneShot<Req, AppResponse> {
+    pub fn app(value: Req) -> (Self, ResponseReceiver<AppResponse>) {
         let (sender, receiver) = oneshot::channel();
         (
             Self {
                 data: value,
                 reply: sender,
             },
-            AppResponseReceiver(receiver),
+            ResponseReceiver(receiver),
+        )
+    }
+}
+
+impl<Req: Send> OneShot<Req, core::result::Result<Recovered, CouldNotRecover>> {
+    pub fn processor(
+        value: Req,
+    ) -> (
+        Self,
+        ResponseReceiver<core::result::Result<Recovered, CouldNotRecover>>,
+    ) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                data: value,
+                reply: sender,
+            },
+            ResponseReceiver(receiver),
         )
     }
 }
 
 pub enum AppMessage {
-    HelloAppId(OneShot<AppId>),
+    HelloAppId(OneShot<AppId, AppResponse>),
 }
 
 pub enum AppResponse {
@@ -56,10 +77,13 @@ pub enum ManagerMessage {
     Closed,
 }
 
+#[derive(thiserror::Error, Debug, Display)]
+pub struct CouldNotRecover;
+
 pub enum PacketProcessingMessage {
     SendPacket(PacketWrapper),
     ReceivedPacket(ReceivedPacket),
-    Recover(SessionId, BatchID),
+    Recover(OneShot<(SessionId, BatchID), core::result::Result<Recovered, CouldNotRecover>>),
     Close,
     Closed,
 }
