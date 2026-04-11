@@ -1,5 +1,7 @@
 use std::{net::SocketAddr, sync::Arc};
 
+use tokio::sync::oneshot;
+
 use crate::{
     dispatch,
     manager::{
@@ -11,7 +13,7 @@ use crate::{
     },
     packet_processor::{
         encryption::{self, Encryptable},
-        fec::{self, FECCompatible},
+        fec::{self, FECCompatible, Recovered},
         serialize::Serialize,
         types::{InboundSender, OutboundSender, ProcessedPacket},
     },
@@ -80,8 +82,11 @@ pub async fn init(
         for msg in buffer {
             match msg {
                 PacketProcessingMessage::SendPacket(packet_wrapper) => packets.push(packet_wrapper),
-                PacketProcessingMessage::Recover(session_id, batch_id) => {
-                    dispatch!(recover(session_id, batch_id, p_sender.clone()) => monitor);
+                PacketProcessingMessage::Recover(OneShot {
+                    data: (session_id, batch_id),
+                    reply,
+                }) => {
+                    dispatch!(recover(session_id, batch_id, reply) => monitor);
                 }
                 PacketProcessingMessage::Close => {
                     monitor.flush().await;
@@ -273,13 +278,17 @@ async fn process_authenticated(
     processed!(serialized to addr as Error 3 times)
 }
 
-async fn recover(session_id: SessionId, batch_id: BatchID, sender: InboundSender) {
+async fn recover(
+    session_id: SessionId,
+    batch_id: BatchID,
+    sender: oneshot::Sender<core::result::Result<Recovered, CouldNotRecover>>,
+) {
     let message = match fec::recover(batch_id, session_id).await {
-        Some(recovered) => Ok(ManagerMessage::Recovered(recovered)),
-        None => Err(PacketProcessingError::RecoveryNotReady(session_id, batch_id).into()),
+        Some(recovered) => Ok(recovered),
+        None => Err(CouldNotRecover),
     };
 
-    send_to_manager(message, sender).await;
+    sender.send(message);
 }
 
 async fn add_pending_ack(
