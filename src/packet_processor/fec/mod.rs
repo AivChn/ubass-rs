@@ -86,6 +86,12 @@ impl From<FECData> for RecoverdPacket {
     }
 }
 
+pub struct Recovered {
+    pub session_id: SessionId,
+    pub batch_id: BatchID,
+    pub packets: Vec<RecoverdPacket>,
+}
+
 /// Represents a packet to be processed. Includes only the data necessary.
 ///
 /// `is_parity`: `true` if the packet is a parity packet
@@ -137,7 +143,7 @@ impl FECCompatible for ParityPacket {}
 #[cfg(feature = "fec_xor")]
 type FECImpl = xor::Xor;
 
-#[cfg(not(feature = "fec_xor"))]
+#[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
 type FECImpl = reed_solomon::RS;
 
 static FEC: LazyLock<FECImpl> = LazyLock::new(FECImpl::new);
@@ -151,6 +157,11 @@ pub async fn received(packet: impl FECCompatible) -> bool {
     FEC.received(packet).await
 }
 
-pub async fn recover(batch_id: BatchID, session_id: SessionId) -> Option<Vec<RecoverdPacket>> {
-    FEC.recover(batch_id, session_id).await
+pub async fn recover(batch_id: BatchID, session_id: SessionId) -> Option<Recovered> {
+    let packets = FEC.recover(batch_id, session_id).await?;
+    Some(Recovered {
+        session_id,
+        batch_id,
+        packets,
+    })
 }

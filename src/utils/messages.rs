@@ -1,6 +1,7 @@
 use tokio::sync::oneshot;
 
 use crate::manager::AppId;
+use crate::packet_processor::fec::Recovered;
 use crate::prelude::*;
 use crate::{
     manager::packets::{BatchID, PacketWrapper, SessionId},
@@ -50,7 +51,7 @@ pub enum AppResponse {
 }
 
 pub enum ManagerMessage {
-    Recovered(Vec<RecoverdPacket>),
+    Recovered(Recovered),
     Packet(PacketWrapper),
     Closed,
 }
