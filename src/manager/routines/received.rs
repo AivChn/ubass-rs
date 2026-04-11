@@ -56,7 +56,7 @@ pub async fn received_hello_packet_as_receiver(
     app_sender: InboundSender,
 ) {
     // ask for permission to communicate with the giveb app ID
-    let (request, receiver) = OneShot::new(packet.app_id.clone());
+    let (request, receiver) = OneShot::<_, AppResponse>::app(packet.app_id.clone());
     let wrapped = AppMessage::HelloAppId(request);
     _ = app_sender.send(Ok(wrapped)).await;
 

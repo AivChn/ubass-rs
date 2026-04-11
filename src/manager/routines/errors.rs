@@ -1,21 +1,30 @@
-use crate::prelude::*;
+use crate::{
+    manager::{routines::received::received_incompatible_version_error, types::OutboundSender},
+    prelude::*,
+};
 
 use ChannelError::*;
 use PacketProcessingError::*;
 use TaskError::*;
 use TransportError::*;
 
-pub fn handle_errors(error: Error) {
+pub async fn handle_errors(error: Error, sender: OutboundSender) {
+    dbg!(&error);
     match error {
-        Error::Task(TaskFailed) => todo!(),
-        Error::Channel(ChannelFailed(direction)) => todo!(),
-        Error::Channel(ChannelClosed(direction)) => todo!(),
-        Error::Transport(FailedToBind) => todo!(),
-        Error::Transport(RecvFailedTooManyTimes) => todo!(),
-        Error::PacketProcessor(IncompatibleVersion(version, socket_addr)) => todo!(),
-        Error::PacketProcessor(RecoveryNotReady(session_id, batch_id)) => todo!(),
-        Error::PacketProcessor(WrongHeaderSize(size)) => todo!(),
-        Error::PacketProcessor(InvalidPacketTypeHeader(value)) => todo!(),
-        Error::PacketProcessor(FailedToDeserialize) => todo!(),
+        error @ (Error::Task(TaskFailed)
+        | Error::Channel(ChannelFailed(_))
+        | Error::Channel(ChannelClosed(_))
+        | Error::Transport(FailedToBind)
+        | Error::Transport(RecvFailedTooManyTimes)) => panicking_error(error),
+        Error::PacketProcessor(WrongHeaderSize(size, source)) => {}
+        Error::PacketProcessor(InvalidPacketTypeHeader(value)) => {}
+        Error::PacketProcessor(FailedToDeserialize) => {}
+        Error::PacketProcessor(IncompatibleVersion(version, src_addr)) => {
+            received_incompatible_version_error(version, src_addr, sender.clone()).await;
+        }
     }
+}
+
+fn panicking_error(error: Error) -> ! {
+    panic!("This error caused a panic - this would not happen in a final build.\n error: {error}")
 }

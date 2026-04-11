@@ -67,3 +67,19 @@ pub async fn connect(address: SocketAddr, outbound_sender: OutboundSender) {
     .send(outbound_sender, address)
     .await;
 }
+
+pub fn close() {
+    todo!()
+}
+
+pub fn listen() {
+    todo!()
+}
+
+pub fn request_track() {
+    todo!()
+}
+
+pub fn request_metadata() {
+    todo!()
+}
