@@ -23,38 +23,37 @@ pub async fn init(
     fingerprint_monitor: FingerprintMonitor,
 ) -> ErrResult {
     loop {
-        let mut buffer = Vec::with_capacity(16);
-        let received = t_receiver.recv_many(&mut buffer, 16).await;
-        if received == 0 {
+        let received = t_receiver.recv().await;
+        let Some(message) = received else {
             return Err(ChannelError::ChannelClosed(Inbound).into());
-        }
+        };
 
-        for message in buffer {
-            let packet = match message {
-                Ok(PacketProcessingMessage::ReceivedPacket(packet)) => packet,
-                Ok(PacketProcessingMessage::Closed) => {
-                    _ = p_sender.send(Ok(ManagerMessage::Closed)).await;
-                    return Ok(());
-                }
-                Ok(_) => unreachable!(
-                    "Invariant broken while receiving from Transport: a message variant other than `ReceivedPacket` and `Closed` was received."
-                ),
-                Err(err) => {
-                    if !err.is_recoverable() {
-                        tokio::spawn(send_up(Err(err), p_sender.clone()));
-                        continue;
-                    }
-                    unreachable!("No path currently leads to a recoverable error at this level");
-                }
-            };
+        let packet = match message {
+            Ok(PacketProcessingMessage::ReceivedPacket(packet)) => packet,
+            Ok(PacketProcessingMessage::Closed) => {
+                _ = p_sender.send(Ok(ManagerMessage::Closed)).await;
+                return Ok(());
+            }
 
-            tokio::spawn(handle_packet(
-                packet,
-                p_sender.clone(),
-                encryption_monitor,
-                fingerprint_monitor,
-            ));
-        }
+            Ok(_) => unreachable!(
+                "Invariant broken while receiving from Transport: a message variant other than `ReceivedPacket` and `Closed` was received."
+            ),
+
+            Err(err) => {
+                if !err.is_recoverable() {
+                    tokio::spawn(send_up(Err(err), p_sender.clone()));
+                    continue;
+                }
+                unreachable!("No path currently leads to a recoverable error at this level");
+            }
+        };
+
+        tokio::spawn(handle_packet(
+            packet,
+            p_sender.clone(),
+            encryption_monitor,
+            fingerprint_monitor,
+        ));
     }
 }
 
