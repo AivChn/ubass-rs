@@ -40,11 +40,8 @@ pub async fn init(
             ),
 
             Err(err) => {
-                if !err.is_recoverable() {
-                    tokio::spawn(send_up(Err(err), p_sender.clone()));
-                    continue;
-                }
-                unreachable!("No path currently leads to a recoverable error at this level");
+                tokio::spawn(send_up(Err(err), p_sender.clone()));
+                continue;
             }
         };
 

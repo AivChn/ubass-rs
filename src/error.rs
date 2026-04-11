@@ -6,47 +6,9 @@ pub type ErrResult = Result<()>;
 pub type EmptyResult = core::result::Result<(), ()>;
 
 pub use PipeDirection::*;
-pub use Recoverabilty::*;
-
-#[derive(Debug)]
-pub enum Recoverabilty {
-    Recoverable,
-    Unrecoverable,
-}
-
-#[derive(Debug)]
-pub struct Error {
-    recoverable: Recoverabilty,
-    contents: ErrorContents,
-}
-
-impl Error {
-    #[must_use]
-    pub fn new(recoverable: Recoverabilty, contents: ErrorContents) -> Self {
-        Self {
-            recoverable,
-            contents,
-        }
-    }
-
-    pub fn is_recoverable(&self) -> bool {
-        match self.recoverable {
-            Recoverabilty::Recoverable => true,
-            Recoverabilty::Unrecoverable => false,
-        }
-    }
-
-    pub fn contents(&self) -> &ErrorContents {
-        &self.contents
-    }
-
-    pub fn consume_contents(self) -> ErrorContents {
-        self.contents
-    }
-}
 
 #[derive(thiserror::Error, Debug)]
-pub enum ErrorContents {
+pub enum Error {
     #[error("Channel: {0:?}")]
     Channel(ChannelError),
     #[error("Task: {0:?}")]
@@ -64,10 +26,7 @@ pub enum TaskError {
 
 impl From<TaskError> for Error {
     fn from(value: TaskError) -> Self {
-        Self {
-            recoverable: Unrecoverable,
-            contents: ErrorContents::Task(value),
-        }
+        Self::Task(value)
     }
 }
 
@@ -85,14 +44,7 @@ pub enum ChannelError {
 
 impl From<ChannelError> for Error {
     fn from(value: ChannelError) -> Self {
-        match value {
-            ChannelError::ChannelClosed(_) => {
-                Self::new(Recoverabilty::Unrecoverable, ErrorContents::Channel(value))
-            }
-            any @ ChannelError::ChannelFailed(_) => {
-                Self::new(Recoverabilty::Recoverable, ErrorContents::Channel(any))
-            }
-        }
+        Self::Channel(value)
     }
 }
 
@@ -109,10 +61,7 @@ pub enum PacketProcessingError {
 
 impl From<PacketProcessingError> for Error {
     fn from(value: PacketProcessingError) -> Self {
-        Self {
-            recoverable: Unrecoverable,
-            contents: ErrorContents::PacketProcessor(value),
-        }
+        Self::PacketProcessor(value)
     }
 }
 
@@ -129,23 +78,6 @@ pub enum TransportError {
 
 impl From<TransportError> for Error {
     fn from(value: TransportError) -> Self {
-        match value {
-            TransportError::RecvFailedTooManyTimes | TransportError::FailedToBind => Error {
-                recoverable: Recoverabilty::Unrecoverable,
-                contents: ErrorContents::Transport(value),
-            },
-        }
-    }
-}
-
-impl TryFrom<Error> for TransportError {
-    type Error = ();
-
-    fn try_from(value: Error) -> core::result::Result<Self, Self::Error> {
-        if let ErrorContents::Transport(err) = value.contents {
-            Ok(err)
-        } else {
-            Err(())
-        }
+        Self::Transport(value)
     }
 }
