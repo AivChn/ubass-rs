@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     net::SocketAddr,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -32,10 +33,29 @@ macro_rules! r_unwrap_or_return {
 }
 
 #[macro_export]
-macro_rules! dispatch {
-    ($call:expr => $monitor:expr) => {
-        let handle = tokio::spawn($call);
-        $monitor.add(handle).await;
+macro_rules! debug_r_unwrap_or_return {
+    ($result:expr, $msg:expr) => {
+        match $result {
+            Ok(val) => val,
+            Err(_) => {
+                #[cfg(debug_assertions)]
+                panic!("Invariant broken: {}.", $msg);
+                return;
+            }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! debug_o_unwrap_or_return {
+    ($result:expr, $msg:expr) => {
+        match $result {
+            Some(val) => val,
+            None => {
+                debug_assert!(false, "Invariant broken: {}.", $msg);
+                return;
+            }
+        }
     };
 }
 
@@ -50,6 +70,13 @@ macro_rules! lock_read {
 macro_rules! lock_write {
     ($to_lock:expr) => {
         $to_lock.write().await
+    };
+}
+
+#[macro_export]
+macro_rules! lock {
+    ($to_lock:expr) => {
+        $to_lock.lock().await
     };
 }
 
@@ -88,26 +115,29 @@ impl HandleMonitor {
         handles.len()
     }
 
-    pub async fn init(self: Arc<Self>) {
-        while !self.destroyed.load(std::sync::atomic::Ordering::Relaxed) {
+    pub fn init(self: Arc<Self>) {
+        tokio::spawn(self.prune());
+    }
+
+    #[inline]
+    pub async fn dispatch<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.handles.lock().await.push(tokio::spawn(future));
+    }
+
+    pub async fn prune(self: Arc<Self>) {
+        while !self.destroyed.load(std::sync::atomic::Ordering::Acquire) {
             tokio::time::sleep(Duration::from_millis(Self::PRUNE_INTERVAL)).await;
-            self.prune().await;
+            let mut handles = self.handles.lock().await;
+            handles.retain(|h| !h.is_finished());
         }
-    }
-
-    pub async fn add(&self, handle: JoinHandle<()>) {
-        let mut handles = self.handles.lock().await;
-        handles.push(handle);
-    }
-
-    pub async fn prune(&self) {
-        let mut handles = self.handles.lock().await;
-        handles.retain(|h| !h.is_finished());
     }
 
     pub async fn flush(&self) {
         self.destroyed
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+            .store(true, std::sync::atomic::Ordering::Release);
 
         let mut handles = self.handles.lock().await;
         for handle in handles.drain(..) {
