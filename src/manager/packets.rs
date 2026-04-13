@@ -1,5 +1,8 @@
 use crate::{
-    manager::{OutboundSender, state::Port},
+    manager::{
+        OutboundSender,
+        state::{HandshakeId, Port},
+    },
     prelude::*,
 };
 
@@ -16,12 +19,13 @@ use crate::packet_processor::fingerprint::{Fingerprint, Headers, Payload};
 
 pub const MAX_PAYLOAD_LENGTH: usize = 1384;
 
+#[derive(Clone)]
 pub struct PacketWrapper {
     pub addr: SocketAddr,
     pub packet: Packet,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum Packet {
     HelloPacket(Box<HelloPacket>),
     TrackRequestPacket(Box<TrackRequestPacket>),
@@ -41,6 +45,59 @@ impl Packet {
     pub fn wrap(self, addr: SocketAddr) -> PacketWrapper {
         PacketWrapper { addr, packet: self }
     }
+
+    pub fn session_id(&self) -> Option<SessionId> {
+        match self {
+            Packet::HelloPacket(packet) => Some(packet.proposed_session_id),
+            Packet::TrackRequestPacket(packet) => Some(packet.session_id),
+            Packet::DataPacket(packet) => Some(packet.session_id),
+            Packet::MetadataPacket(packet) => Some(packet.session_id),
+            Packet::ParityPacket(packet) => Some(packet.session_id),
+            Packet::AckPacket(packet) => Some(packet.session_id),
+            Packet::RetransmitPacket(packet) => Some(packet.session_id),
+            Packet::PlaybackStatusPacket(packet) => Some(packet.session_id),
+            Packet::SessionDoesNotExistErrorPacket(packet) => Some(packet.session_id),
+            Packet::UnexpectedPacketErrorPacket(packet) => Some(packet.session_id),
+            Packet::AppRejectErrorPacket(packet) => Some(packet.session_id),
+            Packet::IncompatibleVersionPacket(_) => None,
+        }
+    }
+}
+
+impl SendPacket for Packet {
+    type Sender = OutboundSender;
+
+    #[must_use]
+    #[allow(
+        mismatched_lifetime_syntaxes,
+        clippy::type_complexity,
+        clippy::type_repetition_in_bounds
+    )]
+    fn send<'async_trait>(
+        self: Box<Self>,
+        sender: Self::Sender,
+        address: SocketAddr,
+    ) -> ::core::pin::Pin<
+        Box<dyn ::core::future::Future<Output = ()> + ::core::marker::Send + 'async_trait>,
+    >
+    where
+        Self: 'async_trait,
+    {
+        match *self {
+            Packet::HelloPacket(packet) => packet.send(sender, address),
+            Packet::TrackRequestPacket(packet) => packet.send(sender, address),
+            Packet::DataPacket(packet) => packet.send(sender, address),
+            Packet::MetadataPacket(packet) => packet.send(sender, address),
+            Packet::ParityPacket(packet) => packet.send(sender, address),
+            Packet::AckPacket(packet) => packet.send(sender, address),
+            Packet::RetransmitPacket(packet) => packet.send(sender, address),
+            Packet::PlaybackStatusPacket(packet) => packet.send(sender, address),
+            Packet::IncompatibleVersionPacket(packet) => packet.send(sender, address),
+            Packet::SessionDoesNotExistErrorPacket(packet) => packet.send(sender, address),
+            Packet::UnexpectedPacketErrorPacket(packet) => packet.send(sender, address),
+            Packet::AppRejectErrorPacket(packet) => packet.send(sender, address),
+        }
+    }
 }
 
 impl TryFrom<&Packet> for PacketFingerprint {
@@ -48,6 +105,7 @@ impl TryFrom<&Packet> for PacketFingerprint {
 
     fn try_from(value: &Packet) -> core::result::Result<Self, ()> {
         Ok(match value {
+            Packet::HelloPacket(packet) => packet.as_ref().into(),
             Packet::TrackRequestPacket(packet) => packet.as_ref().into(),
             Packet::DataPacket(packet) => packet.as_ref().into(),
             Packet::MetadataPacket(packet) => packet.as_ref().into(),
@@ -56,12 +114,16 @@ impl TryFrom<&Packet> for PacketFingerprint {
             Packet::PlaybackStatusPacket(packet) => packet.as_ref().into(),
             Packet::UnexpectedPacketErrorPacket(packet) => packet.as_ref().into(),
             Packet::AppRejectErrorPacket(packet) => packet.as_ref().into(),
-            _ => return Err(()),
+            _x @ (Packet::AckPacket(_)
+            | Packet::IncompatibleVersionPacket(_)
+            | Packet::SessionDoesNotExistErrorPacket(_)) => {
+                return Err(());
+            }
         })
     }
 }
 
-#[derive(SendPacket, Clone, Serialize, Headers)]
+#[derive(Debug, SendPacket, Clone, Serialize, Headers)]
 pub struct HelloPacket {
     pub version: Version,
     pub opts: Options,
@@ -69,6 +131,7 @@ pub struct HelloPacket {
     pub control_type: ControlType,
     pub reserved: Reserved<2>,
     pub proposed_session_id: SessionId,
+    pub handshake_id: HandshakeId,
     pub timestamp: Timestamp,
     pub public_key: PublicKey,
     pub receiving_port: Port,
@@ -79,13 +142,15 @@ impl HelloPacket {
     pub fn new(
         opts: Options,
         proposed_session_id: SessionId,
-        public_key: PublicKey,
+        handshake_id: HandshakeId,
+        public_key: impl Into<PublicKey>,
         app_id: AppId,
         receiving_port: Port,
     ) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Host;
         let control_type = ControlType::Host(HostControlType::Hello);
+        let public_key = public_key.into();
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
@@ -96,6 +161,7 @@ impl HelloPacket {
             control_type,
             reserved,
             proposed_session_id,
+            handshake_id,
             timestamp,
             public_key,
             receiving_port,
@@ -104,7 +170,7 @@ impl HelloPacket {
     }
 }
 
-#[derive(SendPacket, Headers, Payload, Serialize, Clone)]
+#[derive(Debug, SendPacket, Headers, Payload, Serialize, Clone)]
 pub struct TrackRequestPacket {
     pub version: Version,
     pub opts: Options,
@@ -160,7 +226,7 @@ impl TrackRequestPacket {
     }
 }
 
-#[derive(SendPacket, Headers, Payload, Serialize, Clone)]
+#[derive(Debug, SendPacket, Headers, Payload, Serialize, Clone)]
 pub struct DataPacket {
     pub version: Version,
     pub opts: Options,
@@ -204,7 +270,7 @@ impl DataPacket {
     }
 }
 
-#[derive(SendPacket, Clone, Headers, Payload, Serialize)]
+#[derive(Debug, SendPacket, Clone, Headers, Payload, Serialize)]
 pub struct MetadataPacket {
     pub version: Version,
     pub opts: Options,
@@ -257,7 +323,7 @@ impl MetadataPacket {
     }
 }
 
-#[derive(SendPacket, Clone, Headers, Payload, Serialize)]
+#[derive(Debug, SendPacket, Clone, Headers, Payload, Serialize)]
 pub struct ParityPacket {
     pub version: Version,
     pub opts: Options,
@@ -299,7 +365,7 @@ impl ParityPacket {
     }
 }
 
-#[derive(SendPacket, Clone, Serialize, Headers)]
+#[derive(Debug, SendPacket, Clone, Serialize, Headers)]
 pub struct PlaybackStatusPacket {
     pub version: Version,
     pub opts: Options,
@@ -347,7 +413,7 @@ impl PlaybackStatusPacket {
     }
 }
 
-#[derive(SendPacket, Clone, Serialize)]
+#[derive(Debug, SendPacket, Clone, Serialize)]
 pub struct AckPacket {
     pub version: Version,
     pub opts: Options,
@@ -386,7 +452,7 @@ impl AckPacket {
     }
 }
 
-#[derive(SendPacket, Headers, Serialize, Clone)]
+#[derive(Debug, SendPacket, Headers, Serialize, Clone)]
 pub struct RetransmitPacket {
     pub version: Version,
     pub opts: Options,
@@ -437,7 +503,7 @@ impl RetransmitPacket {
     }
 }
 
-#[derive(SendPacket, Clone, Serialize)]
+#[derive(Debug, SendPacket, Clone, Serialize)]
 pub struct SessionDoesNotExistErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -470,7 +536,7 @@ impl SessionDoesNotExistErrorPacket {
     }
 }
 
-#[derive(SendPacket, Clone, Serialize, Headers)]
+#[derive(Debug, SendPacket, Clone, Serialize, Headers)]
 pub struct UnexpectedPacketErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -554,7 +620,7 @@ impl UnexpectedPacketErrorPacket {
     }
 }
 
-#[derive(SendPacket, Clone, Serialize, Headers, Payload)]
+#[derive(Debug, SendPacket, Clone, Serialize, Headers, Payload)]
 pub struct AppRejectErrorPacket {
     pub version: Version,
     pub opts: Options,
@@ -604,7 +670,7 @@ impl AppRejectErrorPacket {
     }
 }
 
-#[derive(SendPacket, Clone, Copy, Serialize)]
+#[derive(Debug, SendPacket, Clone, Copy, Serialize)]
 pub struct IncompatibleVersionPacket {
     pub zero_version: Version,
     pub min_version: Version,
@@ -620,7 +686,7 @@ impl IncompatibleVersionPacket {
     }
 }
 
-#[derive(Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Serialize)]
 #[repr(transparent)]
 pub struct SecondaryType([u8; 2]);
 
@@ -640,7 +706,7 @@ impl From<ErrorType> for SecondaryType {
     }
 }
 
-#[derive(Clone, Serialize, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Hash, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct PacketFingerprint([u8; 16]);
 
@@ -650,7 +716,7 @@ impl<T: Fingerprint> From<&T> for PacketFingerprint {
     }
 }
 
-#[derive(Serialize, PartialEq, Default, Clone, Copy)]
+#[derive(Debug, Serialize, PartialEq, Default, Clone, Copy)]
 #[repr(transparent)]
 pub struct BufferId(u16);
 
@@ -666,7 +732,7 @@ impl BufferId {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Display)]
+#[derive(Debug, Clone, Copy, Serialize, Display)]
 #[repr(transparent)]
 pub struct BufferSize(u32);
 
@@ -686,7 +752,7 @@ impl BufferSize {
     }
 }
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Debug, Serialize, Clone, Copy)]
 #[repr(transparent)]
 pub struct PublicKey([u8; 32]);
 
@@ -710,11 +776,11 @@ impl Deref for PublicKey {
     }
 }
 
-#[derive(Serialize, Debug, Clone, Copy, Display)]
+#[derive(Debug, Serialize, Clone, Copy, Display)]
 #[repr(transparent)]
 pub struct BytePosition(pub u32);
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Reserved<const N: usize>;
 
 impl<const N: usize> Serialize for Reserved<N> {
@@ -740,7 +806,7 @@ impl<const N: usize> Serialize for Reserved<N> {
     }
 }
 
-#[derive(Serialize, Debug, Clone, Copy, Eq, PartialOrd, Ord, PartialEq)]
+#[derive(Debug, Serialize, Clone, Copy, Eq, PartialOrd, Ord, PartialEq)]
 #[repr(transparent)]
 pub struct Version(u16);
 
@@ -781,7 +847,7 @@ impl Display for Version {
 }
 
 /// Enum of all possible packet types as of now
-#[derive(Serialize, Clone, Copy, PartialEq, Debug)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum PacketType {
     Data = 1,
@@ -825,7 +891,7 @@ impl Serialize for ControlType {
     }
 }
 
-#[derive(Serialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum HostControlType {
     Hello = 201,
@@ -838,7 +904,7 @@ impl From<HostControlType> for ControlType {
     }
 }
 
-#[derive(Serialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum SessionControlType {
     Retransmit = 1,
@@ -853,7 +919,7 @@ impl From<SessionControlType> for ControlType {
     }
 }
 
-#[derive(Serialize, Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum PlaybackControlType {
     Play = 101,
@@ -868,7 +934,7 @@ impl From<PlaybackControlType> for ControlType {
     }
 }
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Debug, Serialize, Clone, Copy)]
 #[repr(u8)]
 pub enum ErrorType {
     AppReject = 1,
@@ -877,7 +943,7 @@ pub enum ErrorType {
     SessionDoesNotExist,
 }
 
-#[derive(Display, Deref, Serialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Display, Deref, Serialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct BatchID(u16);
 
@@ -893,13 +959,13 @@ impl BatchID {
     }
 }
 
-#[derive(Flags, Serialize, Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, Flags, Serialize, PartialEq, Clone, Copy)]
 #[repr(transparent)]
 #[flagtype(OptionFlags)]
 pub struct Options(u16);
 
-#[derive(Clone, Copy, Display)]
-#[repr(u8)]
+#[derive(Debug, Clone, Copy, Display)]
+#[repr(u16)]
 #[variants_array]
 pub enum OptionFlags {
     RequireAck = 1 << 0,
@@ -907,19 +973,18 @@ pub enum OptionFlags {
 }
 
 #[repr(transparent)]
-#[derive(Serialize, Deref, Debug, PartialEq, Eq, Hash, Clone, Copy, Display)]
+#[derive(Debug, Serialize, Deref, PartialEq, Eq, Hash, Clone, Copy, Display)]
 pub struct SessionId(u64);
 
 impl SessionId {
     #[inline]
     pub fn generate() -> Self {
-        let mut rng = rand::rng();
-        Self(rng.next_u64())
+        Self(rand::random::<u64>())
     }
 }
 
 #[repr(C)]
-#[derive(Serialize, Clone, Copy, Debug, PartialEq)]
+#[derive(Debug, Serialize, Clone, Copy, PartialEq)]
 pub struct FECInfo {
     pub batch_size: u8,
     pub batch_pos: u8,
