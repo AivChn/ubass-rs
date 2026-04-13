@@ -78,9 +78,11 @@ pub async fn authenticate(
     monitor: EncryptionMonitor,
 ) -> bool {
     let cipher = monitor.get_cipher(&session_id).await;
-    let counter: [u8; 8] = packet[packet.len() - 8..]
+    let counter: [u8; 8] = packet
+        .drain(packet.len() - 8..)
+        .collect::<Vec<_>>()
         .try_into()
-        .expect("length is guaranteed");
+        .expect("size is guaranteed");
     let nonce = Nonce::from(get_nonce(session_id, counter));
 
     let mut tag: Vec<u8> = packet.drain(packet.len() - 16..).collect();
