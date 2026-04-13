@@ -414,11 +414,13 @@ pub fn flags_derive_macro(item: TokenStream) -> TokenStream {
                 Self(0)
             }
 
+            #[must_use]
             fn unset(mut self, flag: Self::FlagType) -> Self {
                 self.0 &= !(flag as #flag_size);
                 self
             }
 
+            #[must_use]
             fn set(mut self, flag: Self::FlagType) -> Self {
                 self.0 |= flag as #flag_size;
                 self
