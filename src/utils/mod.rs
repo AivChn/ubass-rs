@@ -90,6 +90,8 @@ pub trait Flags {
     #[must_use]
     fn unset(self, flag: Self::FlagType) -> Self;
     fn contains(self, flag: Self::FlagType) -> bool;
+    #[cfg(debug_assertions)]
+    fn valid_flag(self) -> bool;
 }
 
 #[async_trait]

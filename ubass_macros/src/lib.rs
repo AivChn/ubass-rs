@@ -439,6 +439,14 @@ pub fn flags_derive_macro(item: TokenStream) -> TokenStream {
                     .filter(|e| (*e as #flag_size) & self.0 != 0)
                     .collect()
             }
+
+            #[cfg(debug_assertions)]
+            fn valid_flag(self) -> bool {
+                let full = Self::construct(&Self::FlagType::VARIANTS);
+                let not_valid_mask = !full.0;
+                (self.0 & not_valid_mask) == 0
+            }
+
         }
     }
     .into()
