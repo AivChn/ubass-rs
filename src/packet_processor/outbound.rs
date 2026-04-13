@@ -70,69 +70,43 @@ pub async fn init(
     HandleMonitor::init(monitor.clone());
 
     loop {
-        let mut buffer = Vec::with_capacity(16);
-        let received = p_receiver.recv_many(&mut buffer, 16).await;
-        if received == 0 {
-            return Err(ChannelError::ChannelClosed(Outbound).into());
-        }
+        let received = p_receiver.recv().await;
+        let msg = match received {
+            Some(msg) => msg,
+            None => return Err(ChannelError::ChannelClosed(Outbound).into()),
+        };
 
-        let mut packets = Vec::with_capacity(received);
-
-        for msg in buffer {
-            match msg {
-                PacketProcessingMessage::SendPacket(packet_wrapper) => packets.push(packet_wrapper),
-                PacketProcessingMessage::Recover(OneShot {
-                    data: (session_id, batch_id),
-                    reply,
-                }) => {
-                    monitor.dispatch(recover(session_id, batch_id, reply)).await;
-                }
-                PacketProcessingMessage::Close => {
-                    monitor.flush().await;
-                    _ = t_sender.send(TransportMessage::Close).await;
-                    return Ok(());
-                }
-                PacketProcessingMessage::ReceivedPacket(_) => unreachable!(
-                    "Invariant broken while receiving from Manager:\
-                received a `ReceivedPacket` variant."
-                ),
-                PacketProcessingMessage::Closed => unreachable!(
-                    "Invariant broken while receiveing from Manager:\
-                    received a `Closed` variant."
-                ),
+        let packet = match msg {
+            PacketProcessingMessage::SendPacket(packet_wrapper) => packet_wrapper,
+            PacketProcessingMessage::Recover(OneShot {
+                data: (session_id, batch_id),
+                reply,
+            }) => {
+                monitor.dispatch(recover(session_id, batch_id, reply)).await;
+                continue;
             }
-        }
+            PacketProcessingMessage::Close => {
+                monitor.flush().await;
+                _ = t_sender.send(TransportMessage::Close).await;
+                return Ok(());
+            }
+            PacketProcessingMessage::ReceivedPacket(_) => unreachable!(
+                "Invariant broken while receiving from Manager:\
+                received a `ReceivedPacket` variant."
+            ),
+            PacketProcessingMessage::Closed => unreachable!(
+                "Invariant broken while receiveing from Manager:\
+                    received a `Closed` variant."
+            ),
+        };
 
         monitor
-            .dispatch(handle_received(
-                packets.into(),
-                p_sender.clone(),
-                t_sender.clone(),
-                monitor.clone(),
-                encryption_monitor,
-                pending_ack_monitor,
-            ))
-            .await;
-    }
-}
-
-#[allow(clippy::unused_async)]
-async fn handle_received(
-    buffer: Box<[PacketWrapper]>,
-    p_sender: InboundSender,
-    t_sender: OutboundSender,
-    handle_monitor: Arc<HandleMonitor>,
-    encryption_monitor: EncryptionMonitor,
-    pending_ack_monitor: PendingAckMonitor,
-) {
-    for packet in buffer {
-        handle_monitor
             .dispatch(handle_packet(
                 packet,
                 p_sender.clone(),
                 t_sender.clone(),
                 encryption_monitor,
-                handle_monitor.clone(),
+                monitor.clone(),
                 pending_ack_monitor,
             ))
             .await;
@@ -360,5 +334,224 @@ async fn send_packet_to_transport(
         .is_err()
     {
         send_to_manager(Err(ChannelError::ChannelFailed(Outbound).into()), p_sender).await;
+    }
+}
+
+#[cfg(test)]
+mod test_packet_processor_macros {
+    use std::net::{IpAddr, Ipv4Addr};
+
+    use crate::manager::packets::{BytePosition, DataPacket, Options, Version};
+
+    use super::*;
+
+    fn get_data_packet() -> DataPacket {
+        packets::DataPacket {
+            version: Version::CURRENT_VERSION,
+            opts: Options::none(),
+            packet_type: packets::PacketType::Data,
+            batch_id: BatchID::new(9),
+            fec_info: packets::FECInfo {
+                batch_size: 9,
+                batch_pos: 2,
+                recovery_count: 5,
+            },
+            session_id: SessionId::new(5),
+            timestamp: Timestamp(120),
+            byte_range_start: BytePosition(8),
+            payload: vec![1u8, 2, 3, 4, 5].into(),
+        }
+    }
+
+    const SERIALIZED_DATA_PACKET: [u8; 35] = [
+        /*version*/ 0,
+        1,
+        /*opts*/ 0,
+        0,
+        PacketType::Data as u8,
+        /*batch_id*/ 0,
+        9,
+        /*fec_info*/ 9,
+        2,
+        5,
+        /*session_id*/ 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        5,
+        /*timestamp*/ 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        120,
+        /*byte_position*/ 0,
+        0,
+        0,
+        8,
+        /*payload*/ 1,
+        2,
+        3,
+        4,
+        5,
+    ];
+
+    #[test]
+    fn test_serialize() {
+        let packet = get_data_packet();
+        let mut buf;
+        serialize!(packet -> buf);
+        assert_eq!(&buf, &SERIALIZED_DATA_PACKET);
+    }
+
+    #[test]
+    fn test_processed() {
+        let packet = get_data_packet();
+        let mut buf;
+        serialize!(packet -> buf);
+        assert_eq!(&buf, &SERIALIZED_DATA_PACKET);
+
+        let cloned = buf.clone();
+        let address = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+        let processed = processed!(buf to address as Data 1 times);
+        let correct = ProcessedPacket {
+            dest_addr: address,
+            packet_type: PacketType::Data,
+            data: cloned,
+            duplicate_count: 1,
+        };
+
+        assert_eq!(processed, correct);
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use core::panic;
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::{LazyLock, OnceLock},
+        time::Duration,
+    };
+
+    use tokio::sync::mpsc::{Receiver, Sender};
+
+    use crate::{
+        manager::{
+            EncryptionMonitor, PendingAckMonitor,
+            state::{EncryptionTable, PendingAckWindow},
+        },
+        packet_processor::types::OutboundChannels,
+        transport::{self, types::ReceivedPacket},
+        utils::{ManagerMessage, PacketProcessingMessage, TransportMessage},
+    };
+
+    static ENCRYPTION: LazyLock<EncryptionTable> = LazyLock::new(EncryptionTable::default);
+    static PENDING_ACK: OnceLock<PendingAckWindow> = OnceLock::new();
+
+    fn prep_for_init() -> (
+        (
+            Sender<PacketProcessingMessage>,
+            Receiver<PacketProcessingMessage>,
+        ),
+        (
+            Sender<crate::prelude::Result<ManagerMessage>>,
+            Receiver<crate::prelude::Result<ManagerMessage>>,
+        ),
+        (Sender<TransportMessage>, Receiver<TransportMessage>),
+        (EncryptionMonitor, PendingAckMonitor),
+    ) {
+        let (processor_to_transport, transport_from_processor) = tokio::sync::mpsc::channel(1);
+        (
+            (processor_to_transport.clone(), transport_from_processor),
+            tokio::sync::mpsc::channel(1),
+            tokio::sync::mpsc::channel(1),
+            (
+                EncryptionMonitor::new(&ENCRYPTION),
+                PendingAckMonitor::new(
+                    PENDING_ACK.get_or_init(|| PendingAckWindow::new(processor_to_transport)),
+                ),
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn outbound_panics_on_closed_message() {
+        let (
+            (t_sender, t_receiver),
+            (dud_sender, _),
+            (dud2_sender, _),
+            (encryption_monitor, pending_ack_monitor),
+        ) = prep_for_init();
+
+        let handle = tokio::spawn(super::init(
+            OutboundChannels {
+                t_sender: dud2_sender.clone(),
+                p_sender: dud_sender.clone(),
+                p_receiver: t_receiver,
+            },
+            encryption_monitor,
+            pending_ack_monitor,
+        ));
+
+        t_sender.send(PacketProcessingMessage::Closed).await;
+        assert!(matches!(handle.await, Err(e) if e.is_panic()));
+    }
+
+    #[tokio::test]
+    async fn outbound_panics_on_received_message() {
+        let (
+            (t_sender, t_receiver),
+            (dud_sender, _),
+            (dud2_sender, _),
+            (encryption_monitor, pending_ack_monitor),
+        ) = prep_for_init();
+
+        let handle = tokio::spawn(super::init(
+            OutboundChannels {
+                t_sender: dud2_sender,
+                p_sender: dud_sender,
+                p_receiver: t_receiver,
+            },
+            encryption_monitor,
+            pending_ack_monitor,
+        ));
+
+        t_sender
+            .send(PacketProcessingMessage::ReceivedPacket(ReceivedPacket {
+                src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8),
+                data: vec![0u8],
+            }))
+            .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(matches!(handle.await, Err(e) if e.is_panic()));
+    }
+
+    #[tokio::test]
+    async fn returned_ok_on_close() {
+        let (
+            (t_sender, t_receiver),
+            (dud_sender, _),
+            (dud2_sender, _),
+            (encryption_monitor, pending_ack_monitor),
+        ) = prep_for_init();
+
+        let handle = tokio::spawn(super::init(
+            OutboundChannels {
+                t_sender: dud2_sender.clone(),
+                p_sender: dud_sender.clone(),
+                p_receiver: t_receiver,
+            },
+            encryption_monitor,
+            pending_ack_monitor,
+        ));
+
+        t_sender.send(PacketProcessingMessage::Close).await;
+        assert!(matches!(handle.await, Ok(Ok(()))));
     }
 }
