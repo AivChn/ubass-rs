@@ -1,3 +1,6 @@
+mod inbound;
+mod outbound;
+
 use crate::{
     lock_read, lock_write,
     manager::packets::{MAX_PAYLOAD_LENGTH, SessionId},
