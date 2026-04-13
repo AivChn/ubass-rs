@@ -82,6 +82,7 @@ pub async fn init(port: u16, app_id: AppId) -> core::result::Result<(), ApiError
     STATE.set(SessionStates::new(
         Port::new(port),
         app_id,
+        manager_to_processor.clone(),
         transport_handle,
         processor_handle,
     ));
