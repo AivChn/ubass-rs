@@ -2,7 +2,7 @@ mod inbound;
 mod key_exchange;
 pub mod packets;
 mod routines;
-mod state;
+pub mod state;
 pub mod types;
 
 pub use routines::endpoints::*;

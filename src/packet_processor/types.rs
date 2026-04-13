@@ -30,7 +30,7 @@ pub struct OutboundChannels {
 /// Represents a serialized packet with minimal data necessary for the transport layer.
 /// Contains the encrypted packet data along with metadata needed for transmission
 /// and retransmission logic. Uses Vec<u8> since it can represent any packet type.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProcessedPacket {
     pub dest_addr: SocketAddr,
     pub packet_type: PacketType,

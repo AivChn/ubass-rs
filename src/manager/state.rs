@@ -360,6 +360,14 @@ impl AppId {
             The ID is not a valid ascii sequence: {id}"
         );
 
+        debug_assert!(
+            id.len() < Self::MAX_LENGTH,
+            "Invariant broken while constructing `AppId`: \
+                The ID is larger than `Self::MAX_LENGTH` ({} >= {})",
+            id.len(),
+            Self::MAX_LENGTH
+        );
+
         Self(id)
     }
 }
@@ -371,6 +379,15 @@ impl From<&str> for AppId {
             "Invariant broken while constructing `AppId`: \
             The ID is not a valid ascii sequence: {value}"
         );
+
+        debug_assert!(
+            value.len() < Self::MAX_LENGTH,
+            "Invariant broken while constructing `AppId`: \
+                The ID is larger than `Self::MAX_LENGTH` ({} >= {})",
+            value.len(),
+            Self::MAX_LENGTH
+        );
+
         Self(String::from(value))
     }
 }

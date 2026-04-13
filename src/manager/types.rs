@@ -20,7 +20,7 @@ pub struct Address(SocketAddr);
 
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
 #[repr(transparent)]
-pub struct Timestamp(u64);
+pub struct Timestamp(pub u64);
 
 impl Timestamp {
     /// returns the current time since `PROTOCOL_EPOCH`

@@ -75,7 +75,7 @@ impl From<(u8, &FECPacket, &[u8])> for ParityPacket {
                 packet.fec_info.recovery_count,
             ),
             packet.session_id,
-            payload.into(),
+            payload,
         )
     }
 }
