@@ -3,6 +3,7 @@ use crate::{
         OutboundSender,
         state::{HandshakeId, Port},
     },
+    packet_processor::serialize,
     prelude::*,
 };
 
@@ -11,7 +12,7 @@ use std::{fmt::Display, net::SocketAddr};
 
 use crate::packet_processor::serialize::Serialize;
 use async_trait::async_trait;
-use derive_more::{Deref, Display};
+use derive_more::{Deref, DerefMut, Display};
 use rand::Rng;
 
 use crate::manager::AppId;
@@ -59,7 +60,14 @@ impl Packet {
             Packet::SessionDoesNotExistErrorPacket(packet) => Some(packet.session_id),
             Packet::UnexpectedPacketErrorPacket(packet) => Some(packet.session_id),
             Packet::AppRejectErrorPacket(packet) => Some(packet.session_id),
-            Packet::IncompatibleVersionPacket(_) => None,
+            Packet::IncompatibleVersionPacket(_) => {
+                debug_assert!(
+                    false,
+                    "Invariant broken while trying to get the session_id of a packet: \
+                        tried to get the session ID of the `IncompatibleVersionPacket` packet, which does not have one"
+                );
+                None
+            }
         }
     }
 }
@@ -147,6 +155,14 @@ impl HelloPacket {
         app_id: AppId,
         receiving_port: Port,
     ) -> Box<Self> {
+        debug_assert!(
+            *receiving_port > 1024,
+            "Invariant broken while constructing a `HelloPacket`: \
+                This hosts port is below 1024 ({receiving_port:?})"
+        );
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "HelloPacket");
+
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Host;
         let control_type = ControlType::Host(HostControlType::Hello);
@@ -179,14 +195,16 @@ pub struct TrackRequestPacket {
     pub reserved: Reserved<2>,
     pub session_id: SessionId,
     pub timestamp: Timestamp,
-    pub payload: Vec<u8>,
+    pub payload: PayloadField,
 }
 
 impl TrackRequestPacket {
     #[must_use]
-    pub fn request_track(opts: Options, session_id: SessionId, payload: Vec<u8>) -> Box<Self> {
+    pub fn request_track(opts: Options, session_id: SessionId, payload: PayloadField) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "TrackRequestPacket");
         let packet_type = PacketType::Session;
         let control_type = ControlType::Session(SessionControlType::TrackRequest);
         let reserved = Reserved;
@@ -205,9 +223,25 @@ impl TrackRequestPacket {
     }
 
     #[must_use]
-    pub fn request_metadata(opts: Options, session_id: SessionId, payload: Vec<u8>) -> Box<Self> {
+    pub fn request_metadata(
+        opts: Options,
+        session_id: SessionId,
+        payload: impl Into<PayloadField>,
+    ) -> Box<Self> {
+        let payload = payload.into();
+
+        debug_assert!(
+            payload.len() < MAX_PAYLOAD_LENGTH,
+            "Invariant broken while constructing `TrackRequestPacket`: \
+                payload is larger than `MAX_PAYLOAD_LENGTH` ({} >= {})",
+            payload.len(),
+            MAX_PAYLOAD_LENGTH
+        );
+
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "TrackRequestPacket");
         let packet_type = PacketType::Session;
         let control_type = ControlType::Session(SessionControlType::MetadataRequest);
         let reserved = Reserved;
@@ -226,7 +260,7 @@ impl TrackRequestPacket {
     }
 }
 
-#[derive(Debug, SendPacket, Headers, Payload, Serialize, Clone)]
+#[derive(Debug, SendPacket, Headers, Payload, Serialize, Clone, PartialEq)]
 pub struct DataPacket {
     pub version: Version,
     pub opts: Options,
@@ -236,11 +270,11 @@ pub struct DataPacket {
     pub session_id: SessionId,
     pub timestamp: Timestamp,
     pub byte_range_start: BytePosition,
-    pub payload: Vec<u8>,
+    pub payload: PayloadField,
 }
 
 impl DataPacket {
-    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<Vec<u8>>();
+    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<PayloadField>();
     pub const MIN_SIZE: usize = Self::HEADER_SIZE + 1;
 
     #[must_use]
@@ -250,8 +284,11 @@ impl DataPacket {
         fec_info: FECInfo,
         session_id: SessionId,
         byte_range_start: BytePosition,
-        payload: Vec<u8>,
+        payload: impl Into<PayloadField>,
     ) -> Box<Self> {
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "DataPacket");
+        let payload = payload.into();
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Data;
         let timestamp = Timestamp::now();
@@ -282,7 +319,7 @@ pub struct MetadataPacket {
     pub buffer_id: BufferId,
     pub buffer_size: BufferSize,
     pub position: BytePosition,
-    pub payload: Vec<u8>,
+    pub payload: PayloadField,
 }
 
 impl MetadataPacket {
@@ -295,14 +332,17 @@ impl MetadataPacket {
         buffer_id: BufferId,
         buffer_size: BufferSize,
         position: BytePosition,
-        payload: Vec<u8>,
+        payload: impl Into<PayloadField>,
     ) -> Box<Self> {
         debug_assert!(
-            position.0 < buffer_size.0,
+            *position < *buffer_size,
             "Invariant broken while constructing `MetadataPacket`: \
             position is laregr than buffer size ({position} > {buffer_size})"
         );
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "MetadataPacket");
 
+        let payload = payload.into();
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Metadata;
         let timestamp = Timestamp::now();
@@ -332,12 +372,12 @@ pub struct ParityPacket {
     pub fec_info: FECInfo,
     pub session_id: SessionId,
     pub timestamp: Timestamp,
-    pub payload: Vec<u8>,
+    pub payload: PayloadField,
 }
 
 impl ParityPacket {
     pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH + size_of::<BytePosition>();
-    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<Vec<u8>>();
+    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<PayloadField>();
     pub const MIN_SIZE: usize = Self::HEADER_SIZE + size_of::<BytePosition>() + 1;
 
     #[must_use]
@@ -346,11 +386,14 @@ impl ParityPacket {
         batch_id: BatchID,
         fec_info: FECInfo,
         session_id: SessionId,
-        payload: Vec<u8>,
+        payload: impl Into<PayloadField>,
     ) -> Box<Self> {
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "ParityPacket");
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Parity;
         let timestamp = Timestamp::now();
+        let payload = payload.into();
 
         Box::new(Self {
             version,
@@ -381,6 +424,8 @@ impl PlaybackStatusPacket {
     fn new(opts: Options, session_id: SessionId, playback_type: PlaybackControlType) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "PlaybackStatusPacket");
         let packet_type = PacketType::Playback;
         let control_type = playback_type.into();
         let reserved = Reserved;
@@ -434,6 +479,8 @@ impl AckPacket {
             "Invariant broken while constructing `AckPacket`: \
             flag `RequireAck` is present, but an ack packet must never be acked"
         );
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "AckPacket");
 
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Ack;
@@ -469,15 +516,11 @@ impl RetransmitPacket {
     const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH - (MAX_PAYLOAD_LENGTH % 6);
     const HEADER_SIZE: usize = size_of::<Self>() - Self::LOCAL_MAX_PAYLOAD_LENGTH;
 
-    pub fn new(
-        opts: Options,
-        buffer_id: Option<BufferId>,
-        session_id: SessionId,
-        payload: Vec<ByteRange>,
-    ) -> Box<Self> {
+    pub fn data(opts: Options, session_id: SessionId, payload: Vec<ByteRange>) -> Box<Self> {
         debug_assert!(
             payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
-            "Invariant broken while constructing a `RetransmitPacket`: payload bigger than allowed max size: {} `ByteRange`s ({} bytes) > {} `ByteRange`s ({} bytes)",
+            "Invariant broken while constructing a `RetransmitPacket`:\
+                payload bigger than allowed max size: {} `ByteRange`s ({} bytes) > {} `ByteRange`s ({} bytes)",
             payload.len(),
             (payload.len() * size_of::<ByteRange>()),
             (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
@@ -486,8 +529,49 @@ impl RetransmitPacket {
 
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "RetransmitPacket");
         let packet_type = PacketType::Session;
         let control_type = ControlType::Session(SessionControlType::Retransmit);
+        let buffer_id = None;
+        let timestamp = Timestamp::now();
+
+        Box::new(Self {
+            version,
+            opts,
+            packet_type,
+            control_type,
+            buffer_id,
+            session_id,
+            timestamp,
+            payload,
+        })
+    }
+
+    pub fn metadata(
+        opts: Options,
+        session_id: SessionId,
+        buffer_id: BufferId,
+        payload: Vec<ByteRange>,
+    ) -> Box<Self> {
+        debug_assert!(
+            payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
+            "Invariant broken while constructing a `RetransmitPacket`:\
+                payload bigger than allowed max size: {} `ByteRange`s ({} bytes) > {} `ByteRange`s ({} bytes)",
+            payload.len(),
+            (payload.len() * size_of::<ByteRange>()),
+            (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
+            Self::LOCAL_MAX_PAYLOAD_LENGTH
+        );
+
+        let version = Version::CURRENT_VERSION;
+        let opts = opts.set(OptionFlags::RequireAck);
+        let opts = opts.set(OptionFlags::Metadata);
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "RetransmitPacket");
+        let packet_type = PacketType::Session;
+        let control_type = ControlType::Session(SessionControlType::Retransmit);
+        let buffer_id = Some(buffer_id);
         let timestamp = Timestamp::now();
 
         Box::new(Self {
@@ -518,6 +602,8 @@ impl SessionDoesNotExistErrorPacket {
     pub const HEADER_SIZE: usize = size_of::<Self>();
 
     pub fn new(opts: Options, session_id: SessionId) -> Box<Self> {
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "SessionDoesNotExistErrorPacket");
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Error;
         let error_type = ErrorType::SessionDoesNotExist;
@@ -561,6 +647,15 @@ impl UnexpectedPacketErrorPacket {
         received_fingerprint: PacketFingerprint,
         incomprehensible: bool,
     ) -> Box<Self> {
+        debug_assert!(
+            valid_secondary_type(received_secondary_type),
+            "Invariant broken while constructing `UnexpectedPacketErrorPacket`: \
+                the value of the received secondary type was not an actual secondary type ({})",
+            received_secondary_type.0
+        );
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "UnexpectedPacketErrorPacket");
+
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Error;
         let error_type = if incomprehensible {
@@ -632,11 +727,11 @@ pub struct AppRejectErrorPacket {
     pub received_type: PacketType,
     pub received_control_type: ControlType,
     pub received_fingerprint: PacketFingerprint,
-    pub payload: Vec<u8>,
+    pub payload: PayloadField,
 }
 
 impl AppRejectErrorPacket {
-    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<Vec<u8>>();
+    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<PayloadField>();
 
     pub fn new(
         opts: Options,
@@ -646,13 +741,21 @@ impl AppRejectErrorPacket {
         received_fingerprint: PacketFingerprint,
         message: String,
     ) -> Box<Self> {
+        debug_assert!(
+            message.is_ascii(),
+            "Invariant broken while constructing `AppRejectErrorPacket`: \
+                message was not valid ascii. message: {message}"
+        );
+        #[cfg(debug_assertions)]
+        assert_opts_valid(opts, "AppRejectErrorPacket");
+
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
         let packet_type = PacketType::Error;
         let error_type = ErrorType::AppReject;
         let reserved = Reserved;
         let timestamp = Timestamp::now();
-        let payload = message.into_bytes();
+        let payload = message.into_bytes().into();
 
         Box::new(Self {
             version,
@@ -688,21 +791,34 @@ impl IncompatibleVersionPacket {
 
 #[derive(Debug, Clone, Copy, Serialize)]
 #[repr(transparent)]
-pub struct SecondaryType([u8; 2]);
+pub struct SecondaryType(u16);
+
+#[cfg(debug_assertions)]
+fn valid_secondary_type(st: SecondaryType) -> bool {
+    HostControlType::VARIANTS.map(|e| e as u16).contains(&st.0)
+        || SessionControlType::VARIANTS
+            .map(|e| e as u16)
+            .contains(&st.0)
+        || PlaybackControlType::VARIANTS
+            .map(|e| e as u16)
+            .contains(&st.0)
+        || ErrorType::VARIANTS.map(|e| e as u16).contains(&st.0)
+}
 
 impl From<ControlType> for SecondaryType {
     fn from(value: ControlType) -> Self {
-        let mut buf = [0u8; 2];
-        value.serialize(&mut buf);
-        Self(buf)
+        let res = match value {
+            ControlType::Host(host_control_type) => host_control_type as u16,
+            ControlType::Session(session_control_type) => session_control_type as u16,
+            ControlType::Playback(playback_control_type) => playback_control_type as u16,
+        };
+        Self(res)
     }
 }
 
 impl From<ErrorType> for SecondaryType {
     fn from(value: ErrorType) -> Self {
-        let mut buf = [0u8; 2];
-        value.serialize(&mut buf);
-        Self(buf)
+        Self(value as u16)
     }
 }
 
@@ -713,6 +829,31 @@ pub struct PacketFingerprint([u8; 16]);
 impl<T: Fingerprint> From<&T> for PacketFingerprint {
     fn from(value: &T) -> Self {
         Self(value.fingerprint())
+    }
+}
+
+#[derive(Debug, PartialEq, Serialize, Deref, DerefMut, Clone)]
+pub struct PayloadField(Vec<u8>);
+
+impl PayloadField {
+    pub fn new(vec: Vec<u8>) -> Self {
+        debug_assert!(
+            vec.len() < MAX_PAYLOAD_LENGTH,
+            "Invariant broken while constructing `PayloadField`: \
+                length of vector larger than `MAX_PAYLOAD_LENGTH` ({} >= {})",
+            vec.len(),
+            MAX_PAYLOAD_LENGTH
+        );
+        Self(vec)
+    }
+}
+
+impl<T> From<T> for PayloadField
+where
+    Vec<u8>: From<T>,
+{
+    fn from(value: T) -> Self {
+        Self::new(value.into())
     }
 }
 
@@ -732,7 +873,7 @@ impl BufferId {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Display)]
+#[derive(Deref, Debug, Clone, Copy, Serialize, Display)]
 #[repr(transparent)]
 pub struct BufferSize(u32);
 
@@ -776,11 +917,11 @@ impl Deref for PublicKey {
     }
 }
 
-#[derive(Debug, Serialize, Clone, Copy, Display)]
+#[derive(Deref, PartialEq, Debug, Serialize, Clone, Copy, Display)]
 #[repr(transparent)]
 pub struct BytePosition(pub u32);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(PartialEq, Debug, Clone, Copy)]
 pub struct Reserved<const N: usize>;
 
 impl<const N: usize> Serialize for Reserved<N> {
@@ -893,6 +1034,7 @@ impl Serialize for ControlType {
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
 #[repr(u8)]
+#[variants_array]
 pub enum HostControlType {
     Hello = 201,
 }
@@ -906,6 +1048,7 @@ impl From<HostControlType> for ControlType {
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
 #[repr(u8)]
+#[variants_array]
 pub enum SessionControlType {
     Retransmit = 1,
     TrackRequest = 2,
@@ -921,6 +1064,7 @@ impl From<SessionControlType> for ControlType {
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
 #[repr(u8)]
+#[variants_array]
 pub enum PlaybackControlType {
     Play = 101,
     Pause = 102,
@@ -936,6 +1080,7 @@ impl From<PlaybackControlType> for ControlType {
 
 #[derive(Debug, Serialize, Clone, Copy)]
 #[repr(u8)]
+#[variants_array]
 pub enum ErrorType {
     AppReject = 1,
     UnexpectedPacket,
@@ -964,6 +1109,16 @@ impl BatchID {
 #[flagtype(OptionFlags)]
 pub struct Options(u16);
 
+#[cfg(debug_assertions)]
+fn assert_opts_valid(opts: Options, contructing: &'static str) {
+    debug_assert!(
+        opts.valid_flag(),
+        "Invariant broken while constructing `{contructing}`: \
+            opts had an invalid value ({})",
+        opts.0
+    );
+}
+
 #[derive(Debug, Clone, Copy, Display)]
 #[repr(u16)]
 #[variants_array]
@@ -983,6 +1138,12 @@ impl SessionId {
     }
 }
 
+impl SessionId {
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+}
+
 #[repr(C)]
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
 pub struct FECInfo {
@@ -994,9 +1155,9 @@ pub struct FECInfo {
 impl FECInfo {
     pub fn new(batch_size: u8, batch_pos: u8, recovery_size: u8) -> Self {
         debug_assert!(
-            batch_pos < batch_size,
+            batch_pos < batch_size + recovery_size,
             "Invariant broken while constructing `FECInfo`: \
-            `batch_pos` is bigger than `batch_size` ({batch_pos} >= {batch_size})"
+            `batch_pos` is bigger than `batch_size` + `recovery_size` ({batch_pos} >= {batch_size} + {recovery_size})"
         );
         debug_assert!(
             recovery_size <= batch_size,
