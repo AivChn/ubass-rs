@@ -38,6 +38,9 @@ impl Timestamp {
                 .as_millis() as u64,
         )
     }
+    pub fn set_again(&mut self) {
+        *self = Timestamp::now();
+    }
 
     pub fn been_longer_than(&self, millis: u64) -> bool {
         Self::now().0 - self.0 > millis
