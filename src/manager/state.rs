@@ -5,15 +5,23 @@ use tokio::sync::{Mutex, RwLock};
 use x25519_dalek::EphemeralSecret;
 
 use crate::{
-    lock_read, lock_write,
-    manager::packets::{
-        BatchID, HelloPacket, MAX_PAYLOAD_LENGTH, PacketFingerprint, PacketWrapper, SessionId,
+    debug_o_unwrap_or_return, debug_r_unwrap_or_return, get_state, lock, lock_read, lock_write,
+    manager::{
+        STATE, inbound,
+        packets::{
+            BatchID, HelloPacket, MAX_PAYLOAD_LENGTH, Packet, PacketFingerprint, PacketWrapper,
+            SessionId,
+        },
+        types::OutboundSender,
     },
+    o_unwrap_or_return,
+    packet_processor::fingerprint,
     prelude::*,
+    r_unwrap_or_return,
 };
 use core::panic;
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::{HashSet, VecDeque, hash_map::Entry},
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{
         Arc,
@@ -25,26 +33,40 @@ use std::{
 
 const PACKET_DISCARD_TIME_MS: u64 = 7 * 1000;
 
-pub type GeneralStateTable = RwLock<HashMap<SessionId, GeneralSessionState>>;
-pub type PendingAckTable = RwLock<HashMap<PacketFingerprint, PendingAck>>;
-pub type EncryptionTable = RwLock<HashMap<SessionId, EncryptionWindow>>;
-pub type FingerprintTable = RwLock<HashMap<SessionId, Arc<FingerprintWindow>>>;
-pub type FecStateTable = RwLock<HashMap<SessionId, SessionFecState>>;
-pub type SessionAppIdTable = RwLock<HashMap<SessionId, AppId>>;
-pub type HandshakeStateTable = RwLock<HashMap<SocketAddr, HandshakeState>>;
-#[derive(Default, Deref)]
-pub struct SessionPortTable(RwLock<HashMap<SessionId, SocketAddr>>);
+macro_rules! sessions_state_fields {
+    ($($name:ident($key:ty => $value:ty)),*) => {
+        $(
+            #[derive(Default, Deref)]
+            pub struct $name(RwLock<HashMap<$key, $value>>);
+        )*
+    };
+}
+
+sessions_state_fields!(
+    GeneralStateTable(SessionId => GeneralSessionState),
+    EncryptionTable(SessionId => EncryptionWindow),
+    FingerprintTable(SessionId => Arc<FingerprintWindow>),
+    FecStateTable(SessionId => SessionFecState),
+    SessionAppIdTable(SessionId => AppId),
+    SessionAddressTable(SessionId => SocketAddr),
+    HandshakeStateTable(HandshakeId => HandshakeState)
+);
+
+#[derive(Default)]
+pub struct LastActivityTable(HashMap<SessionId, Timestamp>);
 
 pub struct SessionStates {
     app_id: AppId,
     port: Port,
     handles: Option<LayerHandles>,
+    global_handle_monitor: Arc<HandleMonitor>,
     pub general: GeneralStateTable,
+    pub last_activity: LastActivityTable,
     pub handshakes: HandshakeStateTable,
-    pub ack: PendingAckTable,
+    pub ack: PendingAckWindow,
     pub encryption: EncryptionTable,
     pub fingerprints: FingerprintTable,
-    pub addresses: SessionPortTable,
+    pub addresses: SessionAddressTable,
     pub fec: FecStateTable,
     pub app_ids: SessionAppIdTable,
 }
@@ -53,26 +75,28 @@ impl SessionStates {
     pub fn new(
         port: Port,
         app_id: AppId,
+        sender: OutboundSender,
         transport_handle: JoinHandle<()>,
         processor_handle: JoinHandle<()>,
     ) -> Self {
+        let global_handle_monitor = Arc::new(HandleMonitor::default());
+        global_handle_monitor.clone().init();
+
         Self {
             app_id,
             port,
             handles: Some(LayerHandles::new(transport_handle, processor_handle)),
+            global_handle_monitor,
             general: GeneralStateTable::default(),
+            last_activity: LastActivityTable::default(),
             handshakes: HandshakeStateTable::default(),
-            ack: PendingAckTable::default(),
+            ack: PendingAckWindow::new(sender),
             encryption: EncryptionTable::default(),
             fingerprints: FingerprintTable::default(),
-            addresses: SessionPortTable::default(),
+            addresses: SessionAddressTable::default(),
             fec: FecStateTable::default(),
             app_ids: SessionAppIdTable::default(),
         }
-    }
-
-    pub async fn new_handshake(&self, src_addr: SocketAddr, ephemeral_secret: EphemeralSecret) {
-        lock_write!(self.handshakes).insert(src_addr, HandshakeState { ephemeral_secret });
     }
 
     /// Joins both layer threads.
@@ -93,16 +117,17 @@ impl SessionStates {
         &self,
         new_session_id: SessionId,
         address: SocketAddr,
+        handshake_id: HandshakeId,
         app_id: AppId,
     ) -> EphemeralSecret {
-        let HandshakeState { ephemeral_secret } = lock_write!(self.handshakes)
-            .remove(&address)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Invariant broken while promoting handshake: \
-                    handshake with {address} did not exist in state."
-                )
-            });
+        let Some(HandshakeState {
+            peer_address,
+            ephemeral_secret,
+            session_id,
+        }) = self.handshakes.take(handshake_id).await
+        else {
+            unreachable!()
+        };
 
         self.new_session(SessionStateFlags::none(), new_session_id, address, app_id)
             .await;
@@ -129,11 +154,9 @@ impl SessionStates {
         address: SocketAddr,
         app_id: AppId,
     ) {
-        lock_write!(self.handshakes).remove(&address);
         lock_write!(self.general).insert(
             session_id,
             GeneralSessionState {
-                last_activity_time: Timestamp::now(),
                 last_key_rotation_time: Timestamp::now(),
                 flags,
             },
@@ -146,6 +169,64 @@ impl SessionStates {
         lock_write!(self.addresses).insert(session_id, address);
 
         lock_write!(self.fec).insert(session_id, SessionFecState::default());
+    }
+}
+
+pub struct GeneralSessionState {
+    last_key_rotation_time: Timestamp,
+    flags: SessionStateFlags,
+}
+
+impl GeneralStateTable {
+    pub async fn last_key_rotation_time(&self, session_id: SessionId) -> Option<Timestamp> {
+        Some(lock_read!(self).get(&session_id)?.last_key_rotation_time)
+    }
+
+    pub async fn key_rotation(&self, session_id: SessionId) -> Option<()> {
+        lock_write!(self)
+            .get_mut(&session_id)?
+            .last_key_rotation_time = Timestamp::now();
+        Some(())
+    }
+
+    pub async fn flags(&self, session_id: SessionId) -> Option<SessionStateFlags> {
+        Some(lock_read!(self).get(&session_id)?.flags)
+    }
+
+    pub async fn flags_then(
+        &self,
+        session_id: SessionId,
+        flag: <SessionStateFlags as Flags>::FlagType,
+        mut f: impl FnMut(
+            SessionStateFlags,
+            <SessionStateFlags as Flags>::FlagType,
+        ) -> SessionStateFlags,
+    ) -> Option<()> {
+        let mut lock = lock_write!(self);
+        let flags = lock.get(&session_id)?.flags;
+        let new = f(flags, flag);
+        lock.get_mut(&session_id)?.flags = new;
+        Some(())
+    }
+}
+
+impl LastActivityTable {
+    pub fn update(&self, session_id: SessionId) {
+        unsafe {
+            let this = self as *const Self as *mut Self;
+            (*this)
+                .0
+                .entry(session_id)
+                .and_modify(Timestamp::set_again)
+                .or_insert_with(Timestamp::now);
+        }
+    }
+
+    pub fn read(&self, session_id: SessionId) -> Timestamp {
+        self.0
+            .get(&session_id)
+            .copied()
+            .unwrap_or_else(Timestamp::now)
     }
 }
 
@@ -183,7 +264,7 @@ impl LayerHandles {
     }
 }
 
-#[derive(Serialize, Deref, Clone, Copy)]
+#[derive(Debug, Serialize, Deref, Clone, Copy)]
 #[repr(transparent)]
 pub struct Port(u16);
 
@@ -214,17 +295,11 @@ impl From<SocketAddrV6> for Port {
     }
 }
 
-struct GeneralSessionState {
-    last_activity_time: Timestamp,
-    last_key_rotation_time: Timestamp,
-    flags: SessionStateFlags,
-}
-
 #[derive(PartialEq, Clone, Copy)]
 #[repr(u32)]
 #[variants_array]
 pub enum SessionStateFlag {
-    Hanshake = 1 << 1,
+    Handshake = 1 << 1,
     CurrentlyStreamingFrom = 1 << 5,
     CurrentlyStreamingTo = 1 << 6,
 }
@@ -234,22 +309,50 @@ pub enum SessionStateFlag {
 #[flagtype(SessionStateFlag)]
 pub struct SessionStateFlags(u32);
 
-pub struct HandshakeState {
-    ephemeral_secret: EphemeralSecret,
-}
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Copy, Serialize)]
+#[repr(transparent)]
+pub struct HandshakeId(u32);
 
-impl HandshakeState {
-    pub fn new(ephemeral_secret: EphemeralSecret) -> Self {
-        Self { ephemeral_secret }
+impl HandshakeId {
+    pub async fn generate() -> Self {
+        let lock = lock_read!(get_state!().handshakes);
+        loop {
+            let r = Self(rand::random::<u32>());
+            if !lock.contains_key(&r) {
+                return r;
+            }
+        }
     }
 }
 
-#[derive(Clone)]
+pub struct HandshakeState {
+    peer_address: SocketAddr,
+    ephemeral_secret: EphemeralSecret,
+    session_id: SessionId,
+}
+
+impl HandshakeState {
+    pub fn new(
+        peer_address: SocketAddr,
+        ephemeral_secret: EphemeralSecret,
+        session_id: SessionId,
+    ) -> Self {
+        Self {
+            peer_address,
+            ephemeral_secret,
+            session_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 #[repr(transparent)]
 pub struct AppId(String);
 
 impl AppId {
-    pub const MAX_LENGTH: usize = MAX_PAYLOAD_LENGTH;
+    // Large enough without exceeding the mac packet size with the number of headers on the
+    // HelloPacket
+    pub const MAX_LENGTH: usize = 512;
     pub fn new(id: String) -> Self {
         debug_assert!(
             id.is_ascii(),
@@ -296,22 +399,44 @@ impl Serialize for AppId {
     }
 }
 
-impl SessionPortTable {
+impl HandshakeStateTable {
+    pub async fn new_handshake(
+        &self,
+        handshake_id: HandshakeId,
+        peer_address: SocketAddr,
+        ephemeral_secret: EphemeralSecret,
+        session_id: SessionId,
+    ) {
+        lock_write!(self).insert(
+            handshake_id,
+            HandshakeState::new(peer_address, ephemeral_secret, session_id),
+        );
+    }
+
+    pub async fn take(&self, id: HandshakeId) -> Option<HandshakeState> {
+        lock_write!(self).remove(&id)
+    }
+}
+
+impl SessionAddressTable {
     pub async fn contains(&self, id: SessionId) -> bool {
         self.read().await.contains_key(&id)
     }
 
-    pub async fn update(&self, id: SessionId, address: SocketAddr) {
-        self.write()
-            .await
-            .entry(id)
-            .or_insert(address)
-            .set_ip(address.ip());
+    pub async fn address_changed(&self, id: SessionId, address: SocketAddr) -> bool {
+        !matches!(lock_read!(self).get(&id), Some(addr) if *addr == address)
+    }
+
+    pub async fn update(&self, id: SessionId, address: SocketAddr) -> SocketAddr {
+        let mut lock = lock_write!(self);
+        let addr = lock.entry(id).or_insert(address);
+        addr.set_ip(address.ip());
+        *addr
     }
 }
 
 #[derive(Default)]
-struct SessionFecState {
+pub struct SessionFecState {
     table: RwLock<HashMap<BatchID, FecBatchWindow>>,
 }
 
@@ -334,7 +459,7 @@ impl FecBatchWindow {
 
     fn revovery_ready(&self) -> bool {
         let needed_data = self.batch_size - self.recovery_count;
-        self.data_arrived.enough_set(needed_data)
+        self.data_arrived.count_set() + self.recovery_arrived.count_set() >= self.batch_size
     }
 
     #[inline]
@@ -343,11 +468,14 @@ impl FecBatchWindow {
     }
 
     #[inline]
-    fn add_parity(&mut self, index: usize) {
-        #[cfg(feature = "fec_xor")]
+    #[cfg(feature = "fec_xor")]
+    fn add_parity(&mut self) {
         self.recovery_arrived.set_bit(0);
+    }
 
-        #[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
+    #[inline]
+    #[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
+    fn add_parity(&mut self, index: usize) {
         self.recovery_arrived.set_bit(index);
     }
 }
@@ -368,6 +496,10 @@ impl FecArrivedBitMap {
         self.0[0].count_ones() + self.0[1].count_ones() >= threshold as u32
     }
 
+    fn count_set(&self) -> u8 {
+        (self.0[0].count_ones() + self.0[1].count_ones()) as u8
+    }
+
     /// Returns true if the bit under the specified index is set
     #[inline]
     fn is_set(&self, index: usize) -> bool {
@@ -375,65 +507,29 @@ impl FecArrivedBitMap {
     }
 }
 
-pub struct PendingAck {
-    packet: PacketWrapper,
-    timestamp: Timestamp,
-    retries: u8,
-}
-
-impl PendingAck {
-    const MAX_RETRIES: u8 = 5;
-
-    pub fn new(packet: PacketWrapper, timestamp: Timestamp) -> Self {
-        Self {
-            packet,
-            timestamp,
-            retries: 0,
-        }
-    }
-
-    pub fn packet(&self) -> &PacketWrapper {
-        &self.packet
-    }
-
-    pub fn retried(&mut self) {
-        self.timestamp = Timestamp::now();
-        self.retries += 1;
-    }
-
-    pub fn is_expired(&self) -> bool {
-        self.timestamp.been_longer_than(PACKET_DISCARD_TIME_MS) && self.retries >= Self::MAX_RETRIES
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct PendingAckMonitor {
-    table: &'static PendingAckTable,
+    table: &'static PendingAckWindow,
 }
 
 impl PendingAckMonitor {
-    pub fn new(table: &'static PendingAckTable) -> Self {
+    pub fn new(table: &'static PendingAckWindow) -> Self {
         Self { table }
     }
 
-    pub async fn add(
-        &self,
-        fingerprint: PacketFingerprint,
-        pending_ack: (PacketWrapper, Timestamp),
-    ) {
-        let mut table = self.table.write().await;
-        table.insert(fingerprint, PendingAck::new(pending_ack.0, pending_ack.1));
+    pub async fn add(&self, packet: Packet) {
+        self.table.add(packet).await;
     }
 }
 
-#[derive(Eq)]
+#[derive(Eq, Deref)]
 struct FingerprintPtr(*const PacketFingerprint);
 
 unsafe impl Send for FingerprintPtr {}
 unsafe impl Sync for FingerprintPtr {}
 
 impl FingerprintPtr {
-    fn from_box(value: &PacketFingerprint) -> Self {
+    fn from_ref(value: &PacketFingerprint) -> Self {
         Self(std::ptr::from_ref(value))
     }
 }
@@ -484,6 +580,175 @@ impl FingerprintMonitor {
     }
 }
 
+//impl PendingAck {
+//    const MAX_RETRIES: u8 = 5;
+//
+//    pub fn new(packet: PacketWrapper, timestamp: Timestamp) -> Self {
+//        Self {
+//            packet,
+//            timestamp,
+//            retries: 0,
+//        }
+//    }
+//
+//    pub fn packet(&self) -> PacketWrapper {
+//        self.packet.clone()
+//    }
+//
+//    pub fn retried(&mut self) {
+//        self.timestamp = Timestamp::now();
+//        self.retries += 1;
+//    }
+//
+//    pub fn is_expired(&self) -> bool {
+//        self.timestamp.been_longer_than(PACKET_DISCARD_TIME_MS) && self.retries >= Self::MAX_RETRIES
+//    }
+//}
+//
+//impl PendingAckTable {}
+
+struct PendingAckQueueEntry {
+    timestamp: Timestamp,
+    ptr: FingerprintPtr,
+    retries: u8,
+}
+
+impl PendingAckQueueEntry {
+    const MAX_RETRIES: u8 = 5;
+    const PRUNE_INTERVAL: u64 = PACKET_DISCARD_TIME_MS;
+
+    fn new(ptr: &PacketFingerprint) -> Self {
+        Self {
+            timestamp: Timestamp::now(),
+            ptr: FingerprintPtr::from_ref(ptr),
+            retries: 0,
+        }
+    }
+
+    fn retried(&mut self) -> bool {
+        self.retries += 1;
+        self.retries > Self::MAX_RETRIES
+    }
+
+    #[inline]
+    fn ready_to_retry(&self) -> bool {
+        self.timestamp.been_longer_than(Self::PRUNE_INTERVAL)
+    }
+}
+
+pub struct PendingAckWindow {
+    pending: RwLock<HashMap<PacketFingerprint, Packet>>,
+    queue: Mutex<VecDeque<PendingAckQueueEntry>>,
+    sender: OutboundSender,
+    canceled: AtomicBool,
+}
+
+impl PendingAckWindow {
+    const PRUNE_INTERVAL: u64 = PACKET_DISCARD_TIME_MS;
+    const BUFFERING_TIME: u64 = 2 * 1000;
+
+    pub fn new(sender: OutboundSender) -> Self {
+        Self {
+            pending: RwLock::default(),
+            queue: Mutex::default(),
+            sender,
+            canceled: AtomicBool::new(false),
+        }
+    }
+
+    pub async fn init(self: Arc<Self>) {
+        get_state!().global_handle_monitor.dispatch(self.prune());
+    }
+
+    pub async fn add(&'static self, packet: Packet) {
+        get_state!()
+            .global_handle_monitor
+            .dispatch(self._add(packet))
+            .await;
+    }
+
+    async fn _add(&self, packet: Packet) {
+        let fingerprint = debug_r_unwrap_or_return!(
+            PacketFingerprint::try_from(&packet),
+            format!(
+                "Invariant broken while adding a packet to `PendingAckWindow`:\
+                A packet that should not be acked was provided ({:?}) full list can\
+                be found at the impl TryFrom<&Packet> for PacketFingerprint",
+                packet
+            )
+        );
+
+        let entry = PendingAckQueueEntry::new(&fingerprint);
+        lock_write!(self.pending).insert(fingerprint, packet);
+        lock!(self.queue).push_back(entry);
+    }
+
+    pub async fn prune(self: Arc<Self>) {
+        let mut expired = Vec::with_capacity(256);
+        let mut to_retry = Vec::with_capacity(256);
+
+        while !self.canceled.load(Ordering::Relaxed) {
+            let top_timestamp = {
+                // get expired pending ack packets as well as ones to retry
+                let mut queue = lock!(self.queue);
+                while queue
+                    .front()
+                    .is_some_and(PendingAckQueueEntry::ready_to_retry)
+                {
+                    if let Some(mut value) = queue.pop_front() {
+                        if value.retried() {
+                            expired.push(value.ptr);
+                        } else {
+                            value.timestamp.set_again();
+                            to_retry.push(value);
+                        }
+                    }
+                }
+
+                // return the time until next pending ack needs a retry
+                match queue.front() {
+                    Some(top) => Timestamp::now().get() - top.timestamp.get(),
+                    None => Self::PRUNE_INTERVAL - Self::BUFFERING_TIME,
+                }
+            };
+
+            // resend pending acks
+            {
+                let pending = lock_read!(self.pending);
+                let mut queue = lock!(self.queue);
+                let lock = lock_read!(get_state!().addresses);
+                for entry in to_retry.drain(..) {
+                    let Some(packet) = pending.get(unsafe { &**entry.ptr }) else {
+                        continue;
+                    };
+
+                    let Some(address) = lock.get(
+                        &packet
+                            .session_id()
+                            .expect("IncompatibleVersion packets are never acked"),
+                    ) else {
+                        continue;
+                    };
+
+                    queue.push_back(entry);
+
+                    Box::new(packet.clone()).send(self.sender.clone(), *address);
+                }
+            }
+
+            // remove expired acks
+            {
+                let mut pending = lock_write!(self.pending);
+                expired
+                    .drain(..)
+                    .for_each(|ptr| _ = pending.remove(unsafe { &**ptr }));
+            }
+
+            tokio::time::sleep(Duration::from_millis(top_timestamp + Self::BUFFERING_TIME)).await;
+        }
+    }
+}
+
 pub struct FingerprintWindow {
     fingerprints: RwLock<HashSet<Box<PacketFingerprint>>>,
     queue: Mutex<VecDeque<(Timestamp, FingerprintPtr)>>,
@@ -504,8 +769,11 @@ impl FingerprintWindow {
     const PRUNE_INTERVAL: u64 = PACKET_DISCARD_TIME_MS;
     const BUFFERING_TIME: u64 = 2 * 1000;
 
-    pub fn init(self: Arc<Self>) {
-        tokio::spawn(self.prune());
+    pub async fn init(self: Arc<Self>) {
+        get_state!()
+            .global_handle_monitor
+            .dispatch(self.prune())
+            .await;
     }
 
     #[must_use]
@@ -516,23 +784,17 @@ impl FingerprintWindow {
 
     pub async fn add(&self, fingerprint: Box<PacketFingerprint>) -> bool {
         let ptr = {
-            let mut fingerprints = self.fingerprints.write().await;
-            let ptr = FingerprintPtr::from_box(&fingerprint);
-            if fingerprints.insert(fingerprint) {
-                Some(ptr)
-            } else {
-                None
+            let mut fingerprints = lock_write!(self.fingerprints);
+            let ptr = FingerprintPtr::from_ref(&fingerprint);
+            if !fingerprints.insert(fingerprint) {
+                return false;
             }
+
+            ptr
         };
 
-        let Some(ptr) = ptr else {
-            return false;
-        };
-
-        {
-            let mut queue = self.queue.lock().await;
-            queue.push_back((Timestamp::now(), ptr));
-        }
+        let mut queue = self.queue.lock().await;
+        queue.push_back((Timestamp::now(), ptr));
 
         true
     }
@@ -540,31 +802,27 @@ impl FingerprintWindow {
     pub async fn prune(self: Arc<Self>) {
         let mut expired = Vec::with_capacity(256);
         while !self.canceled.load(Ordering::Relaxed) {
-            let top_timestamp;
-            {
+            let top_timestamp = {
                 let mut queue = self.queue.lock().await;
                 while queue
                     .front()
                     .is_some_and(|(ts, _)| ts.been_longer_than(Self::PRUNE_INTERVAL))
                 {
-                    if let Some((_, value)) = queue.pop_front() {
-                        expired.push(value);
+                    if let Some((_, ptr)) = queue.pop_front() {
+                        expired.push(ptr);
                     }
                 }
-                top_timestamp = {
-                    if let Some(top) = queue.front() {
-                        top.0.get()
-                    } else {
-                        Self::PRUNE_INTERVAL - Self::BUFFERING_TIME
-                    }
+                match queue.front() {
+                    Some(top) => Timestamp::now().get() - top.0.get(),
+                    None => Self::PRUNE_INTERVAL - Self::BUFFERING_TIME,
                 }
-            }
+            };
 
             {
                 let mut fingerprints = self.fingerprints.write().await;
                 expired
                     .drain(..)
-                    .for_each(|value| _ = fingerprints.remove(unsafe { &*value.0 }));
+                    .for_each(|ptr| _ = fingerprints.remove(unsafe { &**ptr }));
             }
 
             tokio::time::sleep(Duration::from_millis(top_timestamp + Self::BUFFERING_TIME)).await;
