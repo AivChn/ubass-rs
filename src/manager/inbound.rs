@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use crate::{
-    dispatch,
     manager::{
         routines::{
             errors::{self, handle_errors},
@@ -26,14 +25,22 @@ pub async fn init(
                 return Err(Error::Channel(ChannelError::ChannelClosed(Inbound)));
             }
             Some(Err(error)) => {
-                dispatch!(handle_errors(error, outbound_sender.clone()) => monitor);
+                monitor
+                    .dispatch(handle_errors(error, outbound_sender.clone()))
+                    .await;
                 continue;
             }
             Some(Ok(ManagerMessage::Closed)) => {
                 return Ok(());
             }
             Some(Ok(message)) => {
-                dispatch!(handle_message(message, outbound_sender.clone(), app_sender.clone()) => monitor);
+                monitor
+                    .dispatch(handle_message(
+                        message,
+                        outbound_sender.clone(),
+                        app_sender.clone(),
+                    ))
+                    .await;
                 continue;
             }
         };
