@@ -9,7 +9,9 @@ use tokio::runtime::Builder as RuntimeBuilder;
 use crate::{
     api::ApiErrors,
     get_state,
-    manager::{self, AppId, STATE, key_exchange, packets::*, types::OutboundSender},
+    manager::{
+        self, AppId, STATE, key_exchange, packets::*, state::HandshakeId, types::OutboundSender,
+    },
     utils::{Flags, SendPacket},
 };
 
@@ -54,13 +56,17 @@ pub fn open(
 pub async fn connect(address: SocketAddr, outbound_sender: OutboundSender) {
     let session_id = SessionId::generate();
     let (ephemeral_secret, public_key) = key_exchange::create();
+    let handshake_id = HandshakeId::generate().await;
 
-    get_state!().new_handshake(address, ephemeral_secret);
+    get_state!()
+        .handshakes
+        .new_handshake(handshake_id, address, ephemeral_secret, session_id);
 
     HelloPacket::new(
         Options::none(),
         session_id,
-        public_key.into(),
+        handshake_id,
+        public_key,
         get_state!().app_id(),
         get_state!().port(),
     )

@@ -13,6 +13,12 @@ use crate::{
     utils::{AppMessage, AppResponse, Flags, OneShot, SendPacket},
 };
 
+pub async fn received_packet(packet: PacketWrapper) {
+    if let Some(mut session_id) = packet.packet.session_id() {
+        get_state!().last_activity.update(session_id);
+    }
+}
+
 pub async fn received_data_packet(packet: DataPacket) {
     todo!()
 }
@@ -32,7 +38,7 @@ pub async fn received_hello_packet(
 ) {
     // setting the address to the one saved in state
     src_addr.set_port(*packet.receiving_port);
-    if lock_read!(get_state!().handshakes).contains_key(&src_addr) {
+    if lock_read!(get_state!().handshakes).contains_key(&packet.handshake_id) {
         received_hello_packet_as_initializer(packet, src_addr, outbound_sender).await;
     } else {
         received_hello_packet_as_receiver(packet, src_addr, outbound_sender, app_sender).await;
@@ -90,7 +96,7 @@ pub async fn received_hello_packet_as_receiver(
             // create session
             get_state!()
                 .new_session(
-                    SessionStateFlags::construct(&[SessionStateFlag::Hanshake]),
+                    SessionStateFlags::construct(&[SessionStateFlag::Handshake]),
                     session_id,
                     src_addr,
                     packet.app_id,
@@ -106,9 +112,10 @@ pub async fn received_hello_packet_as_receiver(
             );
 
             HelloPacket::new(
-                Options::none(),
+                Options::construct(&[OptionFlags::RequireAck]),
                 session_id,
-                public_key.into(),
+                packet.handshake_id,
+                public_key,
                 get_state!().app_id(),
                 get_state!().port(),
             )
@@ -154,7 +161,12 @@ pub async fn received_hello_packet_as_initializer(
     let fingerprint = PacketFingerprint::from(&packet);
 
     let secret = get_state!()
-        .promote_handshake(packet.proposed_session_id, src_addr, packet.app_id)
+        .promote_handshake(
+            packet.proposed_session_id,
+            src_addr,
+            packet.handshake_id,
+            packet.app_id,
+        )
         .await;
     let key = key_exchange::get_shared_secret(secret, packet.public_key);
     let cipher = Aes256GcmSiv::new(&key.into());
