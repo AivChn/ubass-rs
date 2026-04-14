@@ -292,3 +292,62 @@ async fn dedup_with_payload<T: Headers>(
 async fn send_up(message: Result<ManagerMessage>, sender: InboundSender) {
     _ = sender.send(message).await;
 }
+
+#[cfg(test)]
+mod test {
+    use std::sync::{Arc, LazyLock, atomic::AtomicU64};
+
+    use tokio::time::Instant;
+
+    use crate::{
+        lock_write,
+        manager::{packets::SessionId, state::*},
+        packet_processor::{fingerprint, inbound::dedup_no_payload},
+        prelude::{PROTOCOL_EPOCH, Timestamp},
+    };
+
+    static FINGERPRINTS: LazyLock<FingerprintTable> = LazyLock::new(FingerprintTable::default);
+
+    static SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+    fn next_session() -> SessionId {
+        _ = PROTOCOL_EPOCH.get_or_init(Instant::now);
+        SessionId::new(SESSION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
+    #[tokio::test]
+    async fn dedup_without_payload_not_duplicate() {
+        let session_id = next_session();
+        let packet = b"random packet".to_vec();
+        FINGERPRINTS
+            .write()
+            .await
+            .insert(session_id, Arc::default());
+        let fingerprint_monitor = FingerprintMonitor::new(&FINGERPRINTS);
+        let some = dedup_no_payload(packet.clone(), session_id, fingerprint_monitor).await;
+        assert_eq!(some, Some(packet));
+    }
+
+    #[tokio::test]
+    async fn dedup_without_payload_duplicate() {
+        let session_id = next_session();
+        let mut packet = b"random packet".to_vec();
+        packet.extend_from_slice(&session_id.to_be_bytes());
+        FINGERPRINTS
+            .write()
+            .await
+            .insert(session_id, Arc::default());
+        let fingerprint_monitor = FingerprintMonitor::new(&FINGERPRINTS);
+        let fingerprint = Box::new((&packet).into());
+        assert!(
+            fingerprint_monitor
+                .get(&session_id)
+                .await
+                .add(fingerprint)
+                .await
+        );
+        let none = dedup_no_payload(packet.clone(), session_id, fingerprint_monitor).await;
+        dbg!(&none);
+        assert!(none.is_none());
+    }
+}
