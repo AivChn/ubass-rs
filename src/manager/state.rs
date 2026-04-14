@@ -210,6 +210,13 @@ impl GeneralStateTable {
     }
 }
 
+impl FingerprintTable {
+    pub async fn add(&self, session_id: SessionId) {
+        let mut table = self.0.write().await;
+        table.insert(session_id, Arc::default());
+    }
+}
+
 impl LastActivityTable {
     pub fn update(&self, session_id: SessionId) {
         unsafe {
