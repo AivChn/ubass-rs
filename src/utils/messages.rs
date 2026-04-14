@@ -26,6 +26,7 @@ impl<T> ResponseReceiver<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct OneShot<T: Send, Res: Send> {
     pub data: T,
     pub reply: oneshot::Sender<Res>,
@@ -80,6 +81,7 @@ pub enum ManagerMessage {
 #[derive(thiserror::Error, Debug, Display)]
 pub struct CouldNotRecover;
 
+#[derive(Debug)]
 pub enum PacketProcessingMessage {
     SendPacket(PacketWrapper),
     ReceivedPacket(ReceivedPacket),

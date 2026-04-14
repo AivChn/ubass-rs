@@ -20,7 +20,7 @@ use crate::packet_processor::fingerprint::{Fingerprint, Headers, Payload};
 
 pub const MAX_PAYLOAD_LENGTH: usize = 1384;
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct PacketWrapper {
     pub addr: SocketAddr,
     pub packet: Packet,

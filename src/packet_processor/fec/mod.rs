@@ -44,6 +44,7 @@ impl Default for FECData {
 }
 
 /// Represents a recovered packet, includes all necessary data for full recovery
+#[derive(Debug)]
 pub struct RecoverdPacket {
     byte_range_start: u32,
     payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
@@ -86,6 +87,7 @@ impl From<FECData> for RecoverdPacket {
     }
 }
 
+#[derive(Debug)]
 pub struct Recovered {
     pub session_id: SessionId,
     pub batch_id: BatchID,
