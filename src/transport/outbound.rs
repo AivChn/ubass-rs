@@ -83,6 +83,7 @@ async fn send_packets(buffer: Vec<ProcessedPacket>, socket: Arc<UdpSocket>) {
 
 #[cfg(test)]
 mod test {
+    use core::net;
     use std::{
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
         sync::atomic::AtomicU16,
@@ -95,7 +96,7 @@ mod test {
         manager::packets::PacketType,
         packet_processor::types::{OutboundSender, ProcessedPacket},
         transport::{outbound, types::OutboundReceiver},
-        utils::TransportMessage,
+        utils::{TransportMessage, messages},
     };
 
     static PORT: AtomicU16 = AtomicU16::new(43000);
@@ -134,6 +135,50 @@ mod test {
 
         sender.send(TransportMessage::SendPacket(packet)).await;
         let result = receive.await;
+        dbg!(&result);
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn graceful_close() {
+        let (sender, handle) = prepare_init().await;
+        sender.send(TransportMessage::Close).await;
+        assert!(handle.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn send_multiple() {
+        let port = next_port();
+        let single_message = b"Hello World!";
+        let messages = [single_message; 10];
+
+        let receive = tokio::spawn(async move {
+            let socket = UdpSocket::bind(format!("127.0.0.1:{port}")).await.unwrap();
+            let mut buf = vec![0; 64];
+            for _ in 0..10 {
+                let read = socket.recv(&mut buf).await.unwrap();
+                if &buf[..read] != single_message {
+                    return Err(buf);
+                }
+            }
+            Ok(())
+        });
+
+        let (sender, handle) = prepare_init().await;
+        let packets: Vec<_> = messages
+            .iter()
+            .map(|message| ProcessedPacket {
+                dest_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port)),
+                packet_type: PacketType::Data,
+                data: Vec::from(*message),
+                duplicate_count: 1,
+            })
+            .collect();
+
+        for packet in packets {
+            sender.send(TransportMessage::SendPacket(packet)).await;
+        }
+        let result = receive.await.unwrap();
         dbg!(&result);
         assert!(result.is_ok());
     }
