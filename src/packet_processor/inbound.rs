@@ -301,9 +301,18 @@ mod test {
 
     use crate::{
         lock_write,
-        manager::{packets::SessionId, state::*},
-        packet_processor::{fingerprint, inbound::dedup_no_payload},
+        manager::{
+            packets::{
+                BatchID, BytePosition, DataPacket, FECInfo, Options, PacketFingerprint, SessionId,
+            },
+            state::*,
+        },
+        packet_processor::{
+            fingerprint,
+            inbound::{dedup_no_payload, dedup_with_payload},
+        },
         prelude::{PROTOCOL_EPOCH, Timestamp},
+        utils::Flags,
     };
 
     static FINGERPRINTS: LazyLock<FingerprintTable> = LazyLock::new(FingerprintTable::default);
@@ -349,5 +358,67 @@ mod test {
         let none = dedup_no_payload(packet.clone(), session_id, fingerprint_monitor).await;
         dbg!(&none);
         assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn dedup_with_payload_duplicate() {
+        let session_id = next_session();
+        let mut packet = DataPacket::new(
+            Options::none(),
+            BatchID::new(2),
+            FECInfo {
+                batch_size: 10,
+                batch_pos: 2,
+                recovery_count: 3,
+            },
+            next_session(),
+            BytePosition(12),
+            vec![1, 2, 3, 4, 5],
+        );
+        packet.payload.extend_from_slice(&session_id.to_be_bytes());
+        FINGERPRINTS
+            .write()
+            .await
+            .insert(session_id, Arc::default());
+        let fingerprint_monitor = FingerprintMonitor::new(&FINGERPRINTS);
+        let fingerprint = Box::new(PacketFingerprint::from(&*packet));
+        assert!(
+            fingerprint_monitor
+                .get(&session_id)
+                .await
+                .add(fingerprint)
+                .await
+        );
+        //let none = dedup_no_payload(packet.clone(), session_id, fingerprint_monitor).await;
+        let none = dedup_with_payload(packet, session_id, fingerprint_monitor).await;
+        dbg!(&none);
+        assert!(none.is_none());
+    }
+
+    #[tokio::test]
+    async fn dedup_with_payload_not_duplicate() {
+        let session_id = next_session();
+        let mut packet = DataPacket::new(
+            Options::none(),
+            BatchID::new(2),
+            FECInfo {
+                batch_size: 10,
+                batch_pos: 2,
+                recovery_count: 3,
+            },
+            next_session(),
+            BytePosition(12),
+            vec![1, 2, 3, 4, 5],
+        );
+        packet.payload.extend_from_slice(&session_id.to_be_bytes());
+        FINGERPRINTS
+            .write()
+            .await
+            .insert(session_id, Arc::default());
+        let fingerprint_monitor = FingerprintMonitor::new(&FINGERPRINTS);
+        let fingerprint = Box::new(PacketFingerprint::from(&*packet));
+        let some = dedup_with_payload(packet, session_id, fingerprint_monitor).await;
+        dbg!(&some);
+        assert!(some.is_some());
     }
 }
