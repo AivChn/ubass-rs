@@ -1,10 +1,11 @@
 #![allow(private_interfaces)]
 use aes_gcm_siv::Aes256GcmSiv;
 use derive_more::Deref;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc::Sender, oneshot, watch};
 use x25519_dalek::EphemeralSecret;
 
 use crate::{
+    api::{ReadableBuffer, WriteableBuffer},
     debug_o_unwrap_or_return, debug_r_unwrap_or_return, get_state, lock, lock_read, lock_write,
     manager::{
         STATE, inbound,
@@ -12,7 +13,7 @@ use crate::{
             BatchID, HelloPacket, MAX_PAYLOAD_LENGTH, Packet, PacketFingerprint, PacketWrapper,
             SessionId,
         },
-        types::OutboundSender,
+        types::ManagerToProcessor,
     },
     o_unwrap_or_return,
     packet_processor::fingerprint,
@@ -26,6 +27,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        mpsc::Receiver,
     },
     thread::JoinHandle,
     time::Duration,
@@ -55,7 +57,42 @@ sessions_state_fields!(
 #[derive(Default)]
 pub struct LastActivityTable(HashMap<SessionId, Timestamp>);
 
-pub struct SessionStates {
+#[derive(Debug)]
+pub enum Streaming<'stream> {
+    To(WriteableBuffer<'stream>),
+    From(ReadableBuffer),
+}
+
+#[derive(Debug)]
+enum SessionStates<'stream> {
+    Up,
+    Down,
+    Streaming {
+        streaming: Streaming<'stream>,
+        stream: watch::Sender<StreamMessage>,
+    },
+}
+
+#[derive(Debug)]
+enum ConnectionStates<'buf> {
+    Handshake {
+        ack_triggered_response: oneshot::Sender<
+            core::result::Result<(SessionId, Receiver<ConnectionEvent>), ConnectionError>,
+        >,
+        app_id: AppId,
+        address: RwLock<SocketAddr>,
+    },
+    Established {
+        last_activity: Mutex<Timestamp>,
+        connection: Sender<ConnectionEvent>,
+        state: SessionStates<'buf>,
+        fec: SessionFecState,
+        address: RwLock<SocketAddr>,
+        app_id: AppId,
+    },
+}
+
+pub struct TempSessionStates {
     app_id: AppId,
     port: Port,
     handles: Option<LayerHandles>,
@@ -71,11 +108,11 @@ pub struct SessionStates {
     pub app_ids: SessionAppIdTable,
 }
 
-impl SessionStates {
+impl TempSessionStates {
     pub fn new(
         port: Port,
         app_id: AppId,
-        sender: OutboundSender,
+        sender: ManagerToProcessor,
         transport_handle: JoinHandle<()>,
         processor_handle: JoinHandle<()>,
     ) -> Self {
@@ -459,11 +496,12 @@ impl SessionAddressTable {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct SessionFecState {
     table: RwLock<HashMap<BatchID, FecBatchWindow>>,
 }
 
+#[derive(Debug)]
 struct FecBatchWindow {
     batch_size: u8,
     recovery_count: u8,
@@ -504,7 +542,7 @@ impl FecBatchWindow {
     }
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Debug, Default, Clone, Copy)]
 struct FecArrivedBitMap([u128; 2]);
 
 impl FecArrivedBitMap {
@@ -663,7 +701,7 @@ impl PendingAckQueueEntry {
 pub struct PendingAckWindow {
     pending: RwLock<HashMap<PacketFingerprint, Packet>>,
     queue: Mutex<VecDeque<PendingAckQueueEntry>>,
-    sender: OutboundSender,
+    sender: ManagerToProcessor,
     canceled: AtomicBool,
 }
 
@@ -671,7 +709,7 @@ impl PendingAckWindow {
     const PRUNE_INTERVAL: u64 = PACKET_DISCARD_TIME_MS;
     const BUFFERING_TIME: u64 = 2 * 1000;
 
-    pub fn new(sender: OutboundSender) -> Self {
+    pub fn new(sender: ManagerToProcessor) -> Self {
         Self {
             pending: RwLock::default(),
             queue: Mutex::default(),
