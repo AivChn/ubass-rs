@@ -1,4 +1,7 @@
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use tokio::{
     sync::mpsc::{Receiver, Sender},
@@ -21,6 +24,12 @@ pub struct Address(SocketAddr);
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
 #[repr(transparent)]
 pub struct Timestamp(pub u64);
+
+impl From<&ForeignTimestamp> for Timestamp {
+    fn from(value: &ForeignTimestamp) -> Self {
+        Self(value.get())
+    }
+}
 
 impl Timestamp {
     /// returns the current time since `PROTOCOL_EPOCH`
@@ -58,22 +67,22 @@ impl Timestamp {
     }
 }
 
-#[derive(Serialize, Clone, Copy, PartialEq, Debug, Default)]
+#[derive(Debug, Default)]
 #[repr(transparent)]
-pub struct ForeignTimestamp(u64);
+pub struct ForeignTimestamp(AtomicU64);
 
 impl ForeignTimestamp {
     #[must_use]
     pub fn new(value: u64) -> Self {
-        Self(value)
+        Self(AtomicU64::new(value))
     }
 
     pub fn update(&mut self, value: u64) {
-        self.0 = value;
+        self.0.store(value, Ordering::Relaxed);
     }
 
     #[must_use]
     pub fn get(&self) -> u64 {
-        self.0
+        self.0.load(Ordering::Relaxed)
     }
 }
