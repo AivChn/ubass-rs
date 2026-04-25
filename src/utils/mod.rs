@@ -13,6 +13,16 @@ pub mod messages;
 pub use messages::*;
 
 #[macro_export]
+macro_rules! match_or_return {
+    ($value:expr, $i:ident, $p:pat) => {
+        match $value {
+            $p => $i,
+            _ => return,
+        }
+    };
+}
+
+#[macro_export]
 macro_rules! o_unwrap_or_return {
     ($result:expr) => {
         match $result {
