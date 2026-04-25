@@ -7,12 +7,13 @@ use crate::{
     manager::state::ConnectionStates,
     match_or_return,
     prelude::Timestamp,
+    utils::PanicOnDebug,
 };
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
 use tokio::sync::mpsc::{self, Receiver};
 
 use crate::{
-    DEFAULT_PORT, debug_o_unwrap_or_return, get_state, lock_read, lock_write,
+    DEFAULT_PORT, get_state, lock_read, lock_write,
     manager::{
         STATE, connect, key_exchange,
         packets::*,
@@ -28,7 +29,7 @@ use crate::{
 pub async fn received_track_request_packet(packet: Box<TrackRequestPacket>) {
     let track_id = packet.payload.take();
     let sender = {
-        let lock = lock_read!(get_state!().connection_state);
+        let lock = lock_read!(get_state!().connections);
         o_unwrap_or_return!({
             if let Some(ConnectionStates::Established { connection, .. }) =
                 lock.get(&packet.session_id)
@@ -47,7 +48,7 @@ pub async fn received_track_request_packet(packet: Box<TrackRequestPacket>) {
 
 pub async fn update_last_activity(session_id: SessionId, ts: Timestamp) {
     if let Some(ConnectionStates::Established { last_activity, .. }) =
-        lock_read!(get_state!().connection_state).get(&session_id)
+        lock_read!(get_state!().connections).get(&session_id)
     {
         lock!(last_activity).update(ts.get());
     }
@@ -73,7 +74,7 @@ pub async fn received_data_packet(
 
     // TODO: deal with unexpected packet
     if let Some(ConnectionStates::Established { connection, .. }) =
-        lock_read!(get_state!().connection_state).get(&packet.session_id)
+        lock_read!(get_state!().connections).get(&packet.session_id)
     {
         _ = connection
             .clone()
@@ -222,16 +223,18 @@ pub async fn received_hello_packet_as_initializer(
         .await
     {
         let (ephemeral_secret, public_key) = key_exchange::create();
-        let handshake_id = debug_o_unwrap_or_return!(
+        let handshake_id = o_unwrap_or_return!(
             get_state!()
                 .reuse_handshake(
                     packet.proposed_session_id,
                     packet.handshake_id,
                     ephemeral_secret,
                 )
-                .await,
-            "Invariant broken in the `received_hello_packet_as_initializer` routine: \
+                .await
+                .panic_on_debug(
+                    "Invariant broken in the `received_hello_packet_as_initializer` routine: \
                 the handshake did not exist"
+                )
         );
 
         Box::new(HelloPacket::new(
@@ -247,15 +250,17 @@ pub async fn received_hello_packet_as_initializer(
     }
 
     let (sender, receiver) = mpsc::channel::<ConnectionEvent>(256);
-    let (secret, response) = get_state!()
-        .promote_handshake(
-            packet.proposed_session_id,
-            src_addr,
-            packet.handshake_id,
-            sender,
-            packet.app_id,
-        )
-        .await;
+    let (secret, response) = o_unwrap_or_return!(
+        get_state!()
+            .promote_handshake(
+                packet.proposed_session_id,
+                src_addr,
+                packet.handshake_id,
+                sender,
+                packet.app_id,
+            )
+            .await
+    );
     let key = key_exchange::get_shared_secret(secret, packet.public_key);
     let cipher = Aes256GcmSiv::new(&key.into());
 
@@ -286,9 +291,8 @@ pub async fn received_packet_that_requires_ack(
     sender: ManagerToProcessor,
 ) {
     let address = *lock_read!(match_or_return!(
-        o_unwrap_or_return!(lock_read!(get_state!().connection_state).get(&session_id)),
-        address,
-        ConnectionStates::Established { address, .. }
+        o_unwrap_or_return!(lock_read!(get_state!().connections).get(&session_id)),
+        ConnectionStates::Established { address, .. } => address
     ));
 
     let fingerprint = fingerprint.into();
