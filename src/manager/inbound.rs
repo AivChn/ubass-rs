@@ -4,17 +4,17 @@ use crate::{
     manager::{
         routines::{
             errors::{self, handle_errors},
-            received,
+            received::{self, received_handshake_ack_packet},
         },
-        types::{InboundReceiver, InboundSender, OutboundSender},
+        types::{ManagerFromProcessor, ManagerToApi, ManagerToProcessor},
     },
     prelude::*,
 };
 
 pub async fn init(
-    mut inbound_receiver: InboundReceiver,
-    outbound_sender: OutboundSender,
-    app_sender: InboundSender,
+    mut inbound_receiver: ManagerFromProcessor,
+    outbound_sender: ManagerToProcessor,
+    app_sender: ManagerToApi,
 ) -> ErrResult {
     let monitor = Arc::new(HandleMonitor::default());
     monitor.clone().init();
@@ -22,15 +22,15 @@ pub async fn init(
     loop {
         match inbound_receiver.recv().await {
             None => {
-                return Err(Error::Channel(ChannelError::ChannelClosed(Inbound)));
+                return Err(ChannelError::ChannelClosed(Inbound).into());
             }
             Some(Err(error)) => {
                 monitor
                     .dispatch(handle_errors(error, outbound_sender.clone()))
                     .await;
-                continue;
             }
             Some(Ok(ManagerMessage::Closed)) => {
+                monitor.flush().await;
                 return Ok(());
             }
             Some(Ok(message)) => {
@@ -41,16 +41,15 @@ pub async fn init(
                         app_sender.clone(),
                     ))
                     .await;
-                continue;
             }
-        };
+        }
     }
 }
 
 async fn handle_message(
     message: ManagerMessage,
-    outbound_sender: OutboundSender,
-    app_sender: InboundSender,
+    outbound_sender: ManagerToProcessor,
+    app_sender: ManagerToApi,
 ) {
     match message {
         ManagerMessage::Recovered(recoverd_packets) => {
@@ -68,10 +67,19 @@ async fn handle_message(
                 )
                 .await;
             }
-            packets::Packet::TrackRequestPacket(track_request_packet) => todo!(),
-            packets::Packet::DataPacket(data_packet) => todo!(),
+            packets::Packet::DataPacket(data_packet) => {
+                received::received_data_packet(data_packet, app_sender, outbound_sender).await;
+            }
+            packets::Packet::HandshakeAckPacket(handshake_ack_packet) => {
+                received_handshake_ack_packet(handshake_ack_packet).await;
+            }
+            packets::Packet::TrackRequestPacket(track_request_packet) => {
+                received::received_track_request_packet(track_request_packet).await;
+            }
             packets::Packet::ParityPacket(parity_packet) => todo!(),
-            packets::Packet::AckPacket(ack_packet) => todo!(),
+            packets::Packet::AckPacket(ack_packet) => {
+                received::received_ack_packet(ack_packet).await;
+            }
             packets::Packet::IncompatibleVersionPacket(incompatible_version_packet) => todo!(),
             packets::Packet::SessionDoesNotExistErrorPacket(
                 session_does_not_exist_error_packet,
