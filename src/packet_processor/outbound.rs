@@ -13,7 +13,7 @@ use crate::{
     packet_processor::{
         encryption::{self, Encryptable},
         fec::{self, FECCompatible, Recovered},
-        serialize::Serialize,
+        serialize::{self, Serialize},
         types::{InboundSender, OutboundSender, ProcessedPacket},
     },
     prelude::*,
@@ -80,9 +80,11 @@ pub async fn init(
             PacketProcessingMessage::SendPacket(packet_wrapper) => packet_wrapper,
             PacketProcessingMessage::Recover(OneShot {
                 data: (session_id, batch_id),
-                reply,
+                response,
             }) => {
-                monitor.dispatch(recover(session_id, batch_id, reply)).await;
+                monitor
+                    .dispatch(recover(session_id, batch_id, response))
+                    .await;
                 continue;
             }
             PacketProcessingMessage::Close => {
@@ -127,6 +129,8 @@ async fn handle_packet(
         // fec + encrypted
         // could be acked
         Packet::DataPacket(packet) => {
+            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
+            eprintln!("data: {:?}", packet);
             add_ack!(for DataPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             handle_monitor
@@ -146,12 +150,14 @@ async fn handle_packet(
 
         //encrypted
         Packet::TrackRequestPacket(packet) => {
+            eprintln!("got {:?} from {}", packet.control_type, packet.session_id);
             add_ack!(for TrackRequestPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
             process_encrypted(packet, session_id, addr, encryption_monitor).await
         }
         Packet::AppRejectErrorPacket(packet) => {
+            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             add_ack!(for AppRejectErrorPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
@@ -160,18 +166,21 @@ async fn handle_packet(
 
         // authenticated
         Packet::RetransmitPacket(packet) => {
+            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             add_ack!(for RetransmitPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
             process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
         Packet::PlaybackStatusPacket(packet) => {
+            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             add_ack!(for PlaybackStatusPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
             process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
         Packet::SessionDoesNotExistErrorPacket(packet) => {
+            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             add_ack!(
                 for SessionDoesNotExistErrorPacket(packet),
                 sent to addr,
@@ -183,16 +192,22 @@ async fn handle_packet(
         }
         // could not be acked
         Packet::UnexpectedPacketErrorPacket(packet) => {
+            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             let session_id = packet.session_id;
             process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
         Packet::AckPacket(packet) => {
+            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             let session_id = packet.session_id;
             process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
 
         // nothing
         Packet::HelloPacket(packet) => {
+            eprintln!(
+                "got {:?} from {}",
+                packet.control_type, packet.proposed_session_id
+            );
             let mut serialized;
             serialize!(packet -> serialized);
 
@@ -201,6 +216,18 @@ async fn handle_packet(
                 packet_type: PacketType::Host,
                 data: serialized,
                 duplicate_count: 7,
+            }
+        }
+        Packet::HandshakeAckPacket(packet) => {
+            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
+            let mut serialized;
+            serialize!(packet -> serialized);
+
+            ProcessedPacket {
+                dest_addr: addr,
+                packet_type: PacketType::HandshakeAck,
+                data: serialized,
+                duplicate_count: 3,
             }
         }
         Packet::IncompatibleVersionPacket(packet) => {
