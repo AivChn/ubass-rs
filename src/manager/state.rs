@@ -1,21 +1,21 @@
 #![allow(private_interfaces)]
 use aes_gcm_siv::Aes256GcmSiv;
-use derive_more::Deref;
-use tokio::sync::{Mutex, RwLock, mpsc::Sender, oneshot, watch};
+use derive_more::{Deref, Display};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot, watch};
 use x25519_dalek::EphemeralSecret;
 
 use crate::{
     api::{ReadableBuffer, WriteableBuffer},
-    debug_o_unwrap_or_return, debug_r_unwrap_or_return, get_state, lock, lock_read, lock_write,
+    debug_match_or_return, get_state, lock, lock_read, lock_write,
     manager::{
-        STATE, inbound,
+        CHANNEL_BUFFER_SIZE, STATE, inbound,
         packets::{
             BatchID, HelloPacket, MAX_PAYLOAD_LENGTH, Packet, PacketFingerprint, PacketWrapper,
             SessionId,
         },
-        types::ManagerToProcessor,
+        types::{ForeignTimestamp, ManagerToProcessor},
     },
-    o_unwrap_or_return,
+    match_or_return, o_unwrap_or_return,
     packet_processor::fingerprint,
     prelude::*,
     r_unwrap_or_return,
@@ -23,7 +23,9 @@ use crate::{
 use core::panic;
 use std::{
     collections::{HashSet, VecDeque, hash_map::Entry},
+    fmt::Display,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
+    result,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -51,11 +53,15 @@ sessions_state_fields!(
     FecStateTable(SessionId => SessionFecState),
     SessionAppIdTable(SessionId => AppId),
     SessionAddressTable(SessionId => SocketAddr),
-    HandshakeStateTable(HandshakeId => HandshakeState)
+    HandshakeStateTable(HandshakeId => HandshakeState),
+    AddressSessionIdTable(SocketAddr => Vec<SessionId>)
 );
 
 #[derive(Default)]
-pub struct LastActivityTable(HashMap<SessionId, Timestamp>);
+pub struct LastActivityTable(HashMap<SessionId, ForeignTimestamp>);
+
+#[derive(Default, Debug, Deref)]
+pub struct ConnectionStatesTable<'stream>(RwLock<HashMap<SessionId, ConnectionStates<'stream>>>);
 
 #[derive(Debug)]
 pub enum Streaming<'stream> {
@@ -64,7 +70,7 @@ pub enum Streaming<'stream> {
 }
 
 #[derive(Debug)]
-enum SessionStates<'stream> {
+pub enum SessionStates<'stream> {
     Up,
     Down,
     Streaming {
@@ -73,18 +79,36 @@ enum SessionStates<'stream> {
     },
 }
 
+impl Display for SessionStates<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = match self {
+            SessionStates::Up => "Up",
+            SessionStates::Down => "Down",
+            SessionStates::Streaming {
+                streaming: Streaming::To(_),
+                ..
+            } => "StreamingTo",
+            SessionStates::Streaming {
+                streaming: Streaming::From(_),
+                ..
+            } => "StreamingFrom",
+        };
+        write!(f, "{name}")
+    }
+}
+
 #[derive(Debug)]
-enum ConnectionStates<'buf> {
+pub enum ConnectionStates<'buf> {
     Handshake {
         ack_triggered_response: oneshot::Sender<
-            core::result::Result<(SessionId, Receiver<ConnectionEvent>), ConnectionError>,
+            core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
         >,
         app_id: AppId,
         address: RwLock<SocketAddr>,
     },
     Established {
-        last_activity: Mutex<Timestamp>,
-        connection: Sender<ConnectionEvent>,
+        last_activity: Mutex<ForeignTimestamp>,
+        connection: mpsc::Sender<ConnectionEvent>,
         state: SessionStates<'buf>,
         fec: SessionFecState,
         address: RwLock<SocketAddr>,
@@ -92,62 +116,57 @@ enum ConnectionStates<'buf> {
     },
 }
 
-pub struct TempSessionStates {
+pub struct ProtocolState<'stream> {
     app_id: AppId,
     port: Port,
-    handles: Option<LayerHandles>,
+    // this is a mutex because the compiler hates me specifically
+    handles: Mutex<Option<LayerHandles>>,
     global_handle_monitor: Arc<HandleMonitor>,
-    pub general: GeneralStateTable,
-    pub last_activity: LastActivityTable,
+    pub connections: ConnectionStatesTable<'stream>,
     pub handshakes: HandshakeStateTable,
     pub ack: PendingAckWindow,
     pub encryption: EncryptionTable,
     pub fingerprints: FingerprintTable,
-    pub addresses: SessionAddressTable,
-    pub fec: FecStateTable,
-    pub app_ids: SessionAppIdTable,
+    pub address_session: AddressSessionIdTable,
 }
 
-impl TempSessionStates {
-    pub fn new(
-        port: Port,
-        app_id: AppId,
-        sender: ManagerToProcessor,
-        transport_handle: JoinHandle<()>,
-        processor_handle: JoinHandle<()>,
-    ) -> Self {
+impl ProtocolState<'_> {
+    #[must_use]
+    pub fn new(port: Port, app_id: AppId, sender: ManagerToProcessor) -> Self {
         let global_handle_monitor = Arc::new(HandleMonitor::default());
         global_handle_monitor.clone().init();
 
         Self {
             app_id,
             port,
-            handles: Some(LayerHandles::new(transport_handle, processor_handle)),
+            handles: Mutex::default(),
             global_handle_monitor,
-            general: GeneralStateTable::default(),
-            last_activity: LastActivityTable::default(),
+            connections: ConnectionStatesTable::default(),
             handshakes: HandshakeStateTable::default(),
             ack: PendingAckWindow::new(sender),
             encryption: EncryptionTable::default(),
             fingerprints: FingerprintTable::default(),
-            addresses: SessionAddressTable::default(),
-            fec: FecStateTable::default(),
-            app_ids: SessionAppIdTable::default(),
+            address_session: AddressSessionIdTable::default(),
         }
     }
 
     /// Joins both layer threads.
     /// **DANGEROUS**: This function blocks the entire async runtime, only use if the protocol is
     /// shutting down, when no other tasks need to be done.
-    pub fn join_layers(&mut self) {
-        let handles = self.handles.take().unwrap_or_else(|| {
-            panic!(
-                "Invariant broken while joining the layer threads: \
-            function was called more than once"
-            )
-        });
+    pub async fn join_layers(&mut self) {
+        let handles = o_unwrap_or_return!(lock!(self.handles).take().panic_on_debug(
+            "Invariant broken while joining the layer threads: \
+            function was called more than once",
+        ));
 
         handles.blocking_join();
+    }
+
+    pub async fn set_handles(&self, transport: JoinHandle<()>, processor: JoinHandle<()>) {
+        lock!(self.handles).insert(LayerHandles {
+            transport,
+            processor,
+        });
     }
 
     pub async fn promote_handshake(
@@ -155,21 +174,124 @@ impl TempSessionStates {
         new_session_id: SessionId,
         address: SocketAddr,
         handshake_id: HandshakeId,
+        connection: mpsc::Sender<ConnectionEvent>,
         app_id: AppId,
-    ) -> EphemeralSecret {
+    ) -> Option<(
+        EphemeralSecret,
+        oneshot::Sender<
+            core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
+        >,
+    )> {
         let Some(HandshakeState {
             peer_address,
             ephemeral_secret,
             session_id,
+            response,
         }) = self.handshakes.take(handshake_id).await
         else {
-            unreachable!()
+            debug_assert!(
+                false,
+                "Invariant broken while promoting handshake {handshake_id}: \
+                    could not find handshake entry"
+            );
+            return None;
         };
 
-        self.new_session(SessionStateFlags::none(), new_session_id, address, app_id)
-            .await;
+        let mut lock = lock_write!(self.connections);
+        let Entry::Vacant(entry) = lock.entry(session_id) else {
+            debug_assert!(
+                false,
+                "Invariant broken while promoting handshake {handshake_id}: \
+                    session with session ID {session_id} already exists"
+            );
+            return None;
+        };
 
-        ephemeral_secret
+        entry.insert(ConnectionStates::Established {
+            last_activity: Mutex::default(),
+            connection,
+            state: SessionStates::Up,
+            fec: SessionFecState::default(),
+            address: RwLock::new(address),
+            app_id,
+        });
+
+        lock_write!(self.address_session)
+            .entry(address)
+            .and_modify(|v| v.push(session_id))
+            .or_insert(vec![session_id]);
+
+        Some((ephemeral_secret, response))
+    }
+
+    pub async fn reuse_handshake(
+        &self,
+        session_id: SessionId,
+        handshake_id: HandshakeId,
+        ephemeral_secret: EphemeralSecret,
+    ) -> Option<HandshakeId> {
+        let HandshakeState {
+            peer_address,
+            ephemeral_secret,
+            session_id: _,
+            response,
+        } = lock_write!(self.handshakes).remove(&handshake_id)?;
+
+        let new_handshake_id = HandshakeId::generate().await;
+
+        lock_write!(self.handshakes).insert(
+            new_handshake_id,
+            HandshakeState {
+                peer_address,
+                ephemeral_secret,
+                session_id,
+                response,
+            },
+        );
+
+        Some(new_handshake_id)
+    }
+
+    pub async fn handshake_done(&self, session_id: SessionId) {
+        let mut lock = lock_write!(self.connections);
+        match lock.remove(&session_id) {
+            Some(ConnectionStates::Handshake {
+                ack_triggered_response,
+                app_id,
+                address,
+            }) => {
+                let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+                lock.insert(
+                    session_id,
+                    ConnectionStates::Established {
+                        last_activity: Mutex::default(),
+                        connection: sender,
+                        state: SessionStates::Up,
+                        fec: SessionFecState::default(),
+                        address,
+                        app_id,
+                    },
+                );
+
+                ack_triggered_response.send(Ok((session_id, receiver)));
+            }
+            Some(established @ ConnectionStates::Established { .. }) => {
+                debug_assert!(
+                    false,
+                    "Invariant broken while finishing a handshake: \
+                        the session exists but is already fully Established. {established:?} "
+                );
+
+                lock.insert(session_id, established);
+            }
+            None => {
+                debug_assert!(
+                    false,
+                    "Invariant broken while finishing a handshake: \
+                        the given session ID {session_id} had no associated sessions"
+                );
+            }
+        }
     }
 
     pub fn app_id(&self) -> AppId {
@@ -181,31 +303,108 @@ impl TempSessionStates {
     }
 
     pub async fn session_exists(&self, session_id: SessionId) -> bool {
-        lock_read!(self.general).contains_key(&session_id)
+        lock_read!(self.connections).contains_key(&session_id)
     }
 
     pub async fn new_session(
         &self,
-        flags: SessionStateFlags,
         session_id: SessionId,
+        response: oneshot::Sender<
+            core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
+        >,
         address: SocketAddr,
         app_id: AppId,
     ) {
-        lock_write!(self.general).insert(
-            session_id,
-            GeneralSessionState {
-                last_key_rotation_time: Timestamp::now(),
-                flags,
-            },
+        let mut lock = lock_write!(self.connections);
+        let entry = debug_match_or_return!(
+            lock.entry(session_id),
+            Entry::Vacant(entry) => entry,
+            format!(
+                "in `new_session`: session {session_id} already existed, this one was with {app_id} from {address:?} "
+            )
         );
 
-        lock_write!(self.app_ids).insert(session_id, app_id);
+        entry.insert(ConnectionStates::Handshake {
+            ack_triggered_response: response,
+            app_id,
+            address: RwLock::new(address),
+        });
 
         lock_write!(self.fingerprints).insert(session_id, Arc::new(FingerprintWindow::default()));
 
-        lock_write!(self.addresses).insert(session_id, address);
+        lock_write!(self.address_session)
+            .entry(address)
+            .and_modify(|v| v.push(session_id))
+            .or_insert(vec![session_id]);
+    }
 
-        lock_write!(self.fec).insert(session_id, SessionFecState::default());
+    pub async fn advertise_closed(&self) {
+        for (session_id, connection) in lock_write!(self.connections).drain() {
+            match connection {
+                ConnectionStates::Handshake {
+                    ack_triggered_response,
+                    app_id,
+                    address,
+                } => {
+                    if ack_triggered_response
+                        .send(Err(ConnectionError::ProtocolClosed))
+                        .is_err()
+                    {
+                        debug_assert!(
+                            false,
+                            "Invariant broken in `advertise_closed`: \
+                                response to a handshake request failed. session_id: {}, app_id: {}, address: {}",
+                            session_id,
+                            app_id,
+                            *lock_read!(address)
+                        );
+                    }
+                }
+                ConnectionStates::Established {
+                    last_activity,
+                    connection,
+                    state,
+                    fec,
+                    address,
+                    app_id,
+                } => {
+                    if connection
+                        .send(ConnectionEvent::Closed(vec![]))
+                        .await
+                        .is_err()
+                    {
+                        debug_assert!(
+                            false,
+                            "Invariant broken in `advertise_closed`: \
+                                channel to connection with session ID {} with {} ({}) was already closed. state: {}.",
+                            session_id,
+                            app_id,
+                            *lock_read!(address),
+                            state
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl AddressSessionIdTable {
+    pub async fn free_session(&self, address: SocketAddr) -> Option<SessionId> {
+        let lock = lock_read!(self);
+        let connections = lock_read!(get_state!().connections);
+        lock.get(&address)?
+            .iter()
+            .find(|session| {
+                matches!(
+                    connections.get(session),
+                    Some(ConnectionStates::Established {
+                        state: SessionStates::Up | SessionStates::Down,
+                        ..
+                    })
+                )
+            })
+            .copied()
     }
 }
 
@@ -255,22 +454,15 @@ impl FingerprintTable {
 }
 
 impl LastActivityTable {
-    pub fn update(&self, session_id: SessionId) {
-        unsafe {
-            let this = self as *const Self as *mut Self;
-            (*this)
-                .0
-                .entry(session_id)
-                .and_modify(Timestamp::set_again)
-                .or_insert_with(Timestamp::now);
-        }
+    pub fn update(&mut self, session_id: SessionId, ts: Timestamp) {
+        self.0
+            .entry(session_id)
+            .and_modify(|v| v.update(ts.get()))
+            .or_insert(ForeignTimestamp::new(ts.get()));
     }
 
-    pub fn read(&self, session_id: SessionId) -> Timestamp {
-        self.0
-            .get(&session_id)
-            .copied()
-            .unwrap_or_else(Timestamp::now)
+    pub fn read(&self, session_id: SessionId) -> Option<Timestamp> {
+        self.0.get(&session_id).map(Timestamp::from)
     }
 }
 
@@ -313,6 +505,7 @@ impl LayerHandles {
 pub struct Port(u16);
 
 impl Port {
+    #[must_use]
     pub fn new(port: u16) -> Self {
         Port(port)
     }
@@ -353,7 +546,7 @@ pub enum SessionStateFlag {
 #[flagtype(SessionStateFlag)]
 pub struct SessionStateFlags(u32);
 
-#[derive(Hash, Eq, PartialEq, Debug, Clone, Copy, Serialize)]
+#[derive(Display, Hash, Eq, PartialEq, Debug, Clone, Copy, Serialize)]
 #[repr(transparent)]
 pub struct HandshakeId(u32);
 
@@ -373,23 +566,31 @@ pub struct HandshakeState {
     peer_address: SocketAddr,
     ephemeral_secret: EphemeralSecret,
     session_id: SessionId,
+    response: oneshot::Sender<
+        core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
+    >,
 }
 
 impl HandshakeState {
+    #[must_use]
     pub fn new(
         peer_address: SocketAddr,
         ephemeral_secret: EphemeralSecret,
         session_id: SessionId,
+        response: oneshot::Sender<
+            core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
+        >,
     ) -> Self {
         Self {
             peer_address,
             ephemeral_secret,
             session_id,
+            response,
         }
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Deref, Debug, Clone, Display)]
 #[repr(transparent)]
 pub struct AppId(String);
 
@@ -397,6 +598,7 @@ impl AppId {
     // Large enough without exceeding the mac packet size with the number of headers on the
     // HelloPacket
     pub const MAX_LENGTH: usize = 512;
+    #[must_use]
     pub fn new(id: String) -> Self {
         debug_assert!(
             id.is_ascii(),
@@ -467,10 +669,13 @@ impl HandshakeStateTable {
         peer_address: SocketAddr,
         ephemeral_secret: EphemeralSecret,
         session_id: SessionId,
+        response: oneshot::Sender<
+            core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
+        >,
     ) {
         lock_write!(self).insert(
             handshake_id,
-            HandshakeState::new(peer_address, ephemeral_secret, session_id),
+            HandshakeState::new(peer_address, ephemeral_secret, session_id, response),
         );
     }
 
@@ -558,6 +763,7 @@ impl FecArrivedBitMap {
         self.0[0].count_ones() + self.0[1].count_ones() >= threshold as u32
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn count_set(&self) -> u8 {
         (self.0[0].count_ones() + self.0[1].count_ones()) as u8
     }
@@ -642,33 +848,6 @@ impl FingerprintMonitor {
     }
 }
 
-//impl PendingAck {
-//    const MAX_RETRIES: u8 = 5;
-//
-//    pub fn new(packet: PacketWrapper, timestamp: Timestamp) -> Self {
-//        Self {
-//            packet,
-//            timestamp,
-//            retries: 0,
-//        }
-//    }
-//
-//    pub fn packet(&self) -> PacketWrapper {
-//        self.packet.clone()
-//    }
-//
-//    pub fn retried(&mut self) {
-//        self.timestamp = Timestamp::now();
-//        self.retries += 1;
-//    }
-//
-//    pub fn is_expired(&self) -> bool {
-//        self.timestamp.been_longer_than(PACKET_DISCARD_TIME_MS) && self.retries >= Self::MAX_RETRIES
-//    }
-//}
-//
-//impl PendingAckTable {}
-
 struct PendingAckQueueEntry {
     timestamp: Timestamp,
     ptr: FingerprintPtr,
@@ -709,6 +888,7 @@ impl PendingAckWindow {
     const PRUNE_INTERVAL: u64 = PACKET_DISCARD_TIME_MS;
     const BUFFERING_TIME: u64 = 2 * 1000;
 
+    #[must_use]
     pub fn new(sender: ManagerToProcessor) -> Self {
         Self {
             pending: RwLock::default(),
@@ -725,20 +905,23 @@ impl PendingAckWindow {
     pub async fn add(&'static self, packet: Packet) {
         get_state!()
             .global_handle_monitor
-            .dispatch(self._add(packet))
+            .dispatch(self.inner_add(packet))
             .await;
     }
 
-    async fn _add(&self, packet: Packet) {
-        let fingerprint = debug_r_unwrap_or_return!(
-            PacketFingerprint::try_from(&packet),
-            format!(
+    pub async fn acknowledge(&self, fingerprint: impl Into<PacketFingerprint>) {
+        let fingerprint = fingerprint.into();
+        lock_write!(self.pending).remove(&fingerprint);
+    }
+
+    async fn inner_add(&self, packet: Packet) {
+        let fingerprint = r_unwrap_or_return!(PacketFingerprint::try_from(&packet).panic_on_debug(
+            &format!(
                 "Invariant broken while adding a packet to `PendingAckWindow`:\
-                A packet that should not be acked was provided ({:?}) full list can\
+                A packet that should not be acked was provided ({packet:?}) full list can\
                 be found at the impl TryFrom<&Packet> for PacketFingerprint",
-                packet
             )
-        );
+        ));
 
         let entry = PendingAckQueueEntry::new(&fingerprint);
         lock_write!(self.pending).insert(fingerprint, packet);
@@ -778,23 +961,23 @@ impl PendingAckWindow {
             {
                 let pending = lock_read!(self.pending);
                 let mut queue = lock!(self.queue);
-                let lock = lock_read!(get_state!().addresses);
+                let lock = lock_read!(get_state!().connections);
                 for entry in to_retry.drain(..) {
                     let Some(packet) = pending.get(unsafe { &**entry.ptr }) else {
                         continue;
                     };
 
-                    let Some(address) = lock.get(
-                        &packet
-                            .session_id()
-                            .expect("IncompatibleVersion packets are never acked"),
+                    let Some(ConnectionStates::Established { address, .. }) = lock.get(
+                        o_unwrap_or_return!(&packet.session_id().panic_on_debug(&format!(
+                            "A packet that should never be acked has been inserted: {packet:?}"
+                        ))),
                     ) else {
                         continue;
                     };
 
                     queue.push_back(entry);
 
-                    Box::new(packet.clone()).send(self.sender.clone(), *address);
+                    Box::new(packet.clone()).send(self.sender.clone(), *lock_read!(address));
                 }
             }
 
@@ -898,6 +1081,7 @@ pub struct EncryptionWindow {
 }
 
 impl EncryptionWindow {
+    #[must_use]
     pub fn new(cipher: Aes256GcmSiv) -> Self {
         Self {
             cipher: Arc::new(cipher),
