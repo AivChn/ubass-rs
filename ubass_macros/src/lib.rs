@@ -351,7 +351,7 @@ pub fn send_packet_derive_macro(item: TokenStream) -> TokenStream {
         syn::Data::Struct(_) => quote! {
             #[async_trait]
             impl SendPacket for #ident {
-                type Sender = OutboundSender;
+                type Sender = ManagerToProcessor;
 
                 async fn send(self: Box<Self>, sender: Self::Sender, address: SocketAddr) {
                     sender
