@@ -1,29 +1,89 @@
 use std::net::SocketAddr;
 
+use crate::{
+    api::{Connection, IncomingConnection},
+    error::ConnectionError,
+    lock,
+    manager::state::ConnectionStates,
+    match_or_return,
+    prelude::Timestamp,
+};
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
+use tokio::sync::mpsc::{self, Receiver};
 
 use crate::{
-    DEFAULT_PORT, get_state, lock_read, lock_write,
+    DEFAULT_PORT, debug_o_unwrap_or_return, get_state, lock_read, lock_write,
     manager::{
         STATE, connect, key_exchange,
         packets::*,
         state::{EncryptionWindow, SessionStateFlag, SessionStateFlags},
-        types::{InboundSender, OutboundSender},
+        types::{ManagerToApi, ManagerToProcessor},
     },
-    utils::{AppMessage, AppResponse, Flags, OneShot, SendPacket},
+    o_unwrap_or_return,
+    packet_processor::fingerprint,
+    r_unwrap_or_return,
+    utils::{ApiMessage, AppResponse, ConnectionEvent, Flags, OneShot, SendPacket},
 };
 
-pub async fn received_packet(packet: PacketWrapper) {
-    if let Some(mut session_id) = packet.packet.session_id() {
-        get_state!().last_activity.update(session_id);
+pub async fn received_track_request_packet(packet: Box<TrackRequestPacket>) {
+    let track_id = packet.payload.take();
+    let sender = {
+        let lock = lock_read!(get_state!().connection_state);
+        o_unwrap_or_return!({
+            if let Some(ConnectionStates::Established { connection, .. }) =
+                lock.get(&packet.session_id)
+            {
+                Some(connection)
+            } else {
+                None
+            }
+        })
+        .clone()
+    };
+    _ = sender
+        .send(ConnectionEvent::TrackRequest(track_id.into()))
+        .await;
+}
+
+pub async fn update_last_activity(session_id: SessionId, ts: Timestamp) {
+    if let Some(ConnectionStates::Established { last_activity, .. }) =
+        lock_read!(get_state!().connection_state).get(&session_id)
+    {
+        lock!(last_activity).update(ts.get());
     }
 }
 
-pub async fn received_data_packet(packet: DataPacket) {
-    todo!()
+pub async fn received_ack_packet(packet: Box<AckPacket>) {
+    update_last_activity(packet.session_id, packet.timestamp).await;
+    get_state!().ack.acknowledge(packet.fingerprint).await;
+}
+
+pub async fn received_data_packet(
+    packet: Box<DataPacket>,
+    app_sender: ManagerToApi,
+    outbound_sender: ManagerToProcessor,
+) {
+    // TODO: if session is in Handshake state, buffer with TTL pending handshake ACK
+    update_last_activity(packet.session_id, packet.timestamp).await;
+
+    if packet.opts.contains(OptionFlags::RequireAck) {
+        received_packet_that_requires_ack(packet.session_id, packet.as_ref(), outbound_sender)
+            .await;
+    }
+
+    // TODO: deal with unexpected packet
+    if let Some(ConnectionStates::Established { connection, .. }) =
+        lock_read!(get_state!().connection_state).get(&packet.session_id)
+    {
+        _ = connection
+            .clone()
+            .send(ConnectionEvent::DataReceived(packet.payload))
+            .await;
+    }
 }
 
 /// Routine to handle the case of receiving any [`HelloPacket`].
+///
 /// This function will set the source address port to the one specified in the packet, and check if
 /// there is an entry tied to it in the handshakes state table. Based on the result it will either
 /// call [`received_hello_packet_as_initializer`] or [`received_hello_packet_as_receiver`]
@@ -33,8 +93,8 @@ pub async fn received_data_packet(packet: DataPacket) {
 pub async fn received_hello_packet(
     packet: HelloPacket,
     mut src_addr: SocketAddr,
-    outbound_sender: OutboundSender,
-    app_sender: InboundSender,
+    outbound_sender: ManagerToProcessor,
+    app_sender: ManagerToApi,
 ) {
     // setting the address to the one saved in state
     src_addr.set_port(*packet.receiving_port);
@@ -58,15 +118,23 @@ pub async fn received_hello_packet(
 pub async fn received_hello_packet_as_receiver(
     packet: HelloPacket,
     src_addr: SocketAddr,
-    outbound_sender: OutboundSender,
-    app_sender: InboundSender,
+    outbound_sender: ManagerToProcessor,
+    app_sender: ManagerToApi,
 ) {
-    // ask for permission to communicate with the giveb app ID
-    let (request, receiver) = OneShot::<_, AppResponse>::app(packet.app_id.clone());
-    let wrapped = AppMessage::HelloAppId(request);
+    // ask for permission to communicate with the given app ID
+    let (app_id_request, app_id_response) = OneShot::<_, AppResponse>::new(packet.app_id.clone());
+    let (handshake_request, handshake_response) = OneShot::<
+        _,
+        core::result::Result<(SessionId, Receiver<ConnectionEvent>), ConnectionError>,
+    >::new(());
+    let wrapped = ApiMessage::IncommingConncetion {
+        request: app_id_request,
+        response: handshake_response,
+        peer_address: src_addr,
+    };
     _ = app_sender.send(Ok(wrapped)).await;
 
-    match receiver.recv().await {
+    match r_unwrap_or_return!(app_id_response.recv().await) {
         // send back app rejected error
         AppResponse::AppRejected(message) => {
             AppRejectErrorPacket::new(
@@ -93,11 +161,11 @@ pub async fn received_hello_packet_as_receiver(
                 packet.proposed_session_id
             };
 
-            // create session
+            // create session in handshake state
             get_state!()
                 .new_session(
-                    SessionStateFlags::construct(&[SessionStateFlag::Handshake]),
                     session_id,
+                    handshake_request.response,
                     src_addr,
                     packet.app_id,
                 )
@@ -140,12 +208,12 @@ pub async fn received_hello_packet_as_receiver(
 ///
 /// # Panics
 /// This function does not panic, but it is the only call site for
-/// [`SessionStates::promote_handshake()`], which will panic if the "handshake state must exist"
+/// [`SessionStates::promote_handshake`], which will panic if the "handshake state must exist"
 /// invariant is broken.
 pub async fn received_hello_packet_as_initializer(
     packet: HelloPacket,
     src_addr: SocketAddr,
-    outbound_sender: OutboundSender,
+    outbound_sender: ManagerToProcessor,
 ) {
     // if the session ID is already used that means that there was overlap on both hosts on both
     // attempts. This astronomically unlikely but is possible, so it's accounted for by restarting.
@@ -153,18 +221,38 @@ pub async fn received_hello_packet_as_initializer(
         .session_exists(packet.proposed_session_id)
         .await
     {
-        connect(src_addr, outbound_sender).await;
+        let (ephemeral_secret, public_key) = key_exchange::create();
+        let handshake_id = debug_o_unwrap_or_return!(
+            get_state!()
+                .reuse_handshake(
+                    packet.proposed_session_id,
+                    packet.handshake_id,
+                    ephemeral_secret,
+                )
+                .await,
+            "Invariant broken in the `received_hello_packet_as_initializer` routine: \
+                the handshake did not exist"
+        );
+
+        Box::new(HelloPacket::new(
+            Options::none(),
+            SessionId::generate(),
+            handshake_id,
+            public_key,
+            get_state!().app_id(),
+            get_state!().port(),
+        ))
+        .send(outbound_sender, src_addr);
         return;
     }
 
-    // get packet fingerprint before any partial moves
-    let fingerprint = PacketFingerprint::from(&packet);
-
-    let secret = get_state!()
+    let (sender, receiver) = mpsc::channel::<ConnectionEvent>(256);
+    let (secret, response) = get_state!()
         .promote_handshake(
             packet.proposed_session_id,
             src_addr,
             packet.handshake_id,
+            sender,
             packet.app_id,
         )
         .await;
@@ -175,9 +263,38 @@ pub async fn received_hello_packet_as_initializer(
     lock_write!(get_state!().encryption)
         .insert(packet.proposed_session_id, EncryptionWindow::new(cipher));
 
+    _ = response
+        .send(Ok((packet.proposed_session_id, receiver)))
+        .map_err(|_| eprintln!("failed to send!"));
+
     // construct ack and send
-    AckPacket::new(Options::none(), packet.proposed_session_id, fingerprint)
-        .send(outbound_sender, src_addr)
+    Box::new(HandshakeAckPacket::new(
+        packet.proposed_session_id,
+        packet.handshake_id,
+    ))
+    .send(outbound_sender, src_addr)
+    .await;
+}
+
+pub async fn received_handshake_ack_packet(packet: Box<HandshakeAckPacket>) {
+    get_state!().handshake_done(packet.session_id).await;
+}
+
+pub async fn received_packet_that_requires_ack(
+    session_id: SessionId,
+    fingerprint: impl Into<PacketFingerprint>,
+    sender: ManagerToProcessor,
+) {
+    let address = *lock_read!(match_or_return!(
+        o_unwrap_or_return!(lock_read!(get_state!().connection_state).get(&session_id)),
+        address,
+        ConnectionStates::Established { address, .. }
+    ));
+
+    let fingerprint = fingerprint.into();
+
+    AckPacket::new(Options::none(), session_id, fingerprint)
+        .send(sender, address)
         .await;
 }
 
@@ -187,7 +304,7 @@ pub async fn received_hello_packet_as_initializer(
 pub async fn received_incompatible_version_error(
     _version: Version,
     src_addr: SocketAddr,
-    sender: OutboundSender,
+    sender: ManagerToProcessor,
 ) {
     let packet = IncompatibleVersionPacket::packet();
 
