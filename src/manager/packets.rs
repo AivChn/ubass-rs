@@ -1,6 +1,7 @@
+#![allow(clippy::unnecessary_box_returns)]
 use crate::{
     manager::{
-        OutboundSender,
+        ManagerToProcessor,
         state::{HandshakeId, Port},
     },
     packet_processor::serialize,
@@ -8,7 +9,7 @@ use crate::{
 };
 
 use core::ops::Deref;
-use std::{fmt::Display, net::SocketAddr};
+use std::{fmt::Display, net::SocketAddr, result, vec};
 
 use crate::packet_processor::serialize::Serialize;
 use async_trait::async_trait;
@@ -34,6 +35,7 @@ pub enum Packet {
     MetadataPacket(Box<MetadataPacket>),
     ParityPacket(Box<ParityPacket>),
     AckPacket(Box<AckPacket>),
+    HandshakeAckPacket(Box<HandshakeAckPacket>),
     RetransmitPacket(Box<RetransmitPacket>),
     PlaybackStatusPacket(Box<PlaybackStatusPacket>),
     IncompatibleVersionPacket(Box<IncompatibleVersionPacket>),
@@ -43,10 +45,12 @@ pub enum Packet {
 }
 
 impl Packet {
+    #[must_use]
     pub fn wrap(self, addr: SocketAddr) -> PacketWrapper {
         PacketWrapper { addr, packet: self }
     }
 
+    #[must_use]
     pub fn session_id(&self) -> Option<SessionId> {
         match self {
             Packet::HelloPacket(packet) => Some(packet.proposed_session_id),
@@ -60,7 +64,7 @@ impl Packet {
             Packet::SessionDoesNotExistErrorPacket(packet) => Some(packet.session_id),
             Packet::UnexpectedPacketErrorPacket(packet) => Some(packet.session_id),
             Packet::AppRejectErrorPacket(packet) => Some(packet.session_id),
-            Packet::IncompatibleVersionPacket(_) => {
+            Packet::IncompatibleVersionPacket(_) | Packet::HandshakeAckPacket(_) => {
                 debug_assert!(
                     false,
                     "Invariant broken while trying to get the session_id of a packet: \
@@ -73,7 +77,7 @@ impl Packet {
 }
 
 impl SendPacket for Packet {
-    type Sender = OutboundSender;
+    type Sender = ManagerToProcessor;
 
     #[must_use]
     #[allow(
@@ -104,6 +108,7 @@ impl SendPacket for Packet {
             Packet::SessionDoesNotExistErrorPacket(packet) => packet.send(sender, address),
             Packet::UnexpectedPacketErrorPacket(packet) => packet.send(sender, address),
             Packet::AppRejectErrorPacket(packet) => packet.send(sender, address),
+            Packet::HandshakeAckPacket(packet) => packet.send(sender, address),
         }
     }
 }
@@ -124,7 +129,8 @@ impl TryFrom<&Packet> for PacketFingerprint {
             Packet::AppRejectErrorPacket(packet) => packet.as_ref().into(),
             _x @ (Packet::AckPacket(_)
             | Packet::IncompatibleVersionPacket(_)
-            | Packet::SessionDoesNotExistErrorPacket(_)) => {
+            | Packet::SessionDoesNotExistErrorPacket(_)
+            | Packet::HandshakeAckPacket(_)) => {
                 return Err(());
             }
         })
@@ -233,7 +239,7 @@ impl TrackRequestPacket {
         debug_assert!(
             payload.len() < MAX_PAYLOAD_LENGTH,
             "Invariant broken while constructing `TrackRequestPacket`: \
-                payload is larger than `MAX_PAYLOAD_LENGTH` ({} >= {})",
+                payload is larger than `MAX_PAYLOAD_LENGTH` ({} > {})",
             payload.len(),
             MAX_PAYLOAD_LENGTH
         );
@@ -372,7 +378,7 @@ pub struct ParityPacket {
     pub fec_info: FECInfo,
     pub session_id: SessionId,
     pub timestamp: Timestamp,
-    pub payload: PayloadField,
+    pub payload: ParityPayload,
 }
 
 impl ParityPacket {
@@ -386,7 +392,7 @@ impl ParityPacket {
         batch_id: BatchID,
         fec_info: FECInfo,
         session_id: SessionId,
-        payload: impl Into<PayloadField>,
+        payload: impl Into<ParityPayload>,
     ) -> Box<Self> {
         #[cfg(debug_assertions)]
         assert_opts_valid(opts, "ParityPacket");
@@ -443,16 +449,19 @@ impl PlaybackStatusPacket {
     }
 
     #[inline]
+    #[must_use]
     pub fn play(opts: Options, session_id: SessionId) -> Box<Self> {
         Self::new(opts, session_id, PlaybackControlType::Play)
     }
 
     #[inline]
+    #[must_use]
     pub fn pause(opts: Options, session_id: SessionId) -> Box<Self> {
         Self::new(opts, session_id, PlaybackControlType::Pause)
     }
 
     #[inline]
+    #[must_use]
     pub fn stop(opts: Options, session_id: SessionId) -> Box<Self> {
         Self::new(opts, session_id, PlaybackControlType::Stop)
     }
@@ -473,6 +482,7 @@ impl AckPacket {
     pub const HEADER_SIZE: usize = size_of::<AckPacket>();
     pub const MIN_SIZE: usize = AckPacket::HEADER_SIZE;
 
+    #[must_use]
     pub fn new(opts: Options, session_id: SessionId, fingerprint: PacketFingerprint) -> Box<Self> {
         debug_assert!(
             !opts.contains(OptionFlags::RequireAck),
@@ -499,6 +509,38 @@ impl AckPacket {
     }
 }
 
+#[derive(Debug, SendPacket, Clone, Serialize)]
+pub struct HandshakeAckPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    reserved: Reserved<3>,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+    pub handshake_id: HandshakeId,
+}
+
+impl HandshakeAckPacket {
+    #[must_use]
+    pub fn new(session_id: SessionId, handshake_id: HandshakeId) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let opts = Options::none();
+        let packet_type = PacketType::HandshakeAck;
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            reserved,
+            session_id,
+            timestamp,
+            handshake_id,
+        }
+    }
+}
+
 #[derive(Debug, SendPacket, Headers, Serialize, Clone)]
 pub struct RetransmitPacket {
     pub version: Version,
@@ -516,6 +558,7 @@ impl RetransmitPacket {
     const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH - (MAX_PAYLOAD_LENGTH % 6);
     const HEADER_SIZE: usize = size_of::<Self>() - Self::LOCAL_MAX_PAYLOAD_LENGTH;
 
+    #[must_use]
     pub fn data(opts: Options, session_id: SessionId, payload: Vec<ByteRange>) -> Box<Self> {
         debug_assert!(
             payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
@@ -548,6 +591,7 @@ impl RetransmitPacket {
         })
     }
 
+    #[must_use]
     pub fn metadata(
         opts: Options,
         session_id: SessionId,
@@ -601,6 +645,7 @@ pub struct SessionDoesNotExistErrorPacket {
 impl SessionDoesNotExistErrorPacket {
     pub const HEADER_SIZE: usize = size_of::<Self>();
 
+    #[must_use]
     pub fn new(opts: Options, session_id: SessionId) -> Box<Self> {
         #[cfg(debug_assertions)]
         assert_opts_valid(opts, "SessionDoesNotExistErrorPacket");
@@ -647,6 +692,7 @@ impl UnexpectedPacketErrorPacket {
         received_fingerprint: PacketFingerprint,
         incomprehensible: bool,
     ) -> Box<Self> {
+        #[cfg(debug_assertions)]
         debug_assert!(
             valid_secondary_type(received_secondary_type),
             "Invariant broken while constructing `UnexpectedPacketErrorPacket`: \
@@ -680,6 +726,7 @@ impl UnexpectedPacketErrorPacket {
         })
     }
 
+    #[must_use]
     pub fn unexpected(
         opts: Options,
         session_id: SessionId,
@@ -697,6 +744,7 @@ impl UnexpectedPacketErrorPacket {
         )
     }
 
+    #[must_use]
     pub fn incomprehensible(
         opts: Options,
         session_id: SessionId,
@@ -733,6 +781,7 @@ pub struct AppRejectErrorPacket {
 impl AppRejectErrorPacket {
     pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<PayloadField>();
 
+    #[must_use]
     pub fn new(
         opts: Options,
         session_id: SessionId,
@@ -781,6 +830,8 @@ pub struct IncompatibleVersionPacket {
 
 impl IncompatibleVersionPacket {
     pub const HEADER_SIZE: usize = size_of::<Self>();
+
+    #[must_use]
     pub fn packet() -> Box<Self> {
         Box::new(Self {
             zero_version: Version::new(0, 0, 0),
@@ -832,19 +883,25 @@ impl<T: Fingerprint> From<&T> for PacketFingerprint {
     }
 }
 
-#[derive(Debug, PartialEq, Serialize, Deref, DerefMut, Clone)]
+#[derive(Debug, Deref, PartialEq, Serialize, DerefMut, Clone)]
 pub struct PayloadField(Vec<u8>);
 
 impl PayloadField {
+    #[must_use]
     pub fn new(vec: Vec<u8>) -> Self {
         debug_assert!(
-            vec.len() < MAX_PAYLOAD_LENGTH,
+            vec.len() <= MAX_PAYLOAD_LENGTH,
             "Invariant broken while constructing `PayloadField`: \
-                length of vector larger than `MAX_PAYLOAD_LENGTH` ({} >= {})",
+                length of vector larger than `MAX_PAYLOAD_LENGTH` ({} > {})",
             vec.len(),
             MAX_PAYLOAD_LENGTH
         );
         Self(vec)
+    }
+
+    #[must_use]
+    pub fn take(self) -> Vec<u8> {
+        self.0
     }
 }
 
@@ -857,11 +914,50 @@ where
     }
 }
 
+impl From<PayloadField> for Box<[u8]> {
+    fn from(value: PayloadField) -> Self {
+        value.0.into_boxed_slice()
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deref, DerefMut)]
+pub struct ParityPayload(PayloadField);
+
+impl ParityPayload {
+    pub fn new(payload: impl Into<Vec<u8>>) -> Self {
+        let payload = payload.into();
+        debug_assert!(
+            payload.len() <= ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH,
+            "Invariant broken while constructing `PayloadField`: \
+                length of vector larger than `ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH` ({} > {})",
+            payload.len(),
+            ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH
+        );
+        Self(PayloadField(payload))
+    }
+}
+
+impl<T> From<T> for ParityPayload
+where
+    Vec<u8>: From<T>,
+{
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<ParityPayload> for Box<[u8]> {
+    fn from(value: ParityPayload) -> Self {
+        value.0.0.into_boxed_slice()
+    }
+}
+
 #[derive(Debug, Serialize, PartialEq, Default, Clone, Copy)]
 #[repr(transparent)]
 pub struct BufferId(u16);
 
 impl BufferId {
+    #[must_use]
     pub fn new(id: u16) -> Self {
         debug_assert!(
             id != 0,
@@ -880,6 +976,8 @@ pub struct BufferSize(u32);
 impl BufferSize {
     const MAX_MB: usize = 10;
     const MAX_BUFFER_SIZE: usize = Self::MAX_MB * 1024 * 1024;
+
+    #[must_use]
     pub fn new(size: u32) -> Self {
         debug_assert!(
             (size as usize) < Self::MAX_BUFFER_SIZE,
@@ -956,11 +1054,13 @@ impl Version {
     pub const MIN_COMPATIBLE_VERSION: Version = Version::new(0, 0, 1);
 
     #[inline]
+    #[must_use]
     pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
         Self((major as u16) << 12 | (minor as u16) << 8 | patch as u16)
     }
 
     #[inline]
+    #[must_use]
     pub const fn parse(&self) -> (u8, u8, u8) {
         (
             (self.0 >> 12) as u8,
@@ -970,11 +1070,13 @@ impl Version {
     }
 
     #[inline]
+    #[must_use]
     pub fn is_compatible(&self) -> bool {
         *self >= Version::MIN_COMPATIBLE_VERSION
     }
 
     #[inline]
+    #[must_use]
     pub fn is_zero(&self) -> bool {
         self.0 == 0
     }
@@ -995,6 +1097,7 @@ pub enum PacketType {
     Metadata = 2,
     Parity = 3,
     Ack = 4,
+    HandshakeAck = 5,
     Host = 7,
     Session = 8,
     Playback = 9,
@@ -1093,6 +1196,7 @@ pub enum ErrorType {
 pub struct BatchID(u16);
 
 impl BatchID {
+    #[must_use]
     pub fn new(id: u16) -> Self {
         debug_assert!(
             id != 0,
@@ -1133,12 +1237,14 @@ pub struct SessionId(u64);
 
 impl SessionId {
     #[inline]
+    #[must_use]
     pub fn generate() -> Self {
         Self(rand::random::<u64>())
     }
 }
 
 impl SessionId {
+    #[must_use]
     pub fn new(id: u64) -> Self {
         Self(id)
     }
@@ -1153,6 +1259,7 @@ pub struct FECInfo {
 }
 
 impl FECInfo {
+    #[must_use]
     pub fn new(batch_size: u8, batch_pos: u8, recovery_size: u8) -> Self {
         debug_assert!(
             batch_pos < batch_size + recovery_size,
@@ -1180,6 +1287,7 @@ pub struct ByteRange {
 }
 
 impl ByteRange {
+    #[must_use]
     pub fn new(start: BytePosition, length: u16) -> Self {
         debug_assert!(
             length as usize <= MAX_PAYLOAD_LENGTH,
