@@ -1,7 +1,8 @@
 #![allow(unused)]
+#![allow(clippy::wildcard_imports)]
 #![allow(clippy::cast_lossless)]
-#![allow(clippy::must_use_candidate)]
-#![warn(clippy::async_yields_async)]
+#![warn(clippy::must_use_candidate)]
+#![deny(clippy::async_yields_async)]
 // #![deny(clippy::todo)]
 
 pub mod api;
