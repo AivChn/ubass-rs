@@ -1,21 +1,29 @@
 mod inbound;
 mod outbound;
+mod types;
+
+pub use types::{AppEvent, Connection, IncomingConnection, PendingConnection};
 
 use crate::{
+    api::{
+        ReadableBuffer,
+        core::types::{ApiInner, InnerAppEvent},
+    },
     lock_read, lock_write,
-    manager::packets::{MAX_PAYLOAD_LENGTH, SessionId},
+    manager::packets::{MAX_PAYLOAD_LENGTH, PayloadField, SessionId},
+    o_unwrap_or_return,
     prelude::{HashMap, Timestamp},
+    r_unwrap_or_return,
+    utils::ResponseReceiver,
 };
 
 use std::{
-    collections::VecDeque,
-    ptr,
-    sync::{LazyLock, atomic::AtomicBool},
+    sync::{Arc, Weak, atomic::AtomicBool},
     thread::JoinHandle,
 };
 
 use rand::random;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 
 use crate::{
     DEFAULT_PORT,
@@ -23,26 +31,19 @@ use crate::{
 };
 
 use super::error::ApiErrors;
+use crate::utils::{ApiCommand, ApiMessage, AppResponse, OneShot, SendDataRequest, SendTarget};
+use types::{ApiFromManager, ApiToManager};
 
-static PROTOCOL_OPEN: AtomicBool = AtomicBool::new(false);
-
-#[derive(Debug)]
 pub struct Api {
-    manager_handle: JoinHandle<core::result::Result<(), ApiErrors>>,
+    inner: Arc<ApiInner>,
 }
 
-impl Api {
-    fn new(port: u16, app_id: AppId) -> Result<Self, ApiErrors> {
-        if !PROTOCOL_OPEN.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            Ok(Api {
-                manager_handle: manager::open(port, app_id)?,
-            })
-        } else {
-            Err(ApiErrors::AlreadyOpen)
-        }
-    }
-}
-
+/// Opens the protocol, returning the Api singleton or an error if its already open.
+///
+/// # Errors
+/// - `InvalidAppId` if the app ID is longer than [`MAX_PAYLOAD_LENGTH`] or not valid ASCII
+/// - `InvalidPort` if the port is 1024 or lower
+/// - `AlreadyOpen` if the protocol is already open
 pub async fn open(app_id: String, port: Option<u16>) -> Result<Api, ApiErrors> {
     let port = match port {
         Some(0..=1024) => return Err(ApiErrors::InvalidPort),
@@ -50,101 +51,94 @@ pub async fn open(app_id: String, port: Option<u16>) -> Result<Api, ApiErrors> {
         None => DEFAULT_PORT,
     };
 
-    if !app_id.is_ascii() || app_id.len() > AppId::MAX_LENGTH {
+    if !verify_app_id(&app_id) {
         return Err(ApiErrors::InvalidAppId);
     }
 
     Api::new(port, AppId::new(app_id))
 }
 
-// TODO: this API
-impl Api {
-    pub fn close(self) -> Result<(), ApiErrors> {
-        PROTOCOL_OPEN.store(false, std::sync::atomic::Ordering::Relaxed);
-        // TODO: manager close
-        todo!("manager close");
-
-        Ok(())
-    }
-
-    pub fn connect() -> Result<(), ApiErrors> {
-        todo!()
-    }
-
-    pub fn listen() -> Result<(), ApiErrors> {
-        todo!()
-    }
-
-    pub fn request_track() -> Result<(), ApiErrors> {
-        todo!()
-    }
-}
-
 impl Drop for Api {
     fn drop(&mut self) {
-        let Err(res) = (unsafe { ptr::read(self).close() }) else {
-            return;
-        };
-        dbg!(res);
+        let inner = unsafe { std::ptr::read(&raw const self.inner) };
+        drop(inner);
     }
 }
 
-#[derive(Clone)]
-enum RequestPayload {
-    AppId(AppId),
-    TrackRequest(SessionId, Box<[u8; MAX_PAYLOAD_LENGTH]>),
-}
-
-struct AppRequestsMap {
-    map: RwLock<HashMap<u32, RequestPayload>>,
-    queue: RwLock<VecDeque<(Timestamp, u32)>>,
-}
-
-impl Default for AppRequestsMap {
-    fn default() -> Self {
-        Self {
-            map: RwLock::default(),
-            queue: RwLock::new(VecDeque::with_capacity(32)),
-        }
+impl Api {
+    fn new(port: u16, app_id: AppId) -> Result<Self, ApiErrors> {
+        Ok(Self {
+            inner: Arc::new(ApiInner::new(port, app_id)?),
+        })
     }
-}
 
-impl AppRequestsMap {
-    const PRUNE_INTERVAL: u64 = 10_000;
+    /// connects to the given address. This function will return a `PendingConnection` struct that
+    /// can be awaited to get a ready connection at any point.
+    ///
+    /// # Errors
+    /// This function will return an error if anything in the handshake process failed
+    pub async fn connect(
+        &self,
+        addr: std::net::SocketAddr,
+    ) -> core::result::Result<PendingConnection, ApiErrors> {
+        let reply = self.inner.connect(addr).await?;
+        Ok(PendingConnection::new(
+            Arc::downgrade(&self.inner),
+            addr,
+            reply,
+        ))
+    }
 
-    async fn add(&self, payload: &RequestPayload) -> u32 {
-        let mut map = lock_write!(self.map);
-        let key = loop {
-            let tmp = random::<u32>();
-            if !map.contains_key(&tmp) {
-                break tmp;
+    /// listens on the protocol for any message not attached to a session
+    ///
+    /// # Errors
+    // TODO:
+    pub async fn listen(&self) -> core::result::Result<AppEvent, ApiErrors> {
+        match self.inner.listen().await? {
+            InnerAppEvent::DataReceived { session_id, data } => {
+                Ok(AppEvent::DataReceived { session_id, data })
             }
-        };
+            InnerAppEvent::IncomingConnection {
+                request,
+                response,
+                peer_address,
+            } => {
+                let incoming = IncomingConnection::new(
+                    Arc::downgrade(&self.inner),
+                    peer_address,
+                    request.data,
+                    request.response,
+                    response,
+                );
 
-        map.insert(key, payload.clone());
-        drop(map);
-        lock_write!(self.queue).push_back((Timestamp::now(), key));
-
-        key
-    }
-
-    async fn contains(&self, key: u32) -> bool {
-        lock_read!(self.map).contains_key(&key)
-    }
-
-    async fn prune(&self) {
-        let mut queue = lock_write!(self.queue);
-        let to_remove = queue
-            .iter()
-            .take_while(|(ts, k)| ts.been_longer_than(Self::PRUNE_INTERVAL))
-            .count();
-
-        let to_remove: Vec<_> = queue.drain(..to_remove).map(|(ts, k)| k).collect();
-        drop(queue);
-
-        let mut map = lock_write!(self.map);
-        for k in to_remove {
-            map.remove(&k);
+                Ok(AppEvent::IncomingConnection(incoming))
+            }
+            InnerAppEvent::Closed => Ok(AppEvent::Closed),
         }
     }
+
+    /// # Errors
+    // TODO:
+    pub async fn send_data(
+        &self,
+        target: SendTarget,
+        buffer: impl Into<ReadableBuffer>,
+    ) -> core::result::Result<SessionId, ApiErrors> {
+        self.inner.send_data(target, buffer.into()).await
+    }
+
+    /// # Errors
+    // TODO:
+    pub async fn approve(
+        &self,
+        id: u32,
+        approved: bool,
+        reason: String,
+    ) -> core::result::Result<(), ApiErrors> {
+        self.inner.approve(id, approved, reason).await
+    }
+}
+
+const fn verify_app_id(app_id: &str) -> bool {
+    app_id.is_ascii() && app_id.len() <= AppId::MAX_LENGTH
 }
