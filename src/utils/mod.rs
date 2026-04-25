@@ -1,5 +1,6 @@
 use std::{
     any::Any,
+    fmt::Debug,
     net::SocketAddr,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
@@ -13,8 +14,23 @@ pub mod messages;
 pub use messages::*;
 
 #[macro_export]
+macro_rules! debug_match_or_return {
+    ($value:expr, $p:pat => $i:ident, $msg:expr) => {
+        match $value {
+            $p => $i,
+            _ => {
+                #[cfg(debug_assertions)]
+                panic!("Invariant broken: {}", $msg);
+
+                return;
+            }
+        }
+    };
+}
+
+#[macro_export]
 macro_rules! match_or_return {
-    ($value:expr, $i:ident, $p:pat) => {
+    ($value:expr, $p:pat => $i:ident) => {
         match $value {
             $p => $i,
             _ => return,
@@ -43,33 +59,6 @@ macro_rules! r_unwrap_or_return {
 }
 
 #[macro_export]
-macro_rules! debug_r_unwrap_or_return {
-    ($result:expr, $msg:expr) => {
-        match $result {
-            Ok(val) => val,
-            Err(_) => {
-                #[cfg(debug_assertions)]
-                panic!("Invariant broken: {}.", $msg);
-                return;
-            }
-        }
-    };
-}
-
-#[macro_export]
-macro_rules! debug_o_unwrap_or_return {
-    ($result:expr, $msg:expr) => {
-        match $result {
-            Some(val) => val,
-            None => {
-                debug_assert!(false, "Invariant broken: {}.", $msg);
-                return;
-            }
-        }
-    };
-}
-
-#[macro_export]
 macro_rules! lock_read {
     ($to_lock:expr) => {
         $to_lock.read().await
@@ -88,6 +77,34 @@ macro_rules! lock {
     ($to_lock:expr) => {
         $to_lock.lock().await
     };
+}
+
+pub trait PanicOnDebug {
+    fn panic_on_debug(self, msg: &str) -> Self;
+}
+
+impl<T, E: Debug> PanicOnDebug for Result<T, E> {
+    #[inline]
+    fn panic_on_debug(self, msg: &str) -> Self {
+        #[cfg(debug_assertions)]
+        if let Err(e) = self {
+            panic!("{}: {:?}", msg, e);
+        }
+
+        self
+    }
+}
+
+impl<T> PanicOnDebug for Option<T> {
+    #[inline]
+    fn panic_on_debug(self, msg: &str) -> Self {
+        #[cfg(debug_assertions)]
+        if self.is_none() {
+            panic!("{}", msg);
+        }
+
+        self
+    }
 }
 
 pub trait Flags {
