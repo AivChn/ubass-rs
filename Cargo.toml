@@ -41,5 +41,4 @@ socket2 = "0.6.3"
 uniffi = { version = "0.31.0", features = ["build"] }
 
 [dev-dependencies]
-anyhow = "1"
 tokio = { version = "1.49.0", features = ["full"] }
