@@ -8,14 +8,14 @@ use tokio::{
 use crate::prelude::*;
 
 // processor channels
-pub type OutboundSender = Sender<PacketProcessingMessage>;
-pub type InboundReceiver = Receiver<Result<ManagerMessage>>;
+pub type ManagerToProcessor = Sender<PacketProcessingMessage>;
+pub type ManagerFromProcessor = Receiver<Result<ManagerMessage>>;
 
 // api channels
-pub type InboundSender = Sender<Result<AppMessage>>;
-pub type OutboundReceiver = Receiver<Result<ManagerMessage>>;
+pub type ManagerToApi = Sender<Result<ApiMessage>>;
+pub type ManagerFromApi = Receiver<ApiCommand>;
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct Address(SocketAddr);
 
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
@@ -42,14 +42,37 @@ impl Timestamp {
         *self = Timestamp::now();
     }
 
+    #[must_use]
     pub fn been_longer_than(&self, millis: u64) -> bool {
         Self::now().0 - self.0 > millis
     }
 
+    #[must_use]
     pub fn none() -> Self {
         Timestamp(0)
     }
 
+    #[must_use]
+    pub fn get(&self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Serialize, Clone, Copy, PartialEq, Debug, Default)]
+#[repr(transparent)]
+pub struct ForeignTimestamp(u64);
+
+impl ForeignTimestamp {
+    #[must_use]
+    pub fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub fn update(&mut self, value: u64) {
+        self.0 = value;
+    }
+
+    #[must_use]
     pub fn get(&self) -> u64 {
         self.0
     }
