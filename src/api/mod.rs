@@ -1,9 +1,14 @@
 mod core;
-mod error;
 mod rust;
+mod types;
 mod uniffi;
 
-pub(crate) use error::ApiErrors;
+pub use core::{AppEvent, Connection, IncomingConnection, PendingConnection};
+pub use types::{
+    Connection as ConnectionTrait, IncomingConnection as IncomingConnectionTrait,
+    PendingConnection as PendingConnectionTrait, ReadableBuffer, Stream as StreamTrait,
+    WriteableBuffer,
+};
 
 #[cfg(feature = "rust-api")]
 pub use rust::*;
