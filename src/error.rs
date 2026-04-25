@@ -1,9 +1,84 @@
-use std::net::SocketAddr;
+use std::{io, net::SocketAddr};
 
-use crate::manager::packets::{BatchID, SessionId, Version};
+use crate::{
+    api::IncomingConnection,
+    error,
+    manager::packets::{BatchID, SessionId, Version},
+};
 pub type Result<T> = core::result::Result<T, Error>;
 pub type ErrResult = Result<()>;
 pub type EmptyResult = core::result::Result<(), ()>;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ApiErrors {
+    #[error("Protocol already opened - cannot open more than one instance per program")]
+    AlreadyOpen,
+    #[error("Cannot use ports 1024 or lower, please suggest a different port.")]
+    InvalidPort,
+    #[error("AppId is not a valid ID: its either too long or contains non ascii characters")]
+    InvalidAppId,
+    #[error("Cannot use port {0}, already in use.")]
+    PortAlreadyInUse(u16),
+    #[error("Failed to build runtime: {0:?}")]
+    FailedToBuildRuntime(io::Error),
+    #[error("thread {0} failed at some point.")]
+    ThreadFailed(&'static str),
+    #[error("No free session available for the given target")]
+    NoFreeSession,
+    #[error("Session is occupied")]
+    SessionOccupied,
+    #[error("Session does not exist")]
+    SessionDoesNotExist,
+    #[error("Rejection reason must be valid ASCII and below MAX_PAYLOAD_LENGTH")]
+    InvalidReason,
+    #[error("Protocol is closed")]
+    ProtocolClosed,
+    #[error("Buffer exceeds MAX_PAYLOAD_LENGTH")]
+    BufferTooLarge,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectionError {
+    #[error("Protocol is closed")]
+    ProtocolClosed,
+    #[error("Buffer exceeds MAX_PAYLOAD_LENGTH")]
+    BufferTooLarge,
+    #[error("Session is occupied")]
+    SessionOccupied,
+    #[error("Session was closed by peer")]
+    SessionClosedByPeer,
+    #[error("This error should not happen")]
+    UnknownInternalError,
+    #[error("Reason is too long or not valid ASCII")]
+    InvalidReason(IncomingConnection),
+}
+
+impl ConnectionError {
+    pub(crate) fn from_api(error: ApiErrors) -> Self {
+        match error {
+            ApiErrors::SessionOccupied => ConnectionError::SessionOccupied,
+            ApiErrors::SessionDoesNotExist => ConnectionError::SessionClosedByPeer,
+            ApiErrors::ProtocolClosed => ConnectionError::ProtocolClosed,
+            ApiErrors::BufferTooLarge => ConnectionError::BufferTooLarge,
+            e => {
+                debug_assert!(
+                    false,
+                    "Invariant broken while converting ApiError to ConnectionError: \
+                            got an invalid variant {e:?}: {e}"
+                );
+                ConnectionError::UnknownInternalError
+            }
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum StreamErrors {
+    #[error("{0}")]
+    Connection(ConnectionError),
+    #[error("Stream was paused by peer")]
+    PausedByPeer,
+}
 
 pub use PipeDirection::*;
 use derive_more::Display;
