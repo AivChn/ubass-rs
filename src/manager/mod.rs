@@ -22,7 +22,7 @@ use crate::{
             AckPacket, AppRejectErrorPacket, ControlType, HelloPacket, HostControlType,
             IncompatibleVersionPacket, Options, PacketFingerprint, PacketType, SessionId, Version,
         },
-        state::{EncryptionWindow, Port, SessionStateFlag, SessionStateFlags},
+        state::{EncryptionWindow, Port, ProtocolState, SessionStateFlag, SessionStateFlags},
     },
     packet_processor::{self},
     prelude::*,

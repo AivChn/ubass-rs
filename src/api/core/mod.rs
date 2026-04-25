@@ -9,6 +9,7 @@ use crate::{
         ReadableBuffer,
         core::types::{ApiInner, InnerAppEvent},
     },
+    error::ApiErrors,
     lock_read, lock_write,
     manager::packets::{MAX_PAYLOAD_LENGTH, PayloadField, SessionId},
     o_unwrap_or_return,
@@ -30,7 +31,6 @@ use crate::{
     manager::{self, AppId},
 };
 
-use super::error::ApiErrors;
 use crate::utils::{ApiCommand, ApiMessage, AppResponse, OneShot, SendDataRequest, SendTarget};
 use types::{ApiFromManager, ApiToManager};
 

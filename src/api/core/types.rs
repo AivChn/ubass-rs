@@ -4,7 +4,6 @@ use crate::{
         core::types,
         types::{ReadableBuffer, WriteableBuffer},
     },
-    debug_o_unwrap_or_return,
     error::{ConnectionError, EmptyResult, StreamErrors},
     lock_read, lock_write,
     manager::{

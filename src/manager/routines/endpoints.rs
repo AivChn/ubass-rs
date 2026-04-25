@@ -8,8 +8,7 @@ use std::{
 use tokio::{runtime::Builder as RuntimeBuilder, sync::mpsc::Receiver};
 
 use crate::{
-    api::ApiErrors,
-    error::ConnectionError,
+    error::{ApiErrors, ConnectionError},
     get_state, lock_read,
     manager::{
         self, AppId, STATE, key_exchange,
@@ -156,7 +155,7 @@ async fn resolve_target(
 ) -> core::result::Result<(SessionId, SocketAddr), ApiErrors> {
     match target {
         SendTarget::Session(session_id) => {
-            let lock = lock_read!(get_state!().connection_state);
+            let lock = lock_read!(get_state!().connections);
             let connection = lock
                 .get(&session_id)
                 .ok_or(ApiErrors::SessionDoesNotExist)?;
@@ -173,7 +172,7 @@ async fn resolve_target(
         }
         SendTarget::Address(addr) => {
             let session_id = get_state!()
-                .address_sessions
+                .address_session
                 .free_session(addr)
                 .await
                 .ok_or(ApiErrors::NoFreeSession)?;
