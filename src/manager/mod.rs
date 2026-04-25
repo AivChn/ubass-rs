@@ -1,5 +1,6 @@
 mod inbound;
 mod key_exchange;
+mod outbound;
 pub mod packets;
 mod routines;
 pub mod state;
@@ -14,16 +15,14 @@ use std::{
 };
 
 use crate::{
-    DEFAULT_PORT,
-    api::ApiErrors,
-    lock_read, lock_write,
+    DEFAULT_PORT, lock_read, lock_write,
     manager::{
         self,
         packets::{
             AckPacket, AppRejectErrorPacket, ControlType, HelloPacket, HostControlType,
             IncompatibleVersionPacket, Options, PacketFingerprint, PacketType, SessionId, Version,
         },
-        state::{EncryptionWindow, Port, SessionStateFlag, SessionStateFlags, SessionStates},
+        state::{EncryptionWindow, Port, SessionStateFlag, SessionStateFlags},
     },
     packet_processor::{self},
     prelude::*,
@@ -38,9 +37,10 @@ use types::*;
 
 /// random number, might change
 // TODO: put some thought into this number
+const INBOUND_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 const CHANNEL_BUFFER_SIZE: usize = 256;
 
-pub static STATE: OnceLock<SessionStates> = OnceLock::new();
+pub static STATE: OnceLock<ProtocolState> = OnceLock::new();
 
 #[macro_export]
 macro_rules! get_state {
@@ -64,42 +64,71 @@ pub fn pending_ack_monitor() -> PendingAckMonitor {
     PendingAckMonitor::new(&get_state!().ack)
 }
 
-pub async fn init(port: u16, app_id: AppId) -> core::result::Result<(), ApiErrors> {
+pub async fn init(
+    port: u16,
+    app_id: AppId,
+    manager_to_api: ManagerToApi,
+    manager_from_api: ManagerFromApi,
+) -> core::result::Result<(), ApiErrors> {
     // try to create receiving socket
     std::net::UdpSocket::bind(format!("0.0.0.0:{port}"))
         .map_err(|_| ApiErrors::PortAlreadyInUse(port))?;
 
-    let (manager_to_processor, processor_from_manager): (manager::OutboundSender, _) =
+    let (manager_to_processor, processor_from_manager): (manager::ManagerToProcessor, _) =
         mpsc::channel(CHANNEL_BUFFER_SIZE);
     let (processor_to_manager, manager_from_processor): (
         packet_processor::types::InboundSender,
         _,
     ) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
-    let (transport_handle, processor_handle) =
-        setup_layers(port, processor_to_manager, processor_from_manager).await?;
-
-    STATE.set(SessionStates::new(
+    STATE.set(ProtocolState::new(
         Port::new(port),
         app_id,
         manager_to_processor.clone(),
-        transport_handle,
-        processor_handle,
     ));
     PROTOCOL_EPOCH.set(Instant::now());
 
-    // TODO: implement selecting logic for manager layer
-    let inbound_handle = tokio::spawn(inbound::init(
+    let (transport_handle, processor_handle) =
+        setup_layers(port, processor_to_manager, processor_from_manager).await?;
+
+    get_state!()
+        .set_handles(transport_handle, processor_handle)
+        .await;
+
+    let mut inbound_handle = tokio::spawn(inbound::init(
         manager_from_processor,
         manager_to_processor.clone(),
-        todo!("get these channels"),
+        manager_to_api,
     ));
-    // let outbound_handle = ...
 
-    // loop
-    // select
+    let mut outbound_handle = tokio::spawn(outbound::init(
+        manager_from_api,
+        manager_to_processor.clone(),
+    ));
 
-    Ok(())
+    // TODO: flush pending acks before closing
+    tokio::select! {
+        res = &mut inbound_handle => {
+            // no way to signal outbound — API holds the sender side
+            outbound_handle.abort();
+            match res {
+                Ok(res) => res.map_err(|_| ApiErrors::ThreadFailed("Manager inbound")),
+                Err(_) => Err(ApiErrors::ThreadFailed("Manager inbound")),
+            }
+        },
+        res = &mut outbound_handle => {
+            // close cascades downstream and back up via ManagerMessage::Closed
+            // timeout in case inbound is slow to receive the cascade
+            _ = tokio::time::timeout(INBOUND_CLOSE_TIMEOUT, inbound_handle).await;
+            match res {
+                Ok(Ok(())) => {
+                    get_state!().advertise_closed().await;
+                    Ok(())
+                }
+                _ => Err(ApiErrors::ThreadFailed("Manager outbound")),
+            }
+        },
+    }
 }
 
 async fn setup_layers(
