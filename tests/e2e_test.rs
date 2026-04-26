@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
+//comment
 
 /// Bind to port 0 to get a free UDP port from the OS.
 fn free_port() -> u16 {

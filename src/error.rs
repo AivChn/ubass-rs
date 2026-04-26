@@ -37,6 +37,7 @@ pub enum ApiErrors {
     BufferTooLarge,
 }
 
+// this is a comment
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionError {
     #[error("Protocol is closed")]
