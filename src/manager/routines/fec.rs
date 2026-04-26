@@ -1,5 +1,5 @@
 use crate::packet_processor::fec::RecoverdPacket;
 
-pub async fn recovered_packets(packets: Vec<RecoverdPacket>) {
+pub fn recovered_packets(_packets: Vec<RecoverdPacket>) {
     todo!()
 }

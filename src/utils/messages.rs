@@ -21,11 +21,14 @@ use crate::{
 pub struct ResponseReceiver<T>(oneshot::Receiver<T>);
 
 impl<T> ResponseReceiver<T> {
+    /// Receives from the channel, blocking until any result is available.
+    ///
+    /// # Errors
+    /// This function will returned `ProtocolClosed` if the channel returns any error.
+    /// This might happen even if the close was gracefull, and in some cases is expected on
+    /// gracefull close.
     pub async fn recv(self) -> core::result::Result<T, ApiErrors> {
-        match self.0.await {
-            Err(_) => Err(ApiErrors::ProtocolClosed),
-            Ok(response) => Ok(response),
-        }
+        self.0.await.map_err(|_| ApiErrors::ProtocolClosed)
     }
 }
 

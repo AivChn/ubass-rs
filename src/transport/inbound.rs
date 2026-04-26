@@ -9,6 +9,8 @@ use tokio::net::UdpSocket;
 use super::send_to_processing_layer;
 use super::types::{MAX_PACKET_SIZE, ReceivedPacket};
 
+const MAX_ALLOWED_FAILS: u32 = 10;
+
 pub async fn init(port: u16, sender: InboundSender) -> ErrResult {
     debug_assert!(
         !matches!(port, 1..=1024),
@@ -16,16 +18,13 @@ pub async fn init(port: u16, sender: InboundSender) -> ErrResult {
              system port was used ({port})"
     );
 
-    let socket = match Socket::new(Domain::IPV4, Type::DGRAM, None) {
-        Ok(socket) => socket,
-        Err(_) => {
-            _ = send_to_processing_layer(sender, Err(TransportError::FailedToBind.into())).await;
-            return Err(TransportError::FailedToBind.into());
-        }
+    let Ok(socket) = Socket::new(Domain::IPV4, Type::DGRAM, None) else {
+        _ = send_to_processing_layer(sender, Err(TransportError::FailedToBind.into())).await;
+        return Err(TransportError::FailedToBind.into());
     };
     assert!(socket.set_reuse_address(true).is_ok());
     assert!(socket.set_reuse_port(true).is_ok());
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port));
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
     let addr = socket2::SockAddr::from(addr);
 
     if let Err(e) = socket.bind(&addr) {
@@ -35,15 +34,11 @@ pub async fn init(port: u16, sender: InboundSender) -> ErrResult {
 
     let std_socket: std::net::UdpSocket = socket.into();
     std_socket.set_nonblocking(true);
-    let socket = match UdpSocket::from_std(std_socket) {
-        Ok(socket) => socket,
-        Err(_) => {
-            _ = send_to_processing_layer(sender, Err(TransportError::FailedToBind.into())).await;
-            return Err(TransportError::FailedToBind.into());
-        }
+    let Ok(socket) = UdpSocket::from_std(std_socket) else {
+        _ = send_to_processing_layer(sender, Err(TransportError::FailedToBind.into())).await;
+        return Err(TransportError::FailedToBind.into());
     };
 
-    const MAX_ALLOWED_FAILS: u32 = 10;
     let mut fail_count = 0u32;
 
     loop {

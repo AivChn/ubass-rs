@@ -898,7 +898,7 @@ impl PendingAckWindow {
         }
     }
 
-    pub async fn init(self: Arc<Self>) {
+    pub fn init(self: Arc<Self>) {
         get_state!().global_handle_monitor.dispatch(self.prune());
     }
 

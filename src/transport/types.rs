@@ -70,6 +70,7 @@ impl OutboundSockets {
     }
 
     /// Returns the current socket as an Arc
+    #[must_use]
     pub fn retrieve(&self) -> Arc<UdpSocket> {
         self.sockets[self.current_socket].clone()
     }

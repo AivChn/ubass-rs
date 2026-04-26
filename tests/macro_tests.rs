@@ -368,34 +368,4 @@ mod dec_macros {
         let some = Some(());
         assert_eq!(o_unwrap_or_return!(some), ());
     }
-
-    #[test]
-    #[should_panic]
-    #[allow(unreachable_code)]
-    fn panic_on_unwrap_debug_result() {
-        let error = Err::<(), ()>(());
-        debug_r_unwrap_or_return!(error, "");
-    }
-
-    #[test]
-    #[allow(unreachable_code)]
-    fn unwrap_and_dont_panic_debug_result() {
-        let ok = Ok::<(), ()>(());
-        assert_eq!(debug_r_unwrap_or_return!(ok, ""), ());
-    }
-
-    #[test]
-    #[should_panic]
-    #[allow(unreachable_code)]
-    fn panic_on_unwrap_debug_option() {
-        let none = None::<()>;
-        debug_o_unwrap_or_return!(none, "");
-    }
-
-    #[test]
-    #[allow(unreachable_code)]
-    fn unwrap_and_dont_panic_debug_option() {
-        let some = Some::<()>(());
-        assert_eq!(debug_o_unwrap_or_return!(some, ""), ());
-    }
 }

@@ -80,6 +80,7 @@ macro_rules! lock {
 }
 
 pub trait PanicOnDebug {
+    #[must_use]
     fn panic_on_debug(self, msg: &str) -> Self;
 }
 
@@ -88,7 +89,7 @@ impl<T, E: Debug> PanicOnDebug for Result<T, E> {
     fn panic_on_debug(self, msg: &str) -> Self {
         #[cfg(debug_assertions)]
         if let Err(e) = self {
-            panic!("{}: {:?}", msg, e);
+            panic!("{msg}: {e:?}");
         }
 
         self
@@ -98,10 +99,7 @@ impl<T, E: Debug> PanicOnDebug for Result<T, E> {
 impl<T> PanicOnDebug for Option<T> {
     #[inline]
     fn panic_on_debug(self, msg: &str) -> Self {
-        #[cfg(debug_assertions)]
-        if self.is_none() {
-            panic!("{}", msg);
-        }
+        debug_assert!(self.is_some(), "{msg}");
 
         self
     }

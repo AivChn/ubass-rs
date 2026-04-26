@@ -64,6 +64,11 @@ pub fn pending_ack_monitor() -> PendingAckMonitor {
     PendingAckMonitor::new(&get_state!().ack)
 }
 
+/// Function to initialize the manager layer and all following layers
+///
+/// # Errors
+/// - `PortAlreadyInUse` if the port is already used
+/// - `ThreadFailed` if any of the threads have failed
 pub async fn init(
     port: u16,
     app_id: AppId,
@@ -89,7 +94,7 @@ pub async fn init(
     PROTOCOL_EPOCH.set(Instant::now());
 
     let (transport_handle, processor_handle) =
-        setup_layers(port, processor_to_manager, processor_from_manager).await?;
+        setup_layers(port, processor_to_manager, processor_from_manager)?;
 
     get_state!()
         .set_handles(transport_handle, processor_handle)
@@ -131,7 +136,7 @@ pub async fn init(
     }
 }
 
-async fn setup_layers(
+fn setup_layers(
     port: u16,
     processor_to_manager: packet_processor::types::InboundSender,
     processor_from_manager: packet_processor::types::OutboundReceiver,
@@ -172,9 +177,9 @@ async fn setup_layers(
                         pending_ack_monitor(),
                     )
                     .await;
-                })
+                });
             }
-        };
+        }
     });
 
     // wait on response from channel and return if error
@@ -210,7 +215,7 @@ async fn setup_layers(
                     .await
                 });
             }
-        };
+        }
     });
 
     tor.recv().expect(

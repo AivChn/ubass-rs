@@ -71,10 +71,7 @@ pub async fn init(
 
     loop {
         let received = p_receiver.recv().await;
-        let msg = match received {
-            Some(msg) => msg,
-            None => return Err(ChannelError::ChannelClosed(Outbound).into()),
-        };
+        let msg = received.ok_or(ChannelError::ChannelClosed(Outbound))?;
 
         let packet = match msg {
             PacketProcessingMessage::SendPacket(packet_wrapper) => packet_wrapper,
@@ -130,7 +127,7 @@ async fn handle_packet(
         // could be acked
         Packet::DataPacket(packet) => {
             eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
-            eprintln!("data: {:?}", packet);
+            eprintln!("data: {packet:?}");
             add_ack!(for DataPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             handle_monitor
