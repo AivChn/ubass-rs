@@ -1,5 +1,3 @@
-#![no_main]
-#![cfg(false)]
 use std::net::SocketAddr;
 use std::panic;
 use std::time::Duration;
@@ -86,10 +84,10 @@ async fn client(port: u16, server_addr: SocketAddr) -> Result<(), ()> {
     .map_err(|_| println!("ready failed!"))?;
 
     let message = b"hello ubass!";
-    let mut buffer = vec![];
+    let mut buffer = vec![0; message.len()];
     timeout(
         Duration::from_secs(2),
-        connection.request(*message, &mut buffer),
+        connection.request(*message, buffer.as_mut_slice()),
     )
     .await
     .map_err(|_| println!("request timeout"))?
