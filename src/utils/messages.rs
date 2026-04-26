@@ -1,12 +1,12 @@
 use std::default;
 use std::{fmt::Display, net::SocketAddr};
 
-use crate::api::ReadableBuffer;
+use crate::api::{ReadableBuffer, WriteableBuffer};
 use crate::error::ApiErrors;
 
 use derive_more::{Display, derive};
 use tokio::sync::mpsc::Receiver;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 use crate::manager::AppId;
 use crate::packet_processor::fec::Recovered;
@@ -110,11 +110,14 @@ pub enum SendTarget {
 pub struct RequestDataRequest {
     pub target: SendTarget,
     pub id: Box<[u8]>,
+    pub buffer: WriteableBuffer,
+    pub sender: watch::Sender<StreamMessage>,
 }
 
 pub struct SendDataRequest {
     pub target: SendTarget,
     pub buffer: ReadableBuffer,
+    pub sender: watch::Sender<StreamMessage>,
 }
 
 pub enum ApiCommand {
