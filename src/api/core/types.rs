@@ -153,8 +153,13 @@ impl ApiInner {
         if buffer.len() > MAX_PAYLOAD_LENGTH {
             return Err(ApiErrors::BufferTooLarge);
         }
+        let (sender, update) = watch::channel(StreamMessage::default());
         let (request, reply): (_, ResponseReceiver<Result<SessionId, ApiErrors>>) =
-            OneShot::new(SendDataRequest { target, buffer });
+            OneShot::new(SendDataRequest {
+                target,
+                buffer,
+                sender,
+            });
         self.api_to_manager
             .send(ApiCommand::SendData(request))
             .await
@@ -183,15 +188,19 @@ impl ApiInner {
         &self,
         target: SendTarget,
         track_id: impl Into<Box<[u8]>>,
+        buffer: impl Into<WriteableBuffer>,
     ) -> Result<SessionId, ApiErrors> {
         let track_id = track_id.into();
         if track_id.len() > MAX_PAYLOAD_LENGTH {
             return Err(ApiErrors::BufferTooLarge);
         }
+        let (sender, update) = watch::channel(StreamMessage::default());
         let (request, response) =
             OneShot::<RequestDataRequest, Result<SessionId, ApiErrors>>::new(RequestDataRequest {
                 target,
                 id: track_id,
+                buffer: buffer.into(),
+                sender,
             });
         self.api_to_manager
             .send(ApiCommand::RequestData(request))
@@ -516,17 +525,21 @@ impl api::types::Connection for Connection {
         }
     }
 
-    async fn request<'buf>(
+    async fn request(
         self,
         identifier: impl Into<Box<[u8]>>,
-        buffer: impl Into<WriteableBuffer<'buf>>,
+        buffer: impl Into<WriteableBuffer>,
     ) -> Result<InputStream, Self::Error> {
         let api = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
         let buffer = buffer.into();
         let length = buffer.len();
         let (sender, receiver) = watch::channel(StreamMessage::default());
         match api
-            .request_track(SendTarget::Session(self.session_id), identifier.into())
+            .request_track(
+                SendTarget::Session(self.session_id),
+                identifier.into(),
+                buffer,
+            )
             .await
         {
             Ok(_) => Ok(InputStream::new(
