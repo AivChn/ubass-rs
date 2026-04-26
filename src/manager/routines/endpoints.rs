@@ -8,8 +8,9 @@ use std::{
 use tokio::{runtime::Builder as RuntimeBuilder, sync::mpsc::Receiver};
 
 use crate::{
+    api::WriteableBuffer,
     error::{ApiErrors, ConnectionError},
-    get_state, lock_read,
+    get_state, lock_read, lock_write,
     manager::{
         self, AppId, STATE, key_exchange,
         packets::*,
@@ -18,9 +19,10 @@ use crate::{
         },
         types::{ManagerFromApi, ManagerToApi, ManagerToProcessor},
     },
+    o_unwrap_or_return,
     utils::{
-        ConnectionEvent, Flags, OneShot, RequestDataRequest, SendDataRequest, SendPacket,
-        SendTarget,
+        ConnectionEvent, Flags, OneShot, PanicInDebug, RequestDataRequest, SendDataRequest,
+        SendPacket, SendTarget,
     },
 };
 
@@ -117,18 +119,16 @@ pub async fn connect(
 /// variant on failure.
 pub async fn send_data(
     OneShot {
-        data: SendDataRequest { target, buffer },
+        data:
+            SendDataRequest {
+                target,
+                buffer,
+                sender,
+            },
         response: reply,
     }: OneShot<SendDataRequest, core::result::Result<SessionId, ApiErrors>>,
     outbound_sender: ManagerToProcessor,
 ) {
-    debug_assert!(
-        buffer.len() <= MAX_PAYLOAD_LENGTH,
-        "Invariant broken in `send_data`: buffer exceeds `MAX_PAYLOAD_LENGTH` ({} > {})",
-        buffer.len(),
-        MAX_PAYLOAD_LENGTH
-    );
-
     let (session_id, addr) = match resolve_target(target).await {
         Ok(pair) => pair,
         Err(e) => {
@@ -138,16 +138,14 @@ pub async fn send_data(
     };
     reply.send(Ok(session_id));
 
-    DataPacket::new(
-        Options::none(),
-        BatchID::new(1),
-        FECInfo::new(1, 0, 0),
-        session_id,
-        BytePosition(0),
-        buffer.into_vec(),
-    )
-    .send(outbound_sender, addr)
-    .await;
+    let mut lock = lock_write!(get_state!().connections);
+    let connection = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
+        "Invariant broken in `endpoints::send_data`: \
+                session ID {session_id} does not exist even though it was returned by \
+                `resolve_target`, it had the associated address {addr}",
+    )));
+
+    connection.streaming_to(buffer, sender);
 }
 
 async fn resolve_target(
@@ -192,7 +190,13 @@ pub fn listen() {
 
 pub async fn request_track(
     OneShot {
-        data: RequestDataRequest { target, id },
+        data:
+            RequestDataRequest {
+                target,
+                id,
+                buffer,
+                sender,
+            },
         response,
     }: OneShot<RequestDataRequest, Result<SessionId, ApiErrors>>,
     outbound_sender: ManagerToProcessor,
