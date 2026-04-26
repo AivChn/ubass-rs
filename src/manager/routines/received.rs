@@ -7,7 +7,7 @@ use crate::{
     manager::state::ConnectionStates,
     match_or_return,
     prelude::Timestamp,
-    utils::PanicOnDebug,
+    utils::PanicInDebug,
 };
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
 use tokio::sync::mpsc::{self, Receiver};
@@ -231,7 +231,7 @@ pub async fn received_hello_packet_as_initializer(
                     ephemeral_secret,
                 )
                 .await
-                .panic_on_debug(
+                .panic_in_debug(
                     "Invariant broken in the `received_hello_packet_as_initializer` routine: \
                 the handshake did not exist"
                 )

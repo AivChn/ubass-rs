@@ -1015,7 +1015,7 @@ impl Deref for PublicKey {
     }
 }
 
-#[derive(Deref, PartialEq, Debug, Serialize, Clone, Copy, Display)]
+#[derive(Deref, DerefMut, PartialEq, Debug, Serialize, Clone, Copy, Display)]
 #[repr(transparent)]
 pub struct BytePosition(pub u32);
 
