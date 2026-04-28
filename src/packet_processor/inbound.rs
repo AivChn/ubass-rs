@@ -1,7 +1,9 @@
 #![allow(clippy::wildcard_imports)]
 
 use crate::{
-    manager::{EncryptionMonitor, FingerprintMonitor, packets::*},
+    get_state,
+    manager::{self, EncryptionMonitor, FingerprintMonitor, packets::*},
+    o_unwrap_or_return,
     packet_processor::{encryption, fingerprint::Headers, serialize::Serialize},
     prelude::*,
     r_unwrap_or_return,
@@ -85,9 +87,20 @@ async fn handle_packet(
     let packet_type =
         r_unwrap_or_return!(PacketType::deserialize(&packet.data[PACKET_TYPE_OFFSET..]));
 
+    let session_id = r_unwrap_or_return!(SessionId::deserialize(&packet.data[SESSION_ID_OFFSET..]));
+    if !manager::session_exists(session_id).await {
+        send_up(
+            Err(PacketProcessingError::SessionDoesNotExist(session_id, packet.src_addr).into()),
+            sender,
+        )
+        .await;
+        return;
+    }
+
     let ready_packet = r_unwrap_or_return!(
         deserialize_and_decrypt(
             packet_type,
+            session_id,
             packet.data,
             encryption_monitor,
             fingerprint_monitor
@@ -104,12 +117,11 @@ async fn handle_packet(
 
 async fn deserialize_and_decrypt(
     packet_type: PacketType,
+    session_id: SessionId,
     data: Vec<u8>,
     encryption_monitor: EncryptionMonitor,
     fingerprint_monitor: FingerprintMonitor,
 ) -> core::result::Result<Packet, ()> {
-    let session_id = SessionId::deserialize(&data[SESSION_ID_OFFSET..])?;
-
     match packet_type {
         // Single types
         PacketType::Data => {
@@ -196,6 +208,13 @@ async fn deserialize_and_auth_control_packet(
                 Packet::TrackRequestPacket(packet)
             }
             ControlType::Session(SessionControlType::MetadataRequest) => unimplemented!(),
+            ControlType::Session(SessionControlType::Close) => {
+                authenticate(&mut data, session_id, encryption_monitor).await?;
+                let data = dedup_no_payload(data, session_id, fingerprint_monitor)
+                    .await
+                    .ok_or(())?;
+                Packet::CloseSessionPacket(Box::new(CloseSessionPacket::deserialize(&data)?))
+            }
 
             //playback
             ControlType::Playback(_) => {
@@ -231,9 +250,9 @@ async fn deserialize_and_auth_error_packet(
                 let data = dedup_no_payload(data, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
-                Packet::UnexpectedPacketErrorPacket(Box::new(dbg!(
-                    UnexpectedPacketErrorPacket::deserialize(&data)?
-                )))
+                Packet::UnexpectedPacketErrorPacket(Box::new(
+                    UnexpectedPacketErrorPacket::deserialize(&data)?,
+                ))
             }
 
             ErrorType::SessionDoesNotExist => {

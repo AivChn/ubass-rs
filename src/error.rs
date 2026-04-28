@@ -189,6 +189,8 @@ pub enum PacketProcessingError {
     InvalidPacketTypeHeader(u8),
     #[error("Faild to deserialize a packet")]
     FailedToDeserialize,
+    #[error("Session does not exist on this host")]
+    SessionDoesNotExist(SessionId, SocketAddr),
 }
 
 impl From<PacketProcessingError> for Error {

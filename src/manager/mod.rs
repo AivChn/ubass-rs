@@ -12,8 +12,10 @@ use std::{
 };
 
 use crate::{
+    lock_read,
     manager::{
         self,
+        packets::SessionId,
         state::{Port, ProtocolState},
     },
     packet_processor::{self},
@@ -126,6 +128,10 @@ pub async fn init(
             }
         },
     }
+}
+
+pub async fn session_exists(session_id: SessionId) -> bool {
+    lock_read!(get_state!().connections).contains_key(&session_id)
 }
 
 fn setup_layers(
