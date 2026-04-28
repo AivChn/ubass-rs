@@ -3,6 +3,7 @@ use std::{fmt::Display, net::SocketAddr};
 
 use crate::api::{ReadableBuffer, WriteableBuffer};
 use crate::error::ApiErrors;
+use crate::manager::packets::ByteRange;
 
 use derive_more::{Display, derive};
 use tokio::sync::mpsc::Receiver;
@@ -98,8 +99,17 @@ pub enum ConnectionEvent {
 #[derive(Debug, Default)]
 pub struct StreamMessage {
     pub head: usize,
-    pub is_paused: bool,
+    pub paused: bool,
     pub closed: bool,
+}
+
+#[derive(Debug, Default, Clone)]
+pub enum StreamEvent {
+    #[default]
+    Play,
+    Pause,
+    Close,
+    Retransmit(Vec<ByteRange>),
 }
 
 pub enum SendTarget {

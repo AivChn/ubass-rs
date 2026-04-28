@@ -1,5 +1,6 @@
 #![allow(unused)]
 
+pub mod inference;
 mod reed_solomon;
 mod xor;
 

@@ -52,7 +52,7 @@ async fn handle_message(
     app_sender: ManagerToApi,
 ) {
     match message {
-        ManagerMessage::Recovered(recoverd_packets) => {
+        ManagerMessage::Recovered(_recoverd_packets) => {
             todo!("recovered packets routine")
             // TODO: call recoverd routine
             // TODO: call data received routine
@@ -68,7 +68,7 @@ async fn handle_message(
                 .await;
             }
             packets::Packet::DataPacket(data_packet) => {
-                received::received_data_packet(data_packet, app_sender, outbound_sender).await;
+                received::received_data_packet(*data_packet, outbound_sender).await;
             }
             packets::Packet::HandshakeAckPacket(handshake_ack_packet) => {
                 received_handshake_ack_packet(handshake_ack_packet).await;
@@ -76,20 +76,22 @@ async fn handle_message(
             packets::Packet::TrackRequestPacket(track_request_packet) => {
                 received::received_track_request_packet(track_request_packet).await;
             }
-            packets::Packet::ParityPacket(parity_packet) => todo!(),
+            packets::Packet::ParityPacket(_parity_packet) => todo!(),
             packets::Packet::AckPacket(ack_packet) => {
                 received::received_ack_packet(ack_packet).await;
             }
-            packets::Packet::IncompatibleVersionPacket(incompatible_version_packet) => todo!(),
+            packets::Packet::IncompatibleVersionPacket(_incompatible_version_packet) => todo!(),
             packets::Packet::SessionDoesNotExistErrorPacket(
-                session_does_not_exist_error_packet,
+                _session_does_not_exist_error_packet,
             ) => todo!(),
-            packets::Packet::AppRejectErrorPacket(app_reject_error_packet) => todo!(),
+            packets::Packet::AppRejectErrorPacket(_app_reject_error_packet) => todo!(),
             // TODO: future features
-            packets::Packet::RetransmitPacket(retransmit_packet) => todo!(),
-            packets::Packet::MetadataPacket(metadata_packet) => todo!(),
-            packets::Packet::PlaybackStatusPacket(playback_status_packet) => todo!(),
-            packets::Packet::UnexpectedPacketErrorPacket(unexpected_packet_error_packet) => todo!(),
+            packets::Packet::RetransmitPacket(_retransmit_packet) => todo!(),
+            packets::Packet::MetadataPacket(_metadata_packet) => todo!(),
+            packets::Packet::PlaybackStatusPacket(_playback_status_packet) => todo!(),
+            packets::Packet::UnexpectedPacketErrorPacket(_unexpected_packet_error_packet) => {
+                todo!()
+            }
         },
         ManagerMessage::Closed => unreachable!("This arm is handled in the `init` match"),
     }

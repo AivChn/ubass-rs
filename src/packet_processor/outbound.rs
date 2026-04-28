@@ -1,3 +1,4 @@
+#![allow(clippy::pedantic)]
 use std::{net::SocketAddr, sync::Arc};
 
 use tokio::sync::oneshot;
@@ -48,7 +49,6 @@ macro_rules! add_ack {
                     addr: $addr,
                     packet: Packet::$packet_type($packet.clone()),
                 },
-                $packet.timestamp,
                 $pending_ack_monitor,
             )
             .await
@@ -126,8 +126,6 @@ async fn handle_packet(
         // fec + encrypted
         // could be acked
         Packet::DataPacket(packet) => {
-            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
-            eprintln!("data: {packet:?}");
             add_ack!(for DataPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             handle_monitor
@@ -147,14 +145,12 @@ async fn handle_packet(
 
         //encrypted
         Packet::TrackRequestPacket(packet) => {
-            eprintln!("got {:?} from {}", packet.control_type, packet.session_id);
             add_ack!(for TrackRequestPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
             process_encrypted(packet, session_id, addr, encryption_monitor).await
         }
         Packet::AppRejectErrorPacket(packet) => {
-            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             add_ack!(for AppRejectErrorPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
@@ -163,21 +159,18 @@ async fn handle_packet(
 
         // authenticated
         Packet::RetransmitPacket(packet) => {
-            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             add_ack!(for RetransmitPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
             process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
         Packet::PlaybackStatusPacket(packet) => {
-            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             add_ack!(for PlaybackStatusPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
             process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
         Packet::SessionDoesNotExistErrorPacket(packet) => {
-            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             add_ack!(
                 for SessionDoesNotExistErrorPacket(packet),
                 sent to addr,
@@ -189,22 +182,16 @@ async fn handle_packet(
         }
         // could not be acked
         Packet::UnexpectedPacketErrorPacket(packet) => {
-            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             let session_id = packet.session_id;
             process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
         Packet::AckPacket(packet) => {
-            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             let session_id = packet.session_id;
             process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
 
         // nothing
         Packet::HelloPacket(packet) => {
-            eprintln!(
-                "got {:?} from {}",
-                packet.control_type, packet.proposed_session_id
-            );
             let mut serialized;
             serialize!(packet -> serialized);
 
@@ -216,7 +203,6 @@ async fn handle_packet(
             }
         }
         Packet::HandshakeAckPacket(packet) => {
-            eprintln!("got {:?} from {}", packet.packet_type, packet.session_id);
             let mut serialized;
             serialize!(packet -> serialized);
 
@@ -287,14 +273,10 @@ async fn recover(
         None => Err(CouldNotRecover),
     };
 
-    sender.send(message);
+    _ = sender.send(message);
 }
 
-async fn add_pending_ack(
-    packet: PacketWrapper,
-    timestamp: Timestamp,
-    pending_ack_monitor: PendingAckMonitor,
-) {
+async fn add_pending_ack(packet: PacketWrapper, pending_ack_monitor: PendingAckMonitor) {
     pending_ack_monitor.add(packet.packet).await;
 }
 
@@ -441,7 +423,7 @@ mod test_packet_processor_macros {
         assert_eq!(&buf, &SERIALIZED_DATA_PACKET);
 
         let cloned = buf.clone();
-        let address = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 0);
+        let address = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
         let processed = processed!(buf to address as Data 1 times);
         let correct = ProcessedPacket {
             dest_addr: address,
@@ -523,7 +505,7 @@ mod integration_tests {
             pending_ack_monitor,
         ));
 
-        t_sender.send(PacketProcessingMessage::Closed).await;
+        _ = t_sender.send(PacketProcessingMessage::Closed).await;
         assert!(matches!(handle.await, Err(e) if e.is_panic()));
     }
 
@@ -546,7 +528,7 @@ mod integration_tests {
             pending_ack_monitor,
         ));
 
-        t_sender
+        _ = t_sender
             .send(PacketProcessingMessage::ReceivedPacket(ReceivedPacket {
                 src_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8),
                 data: vec![0u8],
@@ -575,7 +557,7 @@ mod integration_tests {
             pending_ack_monitor,
         ));
 
-        t_sender.send(PacketProcessingMessage::Close).await;
+        _ = t_sender.send(PacketProcessingMessage::Close).await;
         assert!(matches!(handle.await, Ok(Ok(()))));
     }
 }

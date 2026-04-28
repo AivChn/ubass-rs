@@ -104,7 +104,7 @@ async fn handle_packet(
 
 async fn deserialize_and_decrypt(
     packet_type: PacketType,
-    mut data: Vec<u8>,
+    data: Vec<u8>,
     encryption_monitor: EncryptionMonitor,
     fingerprint_monitor: FingerprintMonitor,
 ) -> core::result::Result<Packet, ()> {
@@ -114,12 +114,14 @@ async fn deserialize_and_decrypt(
         // Single types
         PacketType::Data => {
             let mut packet = Box::new(DataPacket::deserialize(&data)?);
+            let session_id = packet.session_id;
             encryption::decrypt(packet.as_mut(), session_id, encryption_monitor).await?;
             Ok(Packet::DataPacket(packet))
         }
 
         PacketType::Parity => {
             let mut packet = Box::new(ParityPacket::deserialize(&data)?);
+            let session_id = packet.session_id;
             encryption::decrypt(packet.as_mut(), session_id, encryption_monitor).await?;
             Ok(Packet::ParityPacket(packet))
         }
@@ -229,9 +231,9 @@ async fn deserialize_and_auth_error_packet(
                 let data = dedup_no_payload(data, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
-                Packet::UnexpectedPacketErrorPacket(Box::new(
-                    UnexpectedPacketErrorPacket::deserialize(&data)?,
-                ))
+                Packet::UnexpectedPacketErrorPacket(Box::new(dbg!(
+                    UnexpectedPacketErrorPacket::deserialize(&data)?
+                )))
             }
 
             ErrorType::SessionDoesNotExist => {
@@ -416,7 +418,6 @@ mod test {
             .await
             .insert(session_id, Arc::default());
         let fingerprint_monitor = FingerprintMonitor::new(&FINGERPRINTS);
-        let fingerprint = Box::new(PacketFingerprint::from(&*packet));
         let some = dedup_with_payload(packet, session_id, fingerprint_monitor).await;
         dbg!(&some);
         assert!(some.is_some());

@@ -2,12 +2,17 @@ use std::{
     any::Any,
     fmt::Debug,
     net::SocketAddr,
+    ops::Deref,
     sync::{Arc, atomic::AtomicBool},
     time::Duration,
 };
 
 use async_trait::async_trait;
-use tokio::{sync::Mutex, task::JoinHandle};
+use futures::future::OptionFuture;
+use tokio::{
+    sync::{Mutex, Notify, RwLock},
+    task::JoinHandle,
+};
 
 pub mod messages;
 
@@ -19,8 +24,7 @@ macro_rules! debug_match_or_return {
         match $value {
             $p => $i,
             _ => {
-                #[cfg(debug_assertions)]
-                panic!("Invariant broken: {}", $msg);
+                debug_assert!(false, "Invariant broken: {}", $msg);
 
                 return;
             }
@@ -77,6 +81,70 @@ macro_rules! lock {
     ($to_lock:expr) => {
         $to_lock.lock().await
     };
+}
+
+#[derive(Debug, Default)]
+pub struct Shared<T: Send + Sync> {
+    value: RwLock<T>,
+    signal: Notify,
+}
+
+impl<T: Send + Sync> Shared<T> {
+    pub fn new(value: T) -> Self {
+        Self {
+            value: RwLock::new(value),
+            signal: Notify::default(),
+        }
+    }
+
+    pub async fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        let val = lock_read!(self.value);
+        f(&*val)
+    }
+
+    pub async fn with_async<R>(&self, f: impl AsyncFnOnce(&T) -> R) -> R {
+        let val = lock_read!(self.value);
+        f(&*val).await
+    }
+
+    pub async fn listen_then<R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
+        self.signal.notified().await;
+        let mut val = lock_write!(self.value);
+        f(&mut *val)
+    }
+
+    pub async fn listen(&self) {
+        self.signal.notified().await;
+    }
+
+    pub async fn update(&self, value: T) {
+        let mut val = lock_write!(self.value);
+        *val = value;
+        self.signal.notify_waiters();
+    }
+
+    pub async fn update_with(&self, f: impl Fn(&mut T)) {
+        let mut val = lock_write!(self.value);
+        f(&mut *val);
+        self.signal.notify_waiters();
+    }
+}
+
+impl<T: Send + Sync + Clone> Shared<T> {
+    pub async fn read_cloned(&self) -> T {
+        lock_read!(self.value).clone()
+    }
+}
+
+impl<T: Send + Sync + Clone + Copy> Shared<T> {
+    pub async fn read(&self) -> T {
+        *lock_read!(self.value)
+    }
+
+    pub async fn get_next(&self) -> T {
+        self.signal.notified().await;
+        *lock_read!(self.value)
+    }
 }
 
 pub trait PanicInDebug {

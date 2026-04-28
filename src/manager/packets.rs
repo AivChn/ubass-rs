@@ -79,7 +79,6 @@ impl Packet {
 impl SendPacket for Packet {
     type Sender = ManagerToProcessor;
 
-    #[must_use]
     #[allow(
         mismatched_lifetime_syntaxes,
         clippy::type_complexity,
@@ -684,7 +683,8 @@ pub struct UnexpectedPacketErrorPacket {
 impl UnexpectedPacketErrorPacket {
     pub const HEADER_SIZE: usize = size_of::<Self>();
 
-    fn new(
+    #[must_use]
+    pub fn new(
         opts: Options,
         session_id: SessionId,
         received_packet_type: PacketType,
@@ -844,6 +844,13 @@ impl IncompatibleVersionPacket {
 #[repr(transparent)]
 pub struct SecondaryType(u16);
 
+impl SecondaryType {
+    #[must_use]
+    pub const fn none() -> Self {
+        Self(0)
+    }
+}
+
 #[cfg(debug_assertions)]
 fn valid_secondary_type(st: SecondaryType) -> bool {
     HostControlType::VARIANTS.map(|e| e as u16).contains(&st.0)
@@ -854,6 +861,7 @@ fn valid_secondary_type(st: SecondaryType) -> bool {
             .map(|e| e as u16)
             .contains(&st.0)
         || ErrorType::VARIANTS.map(|e| e as u16).contains(&st.0)
+        || st.0 == 0
 }
 
 impl From<ControlType> for SecondaryType {
@@ -883,7 +891,7 @@ impl<T: Fingerprint> From<&T> for PacketFingerprint {
     }
 }
 
-#[derive(Debug, Deref, PartialEq, Serialize, DerefMut, Clone)]
+#[derive(Deref, DerefMut, Debug, PartialEq, Serialize, Clone)]
 pub struct PayloadField(Vec<u8>);
 
 impl PayloadField {
@@ -1260,30 +1268,38 @@ pub struct FECInfo {
 
 impl FECInfo {
     #[must_use]
-    pub fn new(batch_size: u8, batch_pos: u8, recovery_size: u8) -> Self {
+    pub const fn const_new(batch_size: u8, batch_pos: u8, recovery_count: u8) -> Self {
+        Self {
+            batch_size,
+            batch_pos,
+            recovery_count,
+        }
+    }
+
+    #[must_use]
+    pub fn new(batch_size: u8, batch_pos: u8, recovery_count: u8) -> Self {
         debug_assert!(
-            batch_pos < batch_size + recovery_size,
+            batch_pos < batch_size + recovery_count,
             "Invariant broken while constructing `FECInfo`: \
-            `batch_pos` is bigger than `batch_size` + `recovery_size` ({batch_pos} >= {batch_size} + {recovery_size})"
+            `batch_pos` is bigger than `batch_size` + `recovery_size` ({batch_pos} >= {batch_size} + {recovery_count})"
         );
         debug_assert!(
-            recovery_size <= batch_size,
+            recovery_count <= batch_size,
             "Invariant broken while constructing `FECInfo`: \
-            there are more recovery shards than there are data shards ({recovery_size} > {batch_size})"
+            there are more recovery shards than there are data shards ({recovery_count} > {batch_size})"
         );
         Self {
             batch_size,
             batch_pos,
-            recovery_count: recovery_size,
+            recovery_count,
         }
     }
 }
 
-#[repr(C)]
 #[derive(Debug, Serialize, Clone)]
 pub struct ByteRange {
-    start: BytePosition,
-    length: u16,
+    pub start: BytePosition,
+    pub length: u16,
 }
 
 impl ByteRange {

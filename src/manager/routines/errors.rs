@@ -15,12 +15,13 @@ pub async fn handle_errors(error: Error, sender: ManagerToProcessor) {
         error @ (Error::Task(TaskFailed)
         | Error::Channel(ChannelFailed(_) | ChannelClosed(_))
         | Error::Transport(FailedToBind | RecvFailedTooManyTimes)) => panicking_error(&error),
-        Error::PacketProcessor(WrongHeaderSize(size, source)) => {}
-        Error::PacketProcessor(InvalidPacketTypeHeader(value)) => {}
-        Error::PacketProcessor(FailedToDeserialize) => {}
+        Error::PacketProcessor(
+            WrongHeaderSize(_, _) | InvalidPacketTypeHeader(_) | FailedToDeserialize,
+        ) => {}
         Error::PacketProcessor(IncompatibleVersion(version, src_addr)) => {
             received_incompatible_version_error(version, src_addr, sender.clone()).await;
         }
+        Error::StateMismatch { .. } => todo!(),
     }
 }
 

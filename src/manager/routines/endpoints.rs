@@ -15,7 +15,8 @@ use crate::{
         self, AppId, STATE, key_exchange,
         packets::*,
         state::{
-            ConnectionStates, HandshakeId, SessionStateFlag, SessionStateFlags, SessionStates,
+            ConnectionStates, EstablishedState, HandshakeId, SessionStateFlag, SessionStateFlags,
+            SessionStates,
         },
         types::{ManagerFromApi, ManagerToApi, ManagerToProcessor},
     },
@@ -53,11 +54,11 @@ pub fn open(
 
         match runtime {
             Err(e) => {
-                mos.send(Err(e));
+                _ = mos.send(Err(e));
                 Err(ApiErrors::ThreadFailed(thread_name))
             }
             Ok(runtime) => {
-                mos.send(Ok(()));
+                _ = mos.send(Ok(()));
                 runtime.block_on(async {
                     manager::init(port, app_id, manager_to_api, manager_from_api).await
                 })
@@ -129,23 +130,18 @@ pub async fn send_data(
     }: OneShot<SendDataRequest, core::result::Result<SessionId, ApiErrors>>,
     outbound_sender: ManagerToProcessor,
 ) {
-    let (session_id, addr) = match resolve_target(target).await {
-        Ok(pair) => pair,
+    let session_id = match resolve_target(target).await {
+        Ok((session_id, _)) => session_id,
         Err(e) => {
-            reply.send(Err(e));
+            _ = reply.send(Err(e));
             return;
         }
     };
-    reply.send(Ok(session_id));
+    _ = reply.send(Ok(session_id));
 
-    let mut lock = lock_write!(get_state!().connections);
-    let connection = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
-        "Invariant broken in `endpoints::send_data`: \
-                session ID {session_id} does not exist even though it was returned by \
-                `resolve_target`, it had the associated address {addr}",
-    )));
-
-    connection.streaming_to(buffer, sender);
+    get_state!()
+        .send_on_session(session_id, buffer, sender, outbound_sender)
+        .await;
 }
 
 async fn resolve_target(
@@ -159,11 +155,11 @@ async fn resolve_target(
                 .ok_or(ApiErrors::SessionDoesNotExist)?;
 
             let address = match connection {
-                ConnectionStates::Established {
+                ConnectionStates::Established(box EstablishedState {
                     address,
                     state: SessionStates::Up | SessionStates::Down,
                     ..
-                } => *lock_read!(address),
+                }) => *lock_read!(address),
                 _ => return Err(ApiErrors::SessionOccupied),
             };
             Ok((session_id, address))
@@ -190,13 +186,7 @@ pub fn listen() {
 
 pub async fn request_track(
     OneShot {
-        data:
-            RequestDataRequest {
-                target,
-                id,
-                buffer,
-                sender,
-            },
+        data: RequestDataRequest { target, id, buffer, sender },
         response,
     }: OneShot<RequestDataRequest, Result<SessionId, ApiErrors>>,
     outbound_sender: ManagerToProcessor,
@@ -211,11 +201,20 @@ pub async fn request_track(
     let (session_id, addr) = match resolve_target(target).await {
         Ok(pair) => pair,
         Err(e) => {
-            response.send(Err(e));
+            _ = response.send(Err(e));
             return;
         }
     };
-    response.send(Ok(session_id));
+    _ = response.send(Ok(session_id));
+
+    o_unwrap_or_return!(
+        lock_write!(get_state!().connections)
+            .get_mut(&session_id)
+            .panic_in_debug(&format!(
+                "Invariant broken in `request_track`: session {session_id} does not exist"
+            ))
+    )
+    .streaming_from(buffer, sender);
 
     TrackRequestPacket::request_track(Options::none(), session_id, id.into())
         .send(outbound_sender, addr)

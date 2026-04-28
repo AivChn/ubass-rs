@@ -6,32 +6,24 @@ mod routines;
 pub mod state;
 pub mod types;
 
-pub use routines::endpoints::*;
-
 use std::{
-    net::SocketAddr,
     sync::{OnceLock, mpsc as std_mpsc},
     thread::JoinHandle,
 };
 
 use crate::{
-    DEFAULT_PORT, lock_read, lock_write,
     manager::{
         self,
-        packets::{
-            AckPacket, AppRejectErrorPacket, ControlType, HelloPacket, HostControlType,
-            IncompatibleVersionPacket, Options, PacketFingerprint, PacketType, SessionId, Version,
-        },
-        state::{EncryptionWindow, Port, ProtocolState, SessionStateFlag, SessionStateFlags},
+        state::{Port, ProtocolState},
     },
     packet_processor::{self},
     prelude::*,
     transport::{self, types::TransportChannels},
 };
 
-use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
 use tokio::{runtime::Builder as RuntimeBuilder, sync::mpsc, time::Instant};
 
+pub use routines::endpoints;
 pub use state::{AppId, EncryptionMonitor, FingerprintMonitor, PendingAckMonitor};
 use types::*;
 
@@ -86,12 +78,12 @@ pub async fn init(
         _,
     ) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
-    STATE.set(ProtocolState::new(
+    _ = STATE.set(ProtocolState::new(
         Port::new(port),
         app_id,
         manager_to_processor.clone(),
     ));
-    PROTOCOL_EPOCH.set(Instant::now());
+    _ = PROTOCOL_EPOCH.set(Instant::now());
 
     let (transport_handle, processor_handle) =
         setup_layers(port, processor_to_manager, processor_from_manager)?;
@@ -165,9 +157,9 @@ fn setup_layers(
         match runtime {
             Err(e) => _ = pos.send(Err(e)),
             Ok(runtime) => {
-                pos.send(Ok(()));
+                _ = pos.send(Ok(()));
                 runtime.block_on(async {
-                    packet_processor::init(
+                    _ = packet_processor::init(
                         processor_from_manager,
                         processor_to_manager,
                         processor_from_transport,
@@ -203,8 +195,8 @@ fn setup_layers(
         match runtime {
             Err(e) => _ = tos.send(Err(e)),
             Ok(runtime) => {
-                tos.send(Ok(()));
-                runtime.block_on(async {
+                _ = tos.send(Ok(()));
+                _ = runtime.block_on(async {
                     transport::init(
                         port,
                         TransportChannels {
