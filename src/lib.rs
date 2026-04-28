@@ -15,4 +15,6 @@ pub mod prelude;
 pub mod transport;
 pub mod utils;
 
+pub use api::open;
+
 pub const DEFAULT_PORT: u16 = 8455;

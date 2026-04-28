@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used)]
+use std::net::Ipv4Addr;
 use std::net::SocketAddr;
+use std::net::SocketAddrV4;
 use std::panic;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -26,6 +28,30 @@ async fn main() -> Result<(), ()> {
         "client" => client(args[2].parse().unwrap(), args[3].parse().unwrap()).await?,
         _ => panic!("usage: e2e_peer <server|client> <port> [server_addr]"),
     }
+    Ok(())
+}
+
+#[allow(unused)]
+async fn client_example(port: u16) -> Result<(), ()> {
+    let app_id = "client_example";
+    let api = ubass::open(app_id, Some(port)).await.unwrap();
+
+    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8455);
+    let pending_connection = api.connect(addr.into()).await.unwrap();
+
+    let connection = pending_connection.ready().await.unwrap();
+
+    let track_size = 128 * 1024;
+    let mut buffer = vec![0u8; track_size];
+    let track_id = b"some track ID".as_slice();
+    let stream = connection
+        .request(track_id, buffer.as_mut_slice())
+        .await
+        .unwrap();
+
+    let connection = stream.complete().await.unwrap();
+
+    connection.close().await;
     Ok(())
 }
 
@@ -102,7 +128,6 @@ async fn client(port: u16, server_addr: SocketAddr) -> Result<(), ()> {
         .map_err(|_| println!("stream complete timeout"))?
         .map_err(|_| println!("stream complete error"))?;
 
-    println!("{}", str::from_utf8(&buffer).unwrap());
     assert_eq!(buffer, MESSAGE);
     Ok(())
 }

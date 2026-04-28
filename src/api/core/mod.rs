@@ -29,7 +29,8 @@ pub struct Api {
 /// - `InvalidAppId` if the app ID is longer than [`MAX_PAYLOAD_LENGTH`] or not valid ASCII
 /// - `InvalidPort` if the port is 1024 or lower
 /// - `AlreadyOpen` if the protocol is already open
-pub async fn open(app_id: String, port: Option<u16>) -> Result<Api, ApiErrors> {
+pub async fn open(app_id: impl Into<String>, port: Option<u16>) -> Result<Api, ApiErrors> {
+    let app_id = app_id.into();
     let port = match port {
         Some(0..=1024) => return Err(ApiErrors::InvalidPort),
         Some(port) => port,
@@ -94,7 +95,6 @@ impl Api {
             InnerAppEvent::Closed => Ok(AppEvent::Closed),
         }
     }
-
 }
 
 const fn verify_app_id(app_id: &str) -> bool {
