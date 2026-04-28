@@ -1,3 +1,4 @@
+#![allow(clippy::unwrap_used)]
 use std::time::{Duration, Instant};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
