@@ -73,3 +73,7 @@ stream struct updated with channel message
 
 write to buffer
 
+# Few things to rememeber
+ - FEC state is only relevant when streaming
+ - Restransmit is also directly handled by the long living send routine
+    - This does mean I need a Restransmit variant for the StreamEvent
