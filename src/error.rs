@@ -3,7 +3,10 @@ use std::{io, net::SocketAddr};
 use crate::{
     api::IncomingConnection,
     error,
-    manager::packets::{BatchID, SessionId, Version},
+    manager::{
+        packets::{BatchID, SessionId, Version},
+        state::{ConnectionStates, EstablishedState, SessionStates, StreamState, Streaming},
+    },
 };
 pub type Result<T> = core::result::Result<T, Error>;
 pub type ErrResult = Result<()>;
@@ -94,6 +97,52 @@ pub enum Error {
     Transport(TransportError),
     #[error("Packet Processing Error: {0}")]
     PacketProcessor(PacketProcessingError),
+    #[error("State did not match the expected state. expected {expected}, found {found} ")]
+    StateMismatch {
+        expected: FlatState,
+        found: FlatState,
+    },
+}
+
+#[derive(Debug, Display)]
+pub enum FlatState {
+    Up,
+    Down,
+    StreamingTo,
+    StreamingFrom,
+    Handshake,
+}
+
+impl From<&ConnectionStates> for FlatState {
+    fn from(value: &ConnectionStates) -> Self {
+        match value {
+            ConnectionStates::Handshake { .. } => Self::Handshake,
+            ConnectionStates::Established(box EstablishedState {
+                state: SessionStates::Up,
+                ..
+            }) => Self::Up,
+            ConnectionStates::Established(box EstablishedState {
+                state: SessionStates::Down,
+                ..
+            }) => Self::Down,
+            ConnectionStates::Established(box EstablishedState {
+                state:
+                    SessionStates::Streaming(StreamState {
+                        streaming: Streaming::To(_),
+                        ..
+                    }),
+                ..
+            }) => Self::StreamingTo,
+            ConnectionStates::Established(box EstablishedState {
+                state:
+                    SessionStates::Streaming(StreamState {
+                        streaming: Streaming::From(_),
+                        ..
+                    }),
+                ..
+            }) => Self::StreamingFrom,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
