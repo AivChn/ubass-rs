@@ -1,15 +1,6 @@
 #![allow(async_fn_in_trait)]
 #![allow(clippy::len_without_is_empty)]
-use std::{
-    collections::btree_map::VacantEntry,
-    fmt::Debug,
-    ops::{Range, Sub},
-    ptr,
-    slice::SliceIndex,
-};
-
-use derive_more::Deref;
-use tokio::sync::Notify;
+use std::{fmt::Debug, ops::Range, ptr, slice::SliceIndex};
 
 use crate::{
     manager::packets::{BytePosition, MAX_PAYLOAD_LENGTH},
@@ -70,6 +61,11 @@ impl WriteableBuffer {
         *self.head as usize
     }
 
+    #[must_use]
+    pub fn is_done(&self) -> bool {
+        *self.head as usize >= self.len()
+    }
+
     const fn position_to_index(&self, position: BytePosition) -> Option<usize> {
         if self.buffer.len() < position.0 as usize {
             None
@@ -124,7 +120,7 @@ impl WriteableBuffer {
         if self.position_occupied(position)?
             || (to_write.len() != MAX_PAYLOAD_LENGTH
                 && self.position_to_index(position)? != self.map.len() - 1)
-            || position.0 as usize + to_write.len() >= self.buffer.len()
+            || position.0 as usize + to_write.len() > self.buffer.len()
         {
             return None;
         }
@@ -143,13 +139,6 @@ impl WriteableBuffer {
 pub struct ReadableBuffer {
     buffer: Box<[u8]>,
     head: usize,
-}
-
-impl ReadableBuffer {
-    #[must_use]
-    pub fn into_vec(self) -> Vec<u8> {
-        self.buffer.into()
-    }
 }
 
 impl<T: Into<Box<[u8]>>> From<T> for ReadableBuffer {
@@ -180,6 +169,10 @@ impl Iterator for ReadableBuffer {
 }
 
 impl ReadableBuffer {
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.buffer.into()
+    }
     #[must_use]
     pub const fn len(&self) -> usize {
         self.buffer.len()

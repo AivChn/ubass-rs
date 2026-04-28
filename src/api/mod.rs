@@ -13,5 +13,5 @@ pub use types::{
 #[cfg(feature = "rust-api")]
 pub use rust::*;
 
-#[cfg(feature = "rust-api")]
+#[cfg(feature = "uniffi-api")]
 pub use uniffi::*;
