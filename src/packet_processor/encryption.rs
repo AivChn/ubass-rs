@@ -26,15 +26,17 @@ pub async fn encrypt(
     packet: &mut impl Encryptable,
     session_id: SessionId,
     monitor: EncryptionMonitor,
-) {
+) -> Option<()> {
     let (aad, payload) = (packet.headers(), packet.payload());
 
-    let (cipher, counter) = monitor.get(&session_id).await;
+    let (cipher, counter) = monitor.get(&session_id).await?;
     let nonce = Nonce::from(get_nonce(session_id, counter));
 
     _ = cipher.encrypt_in_place(&nonce, &aad, payload);
 
     payload.extend(counter);
+
+    Some(())
 }
 
 /// Decrypts the buffer in place, while authenticating the data at the same time.
@@ -59,7 +61,7 @@ pub async fn decrypt(
         return Err(());
     }
 
-    let cipher = monitor.get_cipher(&session_id).await;
+    let cipher = monitor.get_cipher(&session_id).await.ok_or(())?;
     let counter: [u8; 8] = payload[payload.len() - 8..]
         .try_into()
         .expect("failed to convert an 8 byte slice to an array of 8 bytes.");
@@ -71,8 +73,12 @@ pub async fn decrypt(
         .map_err(|_| ())
 }
 
-pub async fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: EncryptionMonitor) {
-    let (cipher, counter) = monitor.get(&session_id).await;
+pub async fn tag(
+    packet: &mut Vec<u8>,
+    session_id: SessionId,
+    monitor: EncryptionMonitor,
+) -> Option<()> {
+    let (cipher, counter) = monitor.get(&session_id).await?;
     let nonce = Nonce::from(get_nonce(session_id, counter));
 
     let mut tag = vec![];
@@ -80,6 +86,8 @@ pub async fn tag(packet: &mut Vec<u8>, session_id: SessionId, monitor: Encryptio
     _ = cipher.encrypt_in_place(&nonce, packet, &mut tag);
     packet.append(&mut tag);
     packet.extend(counter);
+
+    Some(())
 }
 
 /// authenticates the given buffer by passing it as aad to decryption with a buffer of just the tag.
@@ -96,7 +104,9 @@ pub async fn authenticate(
     session_id: SessionId,
     monitor: EncryptionMonitor,
 ) -> bool {
-    let cipher = monitor.get_cipher(&session_id).await;
+    let Some(cipher) = monitor.get_cipher(&session_id).await else {
+        return false;
+    };
     let counter: [u8; 8] = packet
         .drain(packet.len() - 8..)
         .collect::<Vec<_>>()
