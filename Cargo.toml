@@ -7,6 +7,10 @@ edition = "2024"
 name = "ubass"
 path = "src/lib.rs"
 
+[lints.clippy]
+pedantic = "warn"
+unwrap_used = { level = "deny", priority = -1 }
+
 [features]
 default = ["fec_xor", "rust-api"]
 fec_xor = []
