@@ -1,4 +1,6 @@
+#![feature(box_patterns)]
 #![allow(unused)]
+#![allow(dead_code)]
 #![allow(clippy::wildcard_imports)]
 #![allow(clippy::cast_lossless)]
 #![warn(clippy::must_use_candidate)]
