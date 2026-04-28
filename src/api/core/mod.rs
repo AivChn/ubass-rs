@@ -74,9 +74,6 @@ impl Api {
     // TODO:
     pub async fn listen(&self) -> core::result::Result<AppEvent, ApiErrors> {
         match self.inner.listen().await? {
-            InnerAppEvent::DataReceived { session_id, data } => {
-                Ok(AppEvent::DataReceived { session_id, data })
-            }
             InnerAppEvent::IncomingConnection {
                 request,
                 response,

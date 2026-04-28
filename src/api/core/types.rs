@@ -75,12 +75,11 @@ impl ApiInner {
     }
 }
 
-// TODO: this API
 impl ApiInner {
     pub fn close(mut self) -> Result<(), ApiErrors> {
-        let tx = self.api_to_manager.clone();
+        let sender = self.api_to_manager.clone();
         // blocking_send panics from within a tokio runtime — spawn a plain OS thread to avoid that
-        _ = std::thread::spawn(move || tx.blocking_send(ApiCommand::Close)).join();
+        _ = std::thread::spawn(move || sender.blocking_send(ApiCommand::Close)).join();
         if let Some(handle) = self.manager_handle.take() {
             match handle.join() {
                 Ok(res) => res?,
@@ -125,13 +124,10 @@ impl ApiInner {
                 };
                 Ok(event)
             }
-            Some(Ok(ApiMessage::DataReceived { session_id, data })) => {
-                Ok(InnerAppEvent::DataReceived { session_id, data })
-            }
         }
     }
 
-    pub async fn send_data(
+    async fn send_data(
         &self,
         target: SendTarget,
         buffer: ReadableBuffer,
@@ -154,7 +150,7 @@ impl ApiInner {
         reply.recv().await?
     }
 
-    pub async fn request_track(
+    async fn request_track(
         &self,
         target: SendTarget,
         track_id: impl Into<Box<[u8]>>,
@@ -183,19 +179,11 @@ impl ApiInner {
 
 #[derive(Debug)]
 pub enum AppEvent {
-    DataReceived {
-        session_id: SessionId,
-        data: PayloadField,
-    },
     IncomingConnection(IncomingConnection),
     Closed,
 }
 
 pub enum InnerAppEvent {
-    DataReceived {
-        session_id: SessionId,
-        data: PayloadField,
-    },
     IncomingConnection {
         request: OneShot<AppId, AppResponse>,
         response: ResponseReceiver<
@@ -228,6 +216,7 @@ impl PendingConnection {
         }
     }
 }
+
 impl api::types::PendingConnection for PendingConnection {
     type Connection = Connection;
     type Error = ConnectionError;
@@ -471,7 +460,9 @@ impl api::types::Connection for Connection {
         }
     }
 
-    async fn close(self) {}
+    async fn close(self) {
+        todo!()
+    }
 }
 
 #[derive(Debug)]
