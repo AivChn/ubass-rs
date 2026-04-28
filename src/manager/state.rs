@@ -1,6 +1,7 @@
 #![allow(private_interfaces)]
 use aes_gcm_siv::Aes256GcmSiv;
 use derive_more::{Deref, Display};
+use reed_solomon_simd::engine::tables;
 use tokio::{
     select,
     sync::{Mutex, RwLock, mpsc, oneshot, watch},
@@ -80,8 +81,8 @@ impl ConnectionStatesTable {
 
 #[derive(Debug)]
 pub struct StreamingTo {
-    buffer: ReadableBuffer,
-    event: Arc<Shared<StreamEvent>>,
+    pub buffer: ReadableBuffer,
+    pub event: Arc<Shared<StreamEvent>>,
 }
 
 #[derive(Debug)]
@@ -334,8 +335,9 @@ impl ConnectionStates {
         }) = self
         {
             let payload = packet.payload.take();
-            let result = buffer.write(packet.byte_range_start, payload);
-            result.ok_or(ChannelError::ChannelClosed(Inbound))?;
+            buffer
+                .write(packet.byte_range_start, payload)
+                .ok_or(ChannelError::ChannelClosed(Inbound))?;
             stream.send_modify(|m| m.head = buffer.head());
             if buffer.is_done() {
                 stream.send_modify(|m| m.closed = true);
@@ -577,6 +579,7 @@ impl ProtocolState {
                     address,
                     signal,
                 } => {
+                    signal.send_modify(|m| *m = false);
                     if ack_triggered_response
                         .send(Err(ConnectionError::ProtocolClosed))
                         .is_err()
@@ -590,11 +593,10 @@ impl ProtocolState {
                             *lock_read!(address)
                         );
                     }
-                    signal.send_modify(|m| *m = false);
                 }
                 ConnectionStates::Established(box EstablishedState { connection, .. }) => {
                     if connection
-                        .send(ConnectionEvent::Closed(vec![]))
+                        .send(ConnectionEvent::ProtocolClosed(vec![]))
                         .await
                         .is_err()
                     {
@@ -689,6 +691,63 @@ impl ProtocolState {
             }
         }
     }
+
+    pub async fn close_session(&self, session_id: SessionId) {
+        let main_session =
+            o_unwrap_or_return!(lock_write!(get_state!().connections).remove(&session_id));
+
+        let address = match main_session {
+            ConnectionStates::Handshake {
+                ack_triggered_response,
+                address,
+                ..
+            } => {
+                _ = ack_triggered_response.send(Err(ConnectionError::SessionClosedByPeer));
+                *lock_read!(address)
+            }
+            ConnectionStates::Established(box EstablishedState { address, .. }) => {
+                *lock_read!(address)
+            }
+        };
+
+        o_unwrap_or_return!(
+            get_state!()
+                .address_session
+                .remove(address, session_id)
+                .await
+        );
+
+        get_state!().fingerprints.remove_session(session_id);
+
+        lock_write!(get_state!().encryption).remove(&session_id);
+    }
+
+    pub async fn close_stream(&self, session_id: SessionId, outbound_sender: ManagerToProcessor) {
+        let mut lock = lock_write!(self.connections);
+        let session = o_unwrap_or_return!(lock.get_mut(&session_id));
+
+        if let ConnectionStates::Established(box EstablishedState { state, .. }) = session {
+            match state {
+                SessionStates::Streaming(
+                    StreamState {
+                        streaming: Streaming::To(StreamingTo { event, .. }),
+                        ..
+                    },
+                    ..,
+                ) => {
+                    event.update_with(|e| *e = StreamEvent::Close).await;
+                }
+                SessionStates::Streaming(StreamState { stream, .. }) => {
+                    stream.send_modify(|m| m.closed = true);
+                }
+                _ => {
+                    return;
+                }
+            }
+
+            *state = SessionStates::Up;
+        }
+    }
 }
 
 async fn retransmit_action(
@@ -739,11 +798,12 @@ async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToPro
             && let Some(chunks) = stream.get_chunks(n)
         {
             let addr = *lock_read!(address);
-            let close_event = if let Streaming::To(StreamingTo { buffer, event }) = &stream.streaming {
-                buffer.is_done().then(|| event.clone())
-            } else {
-                None
-            };
+            let close_event =
+                if let Streaming::To(StreamingTo { buffer, event }) = &stream.streaming {
+                    buffer.is_done().then(|| event.clone())
+                } else {
+                    None
+                };
             Some((chunks, addr, close_event))
         } else {
             None
@@ -812,6 +872,18 @@ impl AddressSessionIdTable {
             })
             .copied()
     }
+
+    pub async fn remove(&self, address: SocketAddr, session_id: SessionId) -> Option<SessionId> {
+        let mut lock = lock_write!(self);
+        let v = lock.get_mut(&address)?;
+        let index = v.iter().position(|e| e.eq(&session_id))?;
+        v.swap_remove(index);
+        if v.is_empty() {
+            lock.remove(&address);
+        }
+
+        Some(session_id)
+    }
 }
 
 pub struct GeneralSessionState {
@@ -853,9 +925,12 @@ impl GeneralStateTable {
 }
 
 impl FingerprintTable {
-    pub async fn add(&self, session_id: SessionId) {
-        let mut table = self.0.write().await;
-        table.insert(session_id, Arc::default());
+    pub async fn add_session(&self, session_id: SessionId) {
+        lock_write!(self.0).insert(session_id, Arc::default());
+    }
+
+    pub async fn remove_session(&self, session_id: SessionId) {
+        lock_write!(self.0).remove(&session_id);
     }
 }
 
@@ -1560,35 +1635,15 @@ impl EncryptionMonitor {
     ///
     /// # Panics
     /// This function panics if the key is not yet created, which should be impossible
-    pub async fn get(&self, session_id: &SessionId) -> (Arc<Aes256GcmSiv>, [u8; 8]) {
-        self.table
-            .write()
-            .await
-            .get(session_id)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Invariant broken while accessing session table: \
-        session ({session_id}) does not have a key but is being accessed for encryption",
-                )
-            })
-            .get()
+    pub async fn get(&self, session_id: &SessionId) -> Option<(Arc<Aes256GcmSiv>, [u8; 8])> {
+        Some(self.table.write().await.get(session_id)?.get())
     }
 
     /// returns the key without increasing the counter
     ///
     /// # Panics
     /// This function panics if the key is not yet created, which should be impossible
-    pub async fn get_cipher(&self, session_id: &SessionId) -> Arc<Aes256GcmSiv> {
-        self.table
-            .read()
-            .await
-            .get(session_id)
-            .unwrap_or_else(|| {
-                panic!(
-                    "Invariant broken while accessing session table: \
-        session ({session_id}) does not have a key but is being accessed for decryption",
-                )
-            })
-            .get_cipher()
+    pub async fn get_cipher(&self, session_id: &SessionId) -> Option<Arc<Aes256GcmSiv>> {
+        Some(self.table.read().await.get(session_id)?.get_cipher())
     }
 }

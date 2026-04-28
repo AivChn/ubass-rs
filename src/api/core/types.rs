@@ -1,6 +1,6 @@
 use crate::{
     api::{
-        self, SendTarget,
+        self, Api, SendTarget,
         types::{ReadableBuffer, WriteableBuffer},
     },
     error::ConnectionError,
@@ -8,6 +8,7 @@ use crate::{
         AppId, endpoints,
         packets::{MAX_PAYLOAD_LENGTH, PayloadField, SessionId},
     },
+    o_unwrap_or_return,
     prelude::{ApiCommand, ApiErrors, ApiMessage, AppResponse},
     utils::{
         ConnectionEvent, OneShot, PanicInDebug, RequestDataRequest, ResponseReceiver,
@@ -21,10 +22,13 @@ use std::{
     thread::JoinHandle,
 };
 
-use tokio::sync::{
-    Mutex,
-    mpsc::{self, Receiver, Sender},
-    oneshot, watch,
+use tokio::{
+    runtime::Runtime,
+    sync::{
+        Mutex,
+        mpsc::{self, Receiver, Sender},
+        oneshot, watch,
+    },
 };
 
 const CHANNEL_BUFFER_SIZE: usize = 256;
@@ -175,6 +179,19 @@ impl ApiInner {
 
         response.recv().await?
     }
+
+    async fn close_stream(&self, session_id: SessionId) {
+        self.api_to_manager
+            .send(ApiCommand::CloseStream(session_id))
+            .await;
+    }
+
+    fn close_session(&self, session_id: SessionId) {
+        // HACK: find a better way to handle this being syncronous
+        _ = self
+            .api_to_manager
+            .try_send(ApiCommand::CloseSession(session_id));
+    }
 }
 
 #[derive(Debug)]
@@ -244,6 +261,11 @@ impl api::types::PendingConnection for PendingConnection {
             self.peer_address,
             receiver,
         ))
+    }
+
+    // TODO: this needs to inform the handshake state that its stale in some way.
+    async fn discard(self) -> Result<(), Self::Error> {
+        todo!()
     }
 }
 
@@ -386,6 +408,13 @@ impl Connection {
     }
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        let api: Arc<ApiInner> = o_unwrap_or_return!(self.api.upgrade());
+        api.close_session(self.session_id);
+    }
+}
+
 impl api::types::Connection for Connection {
     type Event = ConnectionEvent;
     type Error = ConnectionError;
@@ -399,7 +428,9 @@ impl api::types::Connection for Connection {
                 buffer.push(message);
             }
             match buffer.last() {
-                Some(ConnectionEvent::Closed(_)) => Ok(ConnectionEvent::Closed(buffer)),
+                Some(ConnectionEvent::ProtocolClosed(_)) => {
+                    Ok(ConnectionEvent::ProtocolClosed(buffer))
+                }
                 _ => Err(ConnectionError::ProtocolClosed),
             }
         } else {
@@ -461,7 +492,8 @@ impl api::types::Connection for Connection {
     }
 
     async fn close(self) {
-        todo!()
+        let api: Arc<ApiInner> = o_unwrap_or_return!(self.api.upgrade());
+        api.close_session(self.session_id);
     }
 }
 
@@ -518,7 +550,7 @@ impl api::types::Stream for InputStream {
     }
 
     async fn is_done(&self) -> bool {
-        self.update.borrow().head == self.stream_size
+        self.update.borrow().head == self.stream_size || self.update.borrow().closed
     }
 
     async fn complete(mut self) -> Result<Self::Connection, Self::Error> {
@@ -526,6 +558,12 @@ impl api::types::Stream for InputStream {
             .wait_for(|message| message.closed)
             .await
             .map_err(|_| ConnectionError::ProtocolClosed)?;
+        Ok(self.connection)
+    }
+
+    async fn close(self) -> Result<Self::Connection, Self::Error> {
+        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+        api.close_stream(self.session).await;
         Ok(self.connection)
     }
 }
@@ -592,6 +630,12 @@ impl api::types::Stream for OutputStream {
             .wait_for(|message| message.closed)
             .await
             .map_err(|_| ConnectionError::ProtocolClosed)?;
+        Ok(self.connection)
+    }
+
+    async fn close(self) -> Result<Self::Connection, Self::Error> {
+        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+        api.close_stream(self.session).await;
         Ok(self.connection)
     }
 }

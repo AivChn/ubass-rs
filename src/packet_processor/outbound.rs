@@ -170,6 +170,10 @@ async fn handle_packet(
             let session_id = packet.session_id;
             process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
         }
+        Packet::CloseSessionPacket(packet) => {
+            let session_id = packet.session_id;
+            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
+        }
         Packet::SessionDoesNotExistErrorPacket(packet) => {
             add_ack!(
                 for SessionDoesNotExistErrorPacket(packet),
@@ -460,7 +464,7 @@ mod integration_tests {
     static ENCRYPTION: LazyLock<EncryptionTable> = LazyLock::new(EncryptionTable::default);
     static PENDING_ACK: OnceLock<PendingAckWindow> = OnceLock::new();
 
-    fn prep_for_init() -> (
+    type TestInitTypes = (
         (
             Sender<PacketProcessingMessage>,
             Receiver<PacketProcessingMessage>,
@@ -471,7 +475,9 @@ mod integration_tests {
         ),
         (Sender<TransportMessage>, Receiver<TransportMessage>),
         (EncryptionMonitor, PendingAckMonitor),
-    ) {
+    );
+
+    fn prep_for_init() -> TestInitTypes {
         let (processor_to_transport, transport_from_processor) = tokio::sync::mpsc::channel(1);
         (
             (processor_to_transport.clone(), transport_from_processor),

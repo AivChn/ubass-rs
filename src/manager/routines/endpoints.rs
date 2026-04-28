@@ -1,8 +1,10 @@
 #![allow(clippy::wildcard_imports)]
 use std::{
     net::SocketAddr,
+    os::unix::fs::lchown,
     sync::mpsc::{SyncSender, sync_channel},
     thread::JoinHandle,
+    time::Duration,
 };
 
 use tokio::{runtime::Builder as RuntimeBuilder, sync::mpsc::Receiver};
@@ -16,16 +18,18 @@ use crate::{
         packets::*,
         state::{
             ConnectionStates, EstablishedState, HandshakeId, SessionStateFlag, SessionStateFlags,
-            SessionStates,
+            SessionStates, StreamState, Streaming, StreamingTo,
         },
         types::{ManagerFromApi, ManagerToApi, ManagerToProcessor},
     },
     o_unwrap_or_return,
     utils::{
         ConnectionEvent, Flags, OneShot, PanicInDebug, RequestDataRequest, SendDataRequest,
-        SendPacket, SendTarget,
+        SendPacket, SendTarget, StreamEvent,
     },
 };
+
+const CLOSE_SESSION_DELAY: Duration = Duration::from_millis(25);
 
 /// Creates a runtime and initiates the protocol in it.
 ///
@@ -186,7 +190,13 @@ pub fn listen() {
 
 pub async fn request_track(
     OneShot {
-        data: RequestDataRequest { target, id, buffer, sender },
+        data:
+            RequestDataRequest {
+                target,
+                id,
+                buffer,
+                sender,
+            },
         response,
     }: OneShot<RequestDataRequest, Result<SessionId, ApiErrors>>,
     outbound_sender: ManagerToProcessor,
@@ -223,4 +233,28 @@ pub async fn request_track(
 
 pub fn request_metadata() {
     todo!()
+}
+
+pub async fn close_session(session_id: SessionId, sender: ManagerToProcessor) {
+    // a delay is added as a best effort to add a small buffer for other packets to be received by the other hoest,
+    // since ordering isnt guaranteed and receiving this packet will cause the other host to
+    // immediately stop accepting from this session
+    tokio::time::sleep(CLOSE_SESSION_DELAY);
+
+    Box::new(CloseSessionPacket::new(Options::none(), session_id))
+        .send(
+            sender,
+            o_unwrap_or_return!(get_state!().connections.address(session_id).await),
+        )
+        .await;
+
+    get_state!().close_session(session_id).await;
+}
+
+pub async fn close_stream(session_id: SessionId, sender: ManagerToProcessor) {
+    get_state!().close_stream(session_id, sender.clone()).await;
+
+    let address = o_unwrap_or_return!(get_state!().connections.address(session_id).await);
+
+    Box::new(PlaybackStatusPacket::stop(Options::none(), session_id)).send(sender, address);
 }

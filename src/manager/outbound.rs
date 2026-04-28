@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::{
     get_state,
     manager::{
-        STATE,
+        STATE, outbound,
         routines::endpoints,
         types::{ManagerFromApi, ManagerToProcessor},
     },
@@ -50,7 +50,20 @@ pub async fn init(
                     .await;
             }
             Some(ApiCommand::CloseSession(session_id)) => {
-                todo!()
+                monitor
+                    .dispatch(endpoints::close_session(
+                        session_id,
+                        manager_to_processor.clone(),
+                    ))
+                    .await;
+            }
+            Some(ApiCommand::CloseStream(session_id)) => {
+                monitor
+                    .dispatch(endpoints::close_stream(
+                        session_id,
+                        manager_to_processor.clone(),
+                    ))
+                    .await;
             }
         }
     }

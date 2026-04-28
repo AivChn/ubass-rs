@@ -42,6 +42,7 @@ pub enum Packet {
     SessionDoesNotExistErrorPacket(Box<SessionDoesNotExistErrorPacket>),
     UnexpectedPacketErrorPacket(Box<UnexpectedPacketErrorPacket>),
     AppRejectErrorPacket(Box<AppRejectErrorPacket>),
+    CloseSessionPacket(Box<CloseSessionPacket>),
 }
 
 impl Packet {
@@ -64,6 +65,7 @@ impl Packet {
             Packet::SessionDoesNotExistErrorPacket(packet) => Some(packet.session_id),
             Packet::UnexpectedPacketErrorPacket(packet) => Some(packet.session_id),
             Packet::AppRejectErrorPacket(packet) => Some(packet.session_id),
+            Packet::CloseSessionPacket(packet) => Some(packet.session_id),
             Packet::IncompatibleVersionPacket(_) | Packet::HandshakeAckPacket(_) => {
                 debug_assert!(
                     false,
@@ -108,6 +110,7 @@ impl SendPacket for Packet {
             Packet::UnexpectedPacketErrorPacket(packet) => packet.send(sender, address),
             Packet::AppRejectErrorPacket(packet) => packet.send(sender, address),
             Packet::HandshakeAckPacket(packet) => packet.send(sender, address),
+            Packet::CloseSessionPacket(packet) => packet.send(sender, address),
         }
     }
 }
@@ -126,6 +129,7 @@ impl TryFrom<&Packet> for PacketFingerprint {
             Packet::PlaybackStatusPacket(packet) => packet.as_ref().into(),
             Packet::UnexpectedPacketErrorPacket(packet) => packet.as_ref().into(),
             Packet::AppRejectErrorPacket(packet) => packet.as_ref().into(),
+            Packet::CloseSessionPacket(packet) => packet.as_ref().into(),
             _x @ (Packet::AckPacket(_)
             | Packet::IncompatibleVersionPacket(_)
             | Packet::SessionDoesNotExistErrorPacket(_)
@@ -626,6 +630,39 @@ impl RetransmitPacket {
             session_id,
             timestamp,
             payload,
+        })
+    }
+}
+
+#[derive(Debug, SendPacket, Clone, Serialize, Headers)]
+pub struct CloseSessionPacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub control_type: ControlType,
+    pub reserved: Reserved<2>,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+}
+
+impl CloseSessionPacket {
+    #[must_use]
+    pub fn new(opts: Options, session_id: SessionId) -> Box<Self> {
+        let version = Version::CURRENT_VERSION;
+        let opts = opts.set(OptionFlags::RequireAck);
+        let packet_type = PacketType::Session;
+        let control_type = ControlType::Session(SessionControlType::Close);
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+
+        Box::new(Self {
+            version,
+            opts,
+            packet_type,
+            control_type,
+            reserved,
+            session_id,
+            timestamp,
         })
     }
 }
@@ -1164,6 +1201,7 @@ pub enum SessionControlType {
     Retransmit = 1,
     TrackRequest = 2,
     MetadataRequest = 3,
+    Close = 4,
 }
 
 impl From<SessionControlType> for ControlType {

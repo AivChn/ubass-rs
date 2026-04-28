@@ -3,7 +3,7 @@ use std::{net::SocketAddr, time::Duration};
 use crate::{
     error::ConnectionError,
     lock,
-    manager::state::{ConnectionStates, EstablishedState},
+    manager::state::{ConnectionStates, EstablishedState, SessionStates, StreamState},
     match_or_return,
     prelude::*,
     utils::PanicInDebug,
@@ -24,6 +24,25 @@ use crate::{
 };
 
 const BUFFERING_TIME_FOR_HANDSHAKE: u64 = 7;
+
+pub async fn received_close_session_packet(packet: Box<CloseSessionPacket>) {
+    {
+        let lock = lock_read!(get_state!().connections);
+        let session = o_unwrap_or_return!(lock.get(&packet.session_id));
+        match session {
+            ConnectionStates::Established(box EstablishedState {
+                state: SessionStates::Streaming(StreamState { stream, .. }),
+                ..
+            }) => stream.send_modify(|m| m.closed = true),
+            ConnectionStates::Established(box EstablishedState { connection, .. }) => {
+                connection.send(ConnectionEvent::Closed);
+            }
+            ConnectionStates::Handshake { .. } => {}
+        }
+    }
+
+    get_state!().close_session(packet.session_id);
+}
 
 pub async fn received_track_request_packet(packet: Box<TrackRequestPacket>) {
     let track_id = packet.payload.take();
@@ -327,11 +346,32 @@ pub async fn received_packet_that_requires_ack(
         .await;
 }
 
+pub async fn received_packet_with_invalid_session(
+    src_addr: SocketAddr,
+    sender: ManagerToProcessor,
+    session_id: SessionId,
+) {
+    let packet = Box::new(SessionDoesNotExistErrorPacket::new(
+        Options::none(),
+        session_id,
+    ));
+
+    if src_addr.port() != DEFAULT_PORT {
+        let mut alternative_address = src_addr;
+        alternative_address.set_port(DEFAULT_PORT);
+        packet
+            .clone()
+            .send(sender.clone(), alternative_address)
+            .await;
+    }
+
+    packet.send(sender, src_addr).await;
+}
+
 /// Routine to handle an incompatible version error, occuring during deserialization.
 /// The function sends an `IncompatibleVersionPacket` to the source, doing a reasonable effort to
 /// make sure the packet arrives by sending it to the default port as well.
-pub async fn received_incompatible_version_error(
-    _version: Version,
+pub async fn received_packet_with_incompatible_version(
     src_addr: SocketAddr,
     sender: ManagerToProcessor,
 ) {
