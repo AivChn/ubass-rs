@@ -209,6 +209,7 @@ pub trait Stream {
     async fn complete(self) -> Result<Self::Connection, Self::Error>;
 }
 
+// TODO: add `discard()` method
 pub trait IncomingConnection: Sized {
     type Connection: Connection;
     type Error: std::error::Error;
@@ -225,6 +226,7 @@ pub trait IncomingConnection: Sized {
     ) -> Option<core::result::Result<Self::Connection, Self::Error>>;
 }
 
+// TODO: add `discard()` method
 pub trait PendingConnection {
     type Connection: Connection;
     type Error: std::error::Error;

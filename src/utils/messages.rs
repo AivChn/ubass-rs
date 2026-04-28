@@ -83,10 +83,6 @@ pub enum ApiMessage {
         >,
         peer_address: SocketAddr,
     },
-    DataReceived {
-        session_id: SessionId,
-        data: PayloadField,
-    },
 }
 
 #[derive(Debug)]
@@ -137,6 +133,8 @@ pub enum ApiCommand {
             core::result::Result<(SessionId, Receiver<ConnectionEvent>), ConnectionError>,
         >,
     ),
+    // DiscardConnection()
+    CloseSession(SessionId),
     RequestData(OneShot<RequestDataRequest, core::result::Result<SessionId, ApiErrors>>),
     SendData(OneShot<SendDataRequest, core::result::Result<SessionId, ApiErrors>>),
     Close,

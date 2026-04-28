@@ -39,18 +39,18 @@ pub async fn init(
                 return Ok(());
             }
             Some(ApiCommand::Connect(request)) => {
-                // TODO: track in-flight handshakes to detect duplicate connect() calls
                 monitor
                     .dispatch(endpoints::connect(request, manager_to_processor.clone()))
                     .await;
             }
             Some(ApiCommand::SendData(request)) => {
-                // TODO: buffer framing — split large buffers across multiple DataPackets
                 // TODO: FEC controller — assign real batch_id, fec_info, byte_range_start
-                // TODO: route session-level errors back via inbound channel
                 monitor
                     .dispatch(endpoints::send_data(request, manager_to_processor.clone()))
                     .await;
+            }
+            Some(ApiCommand::CloseSession(session_id)) => {
+                todo!()
             }
         }
     }

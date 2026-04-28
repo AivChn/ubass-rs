@@ -66,10 +66,6 @@ async fn server(port: u16) -> Result<(), ()> {
         .map_err(|_| println!("listen"))?
     {
         ubass::api::AppEvent::IncomingConnection(incoming_connection) => incoming_connection,
-        ubass::api::AppEvent::DataReceived { .. } => {
-            eprintln!("data");
-            return Err(());
-        }
         ubass::api::AppEvent::Closed => {
             eprintln!("closed");
             return Err(());
@@ -82,14 +78,12 @@ async fn server(port: u16) -> Result<(), ()> {
             .map_err(|_| println!("incoming timeout"))?
             .map_err(|_| println!("incoming"))?;
 
-    let id = match tokio::time::timeout(Duration::from_secs(10), connection.listen())
-        .await
-        .map_err(|_| println!("listen timeout"))?
-    {
-        Ok(ConnectionEvent::TrackRequest(id)) => id,
-        _ => {
-            return Err(());
-        }
+    let Ok(ConnectionEvent::TrackRequest(id)) =
+        tokio::time::timeout(Duration::from_secs(10), connection.listen())
+            .await
+            .map_err(|_| println!("listen timeout"))?
+    else {
+        return Err(());
     };
 
     let stream = connection.send(id).await.unwrap();
