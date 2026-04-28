@@ -10,29 +10,14 @@ use crate::{
         core::types::{ApiInner, InnerAppEvent},
     },
     error::ApiErrors,
-    lock_read, lock_write,
-    manager::packets::{MAX_PAYLOAD_LENGTH, PayloadField, SessionId},
-    o_unwrap_or_return,
-    prelude::{HashMap, Timestamp},
-    r_unwrap_or_return,
-    utils::ResponseReceiver,
+    manager::packets::SessionId,
 };
 
-use std::{
-    sync::{Arc, Weak, atomic::AtomicBool},
-    thread::JoinHandle,
-};
+use std::sync::Arc;
 
-use rand::random;
-use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
+use crate::{DEFAULT_PORT, manager::AppId};
 
-use crate::{
-    DEFAULT_PORT,
-    manager::{self, AppId},
-};
-
-use crate::utils::{ApiCommand, ApiMessage, AppResponse, OneShot, SendDataRequest, SendTarget};
-use types::{ApiFromManager, ApiToManager};
+use crate::utils::SendTarget;
 
 pub struct Api {
     inner: Arc<ApiInner>,
@@ -56,13 +41,6 @@ pub async fn open(app_id: String, port: Option<u16>) -> Result<Api, ApiErrors> {
     }
 
     Api::new(port, AppId::new(app_id))
-}
-
-impl Drop for Api {
-    fn drop(&mut self) {
-        let inner = unsafe { std::ptr::read(&raw const self.inner) };
-        drop(inner);
-    }
 }
 
 impl Api {
@@ -117,26 +95,6 @@ impl Api {
         }
     }
 
-    /// # Errors
-    // TODO:
-    pub async fn send_data(
-        &self,
-        target: SendTarget,
-        buffer: impl Into<ReadableBuffer>,
-    ) -> core::result::Result<SessionId, ApiErrors> {
-        self.inner.send_data(target, buffer.into()).await
-    }
-
-    /// # Errors
-    // TODO:
-    pub async fn approve(
-        &self,
-        id: u32,
-        approved: bool,
-        reason: String,
-    ) -> core::result::Result<(), ApiErrors> {
-        self.inner.approve(id, approved, reason).await
-    }
 }
 
 const fn verify_app_id(app_id: &str) -> bool {

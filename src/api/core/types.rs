@@ -1,40 +1,28 @@
 use crate::{
     api::{
-        self, Api, SendTarget,
-        core::types,
+        self, SendTarget,
         types::{ReadableBuffer, WriteableBuffer},
     },
-    error::{ConnectionError, EmptyResult, StreamErrors},
-    lock_read, lock_write,
+    error::ConnectionError,
     manager::{
-        self, AppId,
-        packets::{
-            AppRejectErrorPacket, BytePosition, MAX_PAYLOAD_LENGTH, PayloadField, SessionId,
-        },
+        AppId, endpoints,
+        packets::{MAX_PAYLOAD_LENGTH, PayloadField, SessionId},
     },
-    o_unwrap_or_return,
-    prelude::{ApiCommand, ApiErrors, ApiMessage, AppResponse, HashMap, Timestamp},
+    prelude::{ApiCommand, ApiErrors, ApiMessage, AppResponse},
     utils::{
-        ConnectionEvent, OneShot, RequestDataRequest, ResponseReceiver, SendDataRequest,
-        StreamMessage,
+        ConnectionEvent, OneShot, PanicInDebug, RequestDataRequest, ResponseReceiver,
+        SendDataRequest, StreamMessage,
     },
 };
 use core::result::Result;
 use std::{
-    marker::PhantomData,
-    mem::{self, transmute},
     net::SocketAddr,
-    ops::Range,
-    result,
-    sync::{Weak, atomic::AtomicBool},
+    sync::{Arc, Weak, atomic::AtomicBool},
     thread::JoinHandle,
-    time::Duration,
 };
 
-use aes_gcm_siv::aead::{generic_array::typenum::Diff, rand_core::le};
-use rand::random;
 use tokio::sync::{
-    Mutex, Notify, RwLock,
+    Mutex,
     mpsc::{self, Receiver, Sender},
     oneshot, watch,
 };
@@ -52,7 +40,6 @@ pub struct ApiInner {
     manager_handle: Option<JoinHandle<Result<(), ApiErrors>>>,
     api_to_manager: ApiToManager,
     api_from_manager: Mutex<ApiFromManager>,
-    requests: AppRequestsMap,
 }
 
 impl Drop for ApiInner {
@@ -75,7 +62,7 @@ impl ApiInner {
             let (api_to_manager, manager_from_api) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
             Ok(ApiInner {
-                manager_handle: Some(manager::open(
+                manager_handle: Some(endpoints::open(
                     port,
                     app_id,
                     manager_to_api,
@@ -83,7 +70,6 @@ impl ApiInner {
                 )?),
                 api_to_manager,
                 api_from_manager: Mutex::new(api_from_manager),
-                requests: AppRequestsMap::default(),
             })
         }
     }
@@ -149,11 +135,11 @@ impl ApiInner {
         &self,
         target: SendTarget,
         buffer: ReadableBuffer,
+        sender: watch::Sender<StreamMessage>,
     ) -> Result<SessionId, ApiErrors> {
         if buffer.len() > MAX_PAYLOAD_LENGTH {
             return Err(ApiErrors::BufferTooLarge);
         }
-        let (sender, update) = watch::channel(StreamMessage::default());
         let (request, reply): (_, ResponseReceiver<Result<SessionId, ApiErrors>>) =
             OneShot::new(SendDataRequest {
                 target,
@@ -168,33 +154,17 @@ impl ApiInner {
         reply.recv().await?
     }
 
-    pub async fn approve(&self, id: u32, approved: bool, reason: String) -> Result<(), ApiErrors> {
-        if !reason.is_ascii() || reason.len() >= MAX_PAYLOAD_LENGTH {
-            return Err(ApiErrors::InvalidReason);
-        }
-        let Some(pending) = self.requests.remove(id).await else {
-            return Ok(());
-        };
-        let response = if approved {
-            AppResponse::AppApproved
-        } else {
-            AppResponse::AppRejected(reason)
-        };
-        _ = pending.reply.send(response);
-        Ok(())
-    }
-
     pub async fn request_track(
         &self,
         target: SendTarget,
         track_id: impl Into<Box<[u8]>>,
         buffer: impl Into<WriteableBuffer>,
+        sender: watch::Sender<StreamMessage>,
     ) -> Result<SessionId, ApiErrors> {
         let track_id = track_id.into();
         if track_id.len() > MAX_PAYLOAD_LENGTH {
             return Err(ApiErrors::BufferTooLarge);
         }
-        let (sender, update) = watch::channel(StreamMessage::default());
         let (request, response) =
             OneShot::<RequestDataRequest, Result<SessionId, ApiErrors>>::new(RequestDataRequest {
                 target,
@@ -234,61 +204,6 @@ pub enum InnerAppEvent {
         peer_address: SocketAddr,
     },
     Closed,
-}
-
-#[derive(Debug)]
-enum Approvable {
-    AppId,
-    TrackRequest(SessionId),
-}
-
-#[derive(Debug)]
-struct PendingApproval {
-    kind: Approvable,
-    reply: oneshot::Sender<AppResponse>,
-    timestamp: Timestamp,
-}
-
-#[derive(Debug, Default)]
-struct AppRequestsMap {
-    map: RwLock<HashMap<u32, PendingApproval>>,
-}
-
-impl AppRequestsMap {
-    const PRUNE_INTERVAL: u64 = 1_000_000;
-
-    async fn insert(&self, kind: Approvable, reply: oneshot::Sender<AppResponse>) -> u32 {
-        let key = {
-            let map = lock_read!(self.map);
-            loop {
-                let tmp = random::<u32>();
-                if !map.contains_key(&tmp) {
-                    break tmp;
-                }
-            }
-        };
-
-        lock_write!(self.map).insert(
-            key,
-            PendingApproval {
-                kind,
-                reply,
-                timestamp: Timestamp::now(),
-            },
-        );
-        key
-    }
-
-    async fn remove(&self, key: u32) -> Option<PendingApproval> {
-        lock_write!(self.map).remove(&key)
-    }
-
-    async fn prune(&self) {
-        let mut map = lock_write!(self.map);
-        _ = map
-            .extract_if(|_k, v| v.timestamp.been_longer_than(Self::PRUNE_INTERVAL))
-            .collect::<Vec<_>>();
-    }
 }
 
 type HandshakeDoneReceiver =
@@ -387,7 +302,9 @@ impl api::types::IncomingConnection for IncomingConnection {
         if reason.len() > MAX_PAYLOAD_LENGTH || !reason.is_ascii() {
             return Err(self);
         }
-        sender.send(AppResponse::AppRejected(reason));
+        _ = sender
+            .send(AppResponse::AppRejected(reason))
+            .panic_in_debug("ApiToManager channel failed sending in `reject`");
         Ok(())
     }
 
@@ -439,7 +356,7 @@ impl api::types::IncomingConnection for IncomingConnection {
             if !reason.is_ascii() || reason.len() > MAX_PAYLOAD_LENGTH {
                 Some(Err(ConnectionError::InvalidReason(self)))
             } else {
-                self.reject(reason);
+                _ = self.reject(reason).await;
                 None
             }
         }
@@ -511,7 +428,7 @@ impl api::types::Connection for Connection {
         let length = buffer.len();
         let (sender, receiver) = watch::channel(StreamMessage::default());
         match api
-            .send_data(SendTarget::Session(self.session_id), buffer)
+            .send_data(SendTarget::Session(self.session_id), buffer, sender)
             .await
         {
             Ok(_) => Ok(OutputStream::new(
@@ -530,7 +447,7 @@ impl api::types::Connection for Connection {
         identifier: impl Into<Box<[u8]>>,
         buffer: impl Into<WriteableBuffer>,
     ) -> Result<InputStream, Self::Error> {
-        let api = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
         let buffer = buffer.into();
         let length = buffer.len();
         let (sender, receiver) = watch::channel(StreamMessage::default());
@@ -539,6 +456,7 @@ impl api::types::Connection for Connection {
                 SendTarget::Session(self.session_id),
                 identifier.into(),
                 buffer,
+                sender,
             )
             .await
         {
@@ -553,9 +471,7 @@ impl api::types::Connection for Connection {
         }
     }
 
-    async fn close(self) {
-        self.close();
-    }
+    async fn close(self) {}
 }
 
 #[derive(Debug)]
@@ -598,7 +514,7 @@ impl api::types::Stream for InputStream {
         todo!()
     }
 
-    async fn seek(&mut self, position: usize) -> Result<usize, Self::Error> {
+    async fn seek(&mut self, _position: usize) -> Result<usize, Self::Error> {
         todo!()
     }
 
@@ -607,7 +523,7 @@ impl api::types::Stream for InputStream {
     }
 
     fn is_playing(&self) -> bool {
-        !self.update.borrow().is_paused
+        !self.update.borrow().paused
     }
 
     async fn is_done(&self) -> bool {
@@ -664,7 +580,7 @@ impl api::types::Stream for OutputStream {
         todo!()
     }
 
-    async fn seek(&mut self, position: usize) -> Result<usize, Self::Error> {
+    async fn seek(&mut self, _position: usize) -> Result<usize, Self::Error> {
         todo!()
     }
 
@@ -673,7 +589,7 @@ impl api::types::Stream for OutputStream {
     }
 
     fn is_playing(&self) -> bool {
-        !self.update.borrow().is_paused
+        !self.update.borrow().paused
     }
 
     async fn is_done(&self) -> bool {
