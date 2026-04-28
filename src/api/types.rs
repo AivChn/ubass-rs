@@ -120,7 +120,7 @@ impl WriteableBuffer {
         if self.position_occupied(position)?
             || (to_write.len() != MAX_PAYLOAD_LENGTH
                 && self.position_to_index(position)? != self.map.len() - 1)
-            || position.0 as usize + to_write.len() > self.buffer.len()
+            || *position as usize + to_write.len() > self.buffer.len()
         {
             return None;
         }
@@ -207,9 +207,9 @@ pub trait Stream {
     fn is_playing(&self) -> bool;
     async fn is_done(&self) -> bool;
     async fn complete(self) -> Result<Self::Connection, Self::Error>;
+    async fn close(self) -> Result<Self::Connection, Self::Error>;
 }
 
-// TODO: add `discard()` method
 pub trait IncomingConnection: Sized {
     type Connection: Connection;
     type Error: std::error::Error;
@@ -226,12 +226,12 @@ pub trait IncomingConnection: Sized {
     ) -> Option<core::result::Result<Self::Connection, Self::Error>>;
 }
 
-// TODO: add `discard()` method
 pub trait PendingConnection {
     type Connection: Connection;
     type Error: std::error::Error;
 
     async fn ready(self) -> core::result::Result<Self::Connection, Self::Error>;
+    async fn discard(self) -> core::result::Result<(), Self::Error>;
 }
 
 pub trait Connection {

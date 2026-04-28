@@ -73,7 +73,7 @@ pub async fn init(mut receiver: OutboundReceiver) -> ErrResult {
     }
 }
 
-async fn send_packets(buffer: Vec<ProcessedPacket>, socket: Arc<UdpSocket>) {
+async fn send_packets(buffer: Box<[ProcessedPacket]>, socket: Arc<UdpSocket>) {
     for packet in buffer {
         debug_assert!(
             packet.duplicate_count != 0,
@@ -86,6 +86,7 @@ async fn send_packets(buffer: Vec<ProcessedPacket>, socket: Arc<UdpSocket>) {
     }
 }
 
+#[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod test {
     use core::net;
@@ -110,7 +111,7 @@ mod test {
         PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    async fn prepare_init() -> (OutboundSender, JoinHandle<ErrResult>) {
+    fn prepare_init() -> (OutboundSender, JoinHandle<ErrResult>) {
         let (sender, receiver): (OutboundSender, _) = tokio::sync::mpsc::channel(1);
         (sender, tokio::spawn(outbound::init(receiver)))
     }
@@ -130,9 +131,9 @@ mod test {
             }
         };
 
-        let (sender, handle) = prepare_init().await;
+        let (sender, handle) = prepare_init();
         let packet = ProcessedPacket {
-            dest_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port)),
+            dest_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
             packet_type: PacketType::Data,
             data: Vec::from(message),
             duplicate_count: 1,
@@ -146,7 +147,7 @@ mod test {
 
     #[tokio::test]
     async fn graceful_close() {
-        let (sender, handle) = prepare_init().await;
+        let (sender, handle) = prepare_init();
         sender.send(TransportMessage::Close).await;
         assert!(handle.await.unwrap().is_ok());
     }
@@ -169,11 +170,11 @@ mod test {
             Ok(())
         });
 
-        let (sender, handle) = prepare_init().await;
+        let (sender, handle) = prepare_init();
         let packets: Vec<_> = messages
             .iter()
             .map(|message| ProcessedPacket {
-                dest_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port)),
+                dest_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
                 packet_type: PacketType::Data,
                 data: Vec::from(*message),
                 duplicate_count: 1,

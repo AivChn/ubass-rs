@@ -87,9 +87,9 @@ pub enum ApiMessage {
 
 #[derive(Debug)]
 pub enum ConnectionEvent {
-    DataReceived(PayloadField),
     TrackRequest(Box<[u8]>),
-    Closed(Vec<ConnectionEvent>),
+    Closed,
+    ProtocolClosed(Vec<ConnectionEvent>),
 }
 
 #[derive(Debug, Default)]
@@ -135,6 +135,7 @@ pub enum ApiCommand {
     ),
     // DiscardConnection()
     CloseSession(SessionId),
+    CloseStream(SessionId),
     RequestData(OneShot<RequestDataRequest, core::result::Result<SessionId, ApiErrors>>),
     SendData(OneShot<SendDataRequest, core::result::Result<SessionId, ApiErrors>>),
     Close,

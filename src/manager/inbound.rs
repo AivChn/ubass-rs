@@ -92,6 +92,7 @@ async fn handle_message(
             packets::Packet::UnexpectedPacketErrorPacket(_unexpected_packet_error_packet) => {
                 todo!()
             }
+            packets::Packet::CloseSessionPacket(close_session_packet) => todo!(),
         },
         ManagerMessage::Closed => unreachable!("This arm is handled in the `init` match"),
     }
