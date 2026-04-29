@@ -108,6 +108,7 @@ pub enum StreamEvent {
     Retransmit(Vec<ByteRange>),
 }
 
+#[derive(Debug)]
 pub enum SendTarget {
     Address(SocketAddr),
     Session(SessionId),
@@ -120,6 +121,7 @@ pub struct RequestDataRequest {
     pub sender: watch::Sender<StreamMessage>,
 }
 
+#[derive(Debug)]
 pub struct SendDataRequest {
     pub target: SendTarget,
     pub buffer: ReadableBuffer,
