@@ -87,20 +87,9 @@ async fn handle_packet(
     let packet_type =
         r_unwrap_or_return!(PacketType::deserialize(&packet.data[PACKET_TYPE_OFFSET..]));
 
-    let session_id = r_unwrap_or_return!(SessionId::deserialize(&packet.data[SESSION_ID_OFFSET..]));
-    if !manager::session_exists(session_id).await {
-        send_up(
-            Err(PacketProcessingError::SessionDoesNotExist(session_id, packet.src_addr).into()),
-            sender,
-        )
-        .await;
-        return;
-    }
-
     let ready_packet = r_unwrap_or_return!(
         deserialize_and_decrypt(
             packet_type,
-            session_id,
             packet.data,
             encryption_monitor,
             fingerprint_monitor
@@ -117,11 +106,12 @@ async fn handle_packet(
 
 async fn deserialize_and_decrypt(
     packet_type: PacketType,
-    session_id: SessionId,
     data: Vec<u8>,
     encryption_monitor: EncryptionMonitor,
     fingerprint_monitor: FingerprintMonitor,
 ) -> core::result::Result<Packet, ()> {
+    let session_id = SessionId::deserialize(&data[SESSION_ID_OFFSET..])?;
+
     match packet_type {
         // Single types
         PacketType::Data => {
@@ -188,6 +178,10 @@ async fn deserialize_and_auth_control_packet(
                 // be authenticated or deduplicated here. Authentication is handled at the
                 // app level via the approval mechanism.
                 Packet::HelloPacket(Box::new(HelloPacket::deserialize(&data)?))
+            }
+
+            ControlType::Host(HostControlType::HandshakeReject) => {
+                Packet::HandshakeRejection(Box::new(HandshakeRejection::deserialize(&data)?))
             }
 
             //session

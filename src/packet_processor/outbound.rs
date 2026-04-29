@@ -1,5 +1,5 @@
 #![allow(clippy::pedantic)]
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, ptr::dangling, sync::Arc};
 
 use tokio::sync::oneshot;
 
@@ -204,6 +204,17 @@ async fn handle_packet(
                 packet_type: PacketType::Host,
                 data: serialized,
                 duplicate_count: 7,
+            }
+        }
+        Packet::HandshakeRejection(packet) => {
+            let mut serialized;
+            serialize!(packet -> serialized);
+
+            ProcessedPacket {
+                dest_addr: addr,
+                packet_type: PacketType::Host,
+                data: serialized,
+                duplicate_count: 3,
             }
         }
         Packet::HandshakeAckPacket(packet) => {

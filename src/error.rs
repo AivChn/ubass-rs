@@ -55,6 +55,10 @@ pub enum ConnectionError {
     UnknownInternalError,
     #[error("Reason is too long or not valid ASCII")]
     InvalidReason(IncomingConnection),
+    #[error("peer rejected the handhsake: {}", .0.as_ref().unwrap_or(&"FAILED TO PARSE".to_string()))]
+    PeerRejected(Option<String>),
+    #[error("Congrats! the universe is gone and you got 2 u64 collisions (1 in 2^65 chance)")]
+    SessionIdCollided,
 }
 
 impl ConnectionError {

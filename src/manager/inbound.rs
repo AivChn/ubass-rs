@@ -93,6 +93,7 @@ async fn handle_message(
                 todo!()
             }
             packets::Packet::CloseSessionPacket(close_session_packet) => todo!(),
+            packets::Packet::HandshakeRejection(handshake_rejection) => todo!(),
         },
         ManagerMessage::Closed => unreachable!("This arm is handled in the `init` match"),
     }

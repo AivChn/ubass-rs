@@ -73,6 +73,34 @@ pub async fn update_last_activity(session_id: SessionId, ts: Timestamp) {
     }
 }
 
+pub async fn received_handshake_rejected_packet(packet: Box<HandshakeRejection>) {
+    match packet.reason {
+        HandshakeRejectionReason::App => {
+            if let Some(handshake) =
+                lock_write!(get_state!().handshakes).remove(&packet.handshake_id)
+            {
+                let reason = if packet.payload.len() == 1 && packet.payload[0] == 0 {
+                    None
+                } else {
+                    String::from_utf8(packet.payload.take()).ok()
+                };
+                handshake
+                    .response
+                    .send(Err(ConnectionError::PeerRejected(reason)));
+            }
+        }
+        HandshakeRejectionReason::IdCollision => {
+            if let Some(ConnectionStates::Handshake {
+                ack_triggered_response,
+                ..
+            }) = lock_write!(get_state!().connections).remove(&packet.session_id)
+            {
+                ack_triggered_response.send(Err(ConnectionError::SessionIdCollided));
+            }
+        }
+    }
+}
+
 pub async fn received_ack_packet(packet: Box<AckPacket>) {
     update_last_activity(packet.session_id, packet.timestamp).await;
     get_state!().ack.acknowledge(packet.fingerprint).await;
@@ -183,14 +211,13 @@ pub async fn received_hello_packet_as_receiver(
     match r_unwrap_or_return!(app_id_response.recv().await) {
         // send back app rejected error
         AppResponse::AppRejected(message) => {
-            AppRejectErrorPacket::new(
+            Box::new(HandshakeRejection::new(
                 Options::none(),
                 packet.proposed_session_id,
-                PacketType::Host,
-                ControlType::Host(HostControlType::Hello),
-                PacketFingerprint::from(&packet),
-                message,
-            )
+                HandshakeRejectionReason::App,
+                packet.handshake_id,
+                PayloadField::from(message),
+            ))
             .send(outbound_sender, src_addr)
             .await;
         }
@@ -261,37 +288,11 @@ pub async fn received_hello_packet_as_initializer(
     src_addr: SocketAddr,
     outbound_sender: ManagerToProcessor,
 ) {
-    // if the session ID is already used that means that there was overlap on both hosts on both
-    // attempts. This astronomically unlikely but is possible, so it's accounted for by restarting.
     if get_state!()
         .session_exists(packet.proposed_session_id)
         .await
     {
-        let (ephemeral_secret, public_key) = key_exchange::create();
-        let handshake_id = o_unwrap_or_return!(
-            get_state!()
-                .reuse_handshake(
-                    packet.proposed_session_id,
-                    packet.handshake_id,
-                    ephemeral_secret,
-                )
-                .await
-                .panic_in_debug(
-                    "Invariant broken in the `received_hello_packet_as_initializer` routine: \
-                the handshake did not exist"
-                )
-        );
-
-        Box::new(HelloPacket::new(
-            Options::none(),
-            SessionId::generate(),
-            handshake_id,
-            public_key,
-            get_state!().app_id(),
-            get_state!().port(),
-        ))
-        .send(outbound_sender, src_addr)
-        .await;
+        session_id_collided(packet, src_addr, outbound_sender).await;
         return;
     }
 
@@ -320,6 +321,48 @@ pub async fn received_hello_packet_as_initializer(
     Box::new(HandshakeAckPacket::new(
         packet.proposed_session_id,
         packet.handshake_id,
+    ))
+    .send(outbound_sender, src_addr)
+    .await;
+}
+
+async fn session_id_collided(
+    packet: HelloPacket,
+    src_addr: SocketAddr,
+    outbound_sender: ManagerToProcessor,
+) {
+    Box::new(HandshakeRejection::new(
+        Options::none(),
+        packet.proposed_session_id,
+        HandshakeRejectionReason::IdCollision,
+        packet.handshake_id,
+        PayloadField::empty(),
+    ))
+    .send(outbound_sender.clone(), src_addr)
+    .await;
+
+    let (ephemeral_secret, public_key) = key_exchange::create();
+    let handshake_id = o_unwrap_or_return!(
+        get_state!()
+            .reuse_handshake(
+                packet.proposed_session_id,
+                packet.handshake_id,
+                ephemeral_secret,
+            )
+            .await
+            .panic_in_debug(
+                "Invariant broken in the `session_id_collided` routine: \
+                the handshake did not exist"
+            )
+    );
+
+    Box::new(HelloPacket::new(
+        Options::none(),
+        SessionId::generate(),
+        handshake_id,
+        public_key,
+        get_state!().app_id(),
+        get_state!().port(),
     ))
     .send(outbound_sender, src_addr)
     .await;

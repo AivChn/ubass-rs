@@ -43,6 +43,7 @@ pub enum Packet {
     UnexpectedPacketErrorPacket(Box<UnexpectedPacketErrorPacket>),
     AppRejectErrorPacket(Box<AppRejectErrorPacket>),
     CloseSessionPacket(Box<CloseSessionPacket>),
+    HandshakeRejection(Box<HandshakeRejection>),
 }
 
 impl Packet {
@@ -66,6 +67,7 @@ impl Packet {
             Packet::UnexpectedPacketErrorPacket(packet) => Some(packet.session_id),
             Packet::AppRejectErrorPacket(packet) => Some(packet.session_id),
             Packet::CloseSessionPacket(packet) => Some(packet.session_id),
+            Packet::HandshakeRejection(packet) => Some(packet.session_id),
             Packet::IncompatibleVersionPacket(_) | Packet::HandshakeAckPacket(_) => {
                 debug_assert!(
                     false,
@@ -111,6 +113,7 @@ impl SendPacket for Packet {
             Packet::AppRejectErrorPacket(packet) => packet.send(sender, address),
             Packet::HandshakeAckPacket(packet) => packet.send(sender, address),
             Packet::CloseSessionPacket(packet) => packet.send(sender, address),
+            Packet::HandshakeRejection(packet) => packet.send(sender, address),
         }
     }
 }
@@ -133,7 +136,8 @@ impl TryFrom<&Packet> for PacketFingerprint {
             _x @ (Packet::AckPacket(_)
             | Packet::IncompatibleVersionPacket(_)
             | Packet::SessionDoesNotExistErrorPacket(_)
-            | Packet::HandshakeAckPacket(_)) => {
+            | Packet::HandshakeAckPacket(_)
+            | Packet::HandshakeRejection(_)) => {
                 return Err(());
             }
         })
@@ -667,6 +671,59 @@ impl CloseSessionPacket {
     }
 }
 
+#[derive(Debug, Serialize, Clone, Copy)]
+#[repr(u8)]
+pub enum HandshakeRejectionReason {
+    App = 1,
+    IdCollision = 2,
+}
+
+#[derive(Debug, SendPacket, Clone, Serialize)]
+pub struct HandshakeRejection {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    pub control_type: ControlType,
+    pub reserved: Reserved<2>,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+    pub handshake_id: HandshakeId,
+    pub reason: HandshakeRejectionReason,
+    pub payload: PayloadField,
+}
+
+impl HandshakeRejection {
+    #[must_use]
+    pub fn new(
+        opts: Options,
+        session_id: SessionId,
+        reason: HandshakeRejectionReason,
+        handshake_id: HandshakeId,
+        payload: impl Into<PayloadField>,
+    ) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let opts = opts.unset(OptionFlags::RequireAck);
+        let packet_type = PacketType::Host;
+        let control_type = ControlType::Host(HostControlType::HandshakeReject);
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+        let payload = payload.into();
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            control_type,
+            reserved,
+            session_id,
+            timestamp,
+            handshake_id,
+            reason,
+            payload,
+        }
+    }
+}
+
 #[derive(Debug, SendPacket, Clone, Serialize)]
 pub struct SessionDoesNotExistErrorPacket {
     pub version: Version,
@@ -945,6 +1002,11 @@ impl PayloadField {
     }
 
     #[must_use]
+    pub fn empty() -> Self {
+        Self(vec![0])
+    }
+
+    #[must_use]
     pub fn take(self) -> Vec<u8> {
         self.0
     }
@@ -1185,6 +1247,7 @@ impl Serialize for ControlType {
 #[variants_array]
 pub enum HostControlType {
     Hello = 201,
+    HandshakeReject = 202,
 }
 
 impl From<HostControlType> for ControlType {
