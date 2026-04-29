@@ -22,6 +22,7 @@ use std::{
     thread::JoinHandle,
 };
 
+use aes_gcm_siv::Error;
 use tokio::{
     runtime::Runtime,
     sync::{
@@ -263,9 +264,25 @@ impl api::types::PendingConnection for PendingConnection {
         ))
     }
 
-    // TODO: this needs to inform the handshake state that its stale in some way.
+    // HACK: This is a temporary solution. idealy, the pending connection could tell the protocol to
+    // mark it as stale
     async fn discard(self) -> Result<(), Self::Error> {
-        todo!()
+        if self.api.strong_count() == 0 {
+            return Err(ConnectionError::ProtocolClosed);
+        }
+        tokio::spawn(async move {
+            let Ok(Ok((session_id, _))) = self.reply.recv().await else {
+                return;
+            };
+
+            let Some(api) = self.api.upgrade() else {
+                return;
+            };
+
+            api.close_session(session_id);
+        });
+
+        Ok(())
     }
 }
 
