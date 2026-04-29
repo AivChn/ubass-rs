@@ -42,8 +42,7 @@ pub async fn init(mut receiver: OutboundReceiver) -> ErrResult {
                 Ok(Some(TransportMessage::Close)) => {
                     if !buffer.is_empty() {
                         monitor
-                            .dispatch(send_packets(buffer.drain(..).collect(), sockets.retrieve()))
-                            .await;
+                            .dispatch(send_packets(buffer.drain(..).collect(), sockets.retrieve()));
                     }
                     monitor.flush().await;
                     return Ok(());
@@ -67,9 +66,7 @@ pub async fn init(mut receiver: OutboundReceiver) -> ErrResult {
         }
 
         #[allow(clippy::drain_collect)]
-        monitor
-            .dispatch(send_packets(buffer.drain(..).collect(), sockets.retrieve()))
-            .await;
+        monitor.dispatch(send_packets(buffer.drain(..).collect(), sockets.retrieve()));
     }
 }
 

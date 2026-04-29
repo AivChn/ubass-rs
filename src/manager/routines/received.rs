@@ -109,8 +109,8 @@ pub async fn received_ack_packet(packet: Box<AckPacket>) {
 pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerToProcessor) {
     get_state!()
         .global_handle_monitor
-        .dispatch(update_last_activity(packet.session_id, packet.timestamp))
-        .await;
+        .dispatch(update_last_activity(packet.session_id, packet.timestamp));
+
     if let ConnectionStates::Handshake { signal, .. } = o_unwrap_or_return!(
         lock_read!(get_state!().connections)
             .get(&packet.session_id)

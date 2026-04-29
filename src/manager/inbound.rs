@@ -24,23 +24,17 @@ pub async fn init(
             None => {
                 return Err(ChannelError::ChannelClosed(Inbound).into());
             }
-            Some(Err(error)) => {
-                monitor
-                    .dispatch(handle_errors(error, outbound_sender.clone()))
-                    .await;
-            }
+            Some(Err(error)) => monitor.dispatch(handle_errors(error, outbound_sender.clone())),
             Some(Ok(ManagerMessage::Closed)) => {
                 monitor.flush().await;
                 return Ok(());
             }
             Some(Ok(message)) => {
-                monitor
-                    .dispatch(handle_message(
-                        message,
-                        outbound_sender.clone(),
-                        app_sender.clone(),
-                    ))
-                    .await;
+                monitor.dispatch(handle_message(
+                    message,
+                    outbound_sender.clone(),
+                    app_sender.clone(),
+                ));
             }
         }
     }

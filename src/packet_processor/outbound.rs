@@ -51,7 +51,6 @@ macro_rules! add_ack {
                 },
                 $pending_ack_monitor,
             )
-            .await
         }
     };
 }
@@ -79,9 +78,7 @@ pub async fn init(
                 data: (session_id, batch_id),
                 response,
             }) => {
-                monitor
-                    .dispatch(recover(session_id, batch_id, response))
-                    .await;
+                monitor.dispatch(recover(session_id, batch_id, response));
                 continue;
             }
             PacketProcessingMessage::Close => {
@@ -99,16 +96,14 @@ pub async fn init(
             ),
         };
 
-        monitor
-            .dispatch(handle_packet(
-                packet,
-                p_sender.clone(),
-                t_sender.clone(),
-                encryption_monitor,
-                monitor.clone(),
-                pending_ack_monitor,
-            ))
-            .await;
+        monitor.dispatch(handle_packet(
+            packet,
+            p_sender.clone(),
+            t_sender.clone(),
+            encryption_monitor,
+            monitor.clone(),
+            pending_ack_monitor,
+        ));
     }
 }
 
@@ -128,16 +123,14 @@ async fn handle_packet(
         Packet::DataPacket(packet) => {
             add_ack!(for DataPacket(packet), sent to addr, saved to pending_ack_monitor);
 
-            handle_monitor
-                .dispatch(handle_fec(
-                    *packet.clone(),
-                    addr,
-                    p_sender.clone(),
-                    t_sender.clone(),
-                    encryption_monitor,
-                    handle_monitor.clone(),
-                ))
-                .await;
+            handle_monitor.dispatch(handle_fec(
+                *packet.clone(),
+                addr,
+                p_sender.clone(),
+                t_sender.clone(),
+                encryption_monitor,
+                handle_monitor.clone(),
+            ));
 
             let session_id = packet.session_id;
             process_encrypted(packet, session_id, addr, encryption_monitor).await
@@ -291,8 +284,8 @@ async fn recover(
     _ = sender.send(message);
 }
 
-async fn add_pending_ack(packet: PacketWrapper, pending_ack_monitor: PendingAckMonitor) {
-    pending_ack_monitor.add(packet.packet).await;
+fn add_pending_ack(packet: PacketWrapper, pending_ack_monitor: PendingAckMonitor) {
+    pending_ack_monitor.add(packet.packet);
 }
 
 async fn handle_fec(
@@ -305,15 +298,13 @@ async fn handle_fec(
 ) {
     if let Some(parity_packets) = fec::sent(packet).await {
         for packet in parity_packets {
-            handle_monitor
-                .dispatch(handle_parity(
-                    packet,
-                    dest_addr,
-                    t_sender.clone(),
-                    p_sender.clone(),
-                    encryption_monitor,
-                ))
-                .await;
+            handle_monitor.dispatch(handle_parity(
+                packet,
+                dest_addr,
+                t_sender.clone(),
+                p_sender.clone(),
+                encryption_monitor,
+            ));
         }
     }
 }

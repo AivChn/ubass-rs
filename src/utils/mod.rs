@@ -215,11 +215,12 @@ impl HandleMonitor {
     }
 
     #[inline]
-    pub async fn dispatch<F>(&self, future: F)
+    pub fn dispatch<F>(self: &Arc<Self>, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.handles.lock().await.push(tokio::spawn(future));
+        let copy = self.clone();
+        tokio::spawn(async move { copy.handles.lock().await.push(tokio::spawn(future)) });
     }
 
     pub async fn prune(self: Arc<Self>) {

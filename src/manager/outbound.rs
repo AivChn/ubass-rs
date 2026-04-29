@@ -24,12 +24,10 @@ pub async fn init(
                 return Err(ChannelError::ChannelClosed(Outbound).into());
             }
             Some(ApiCommand::RequestData(one_shot)) => {
-                monitor
-                    .dispatch(endpoints::request_track(
-                        one_shot,
-                        manager_to_processor.clone(),
-                    ))
-                    .await;
+                monitor.dispatch(endpoints::request_track(
+                    one_shot,
+                    manager_to_processor.clone(),
+                ));
             }
             Some(ApiCommand::Close) => {
                 monitor.flush().await;
@@ -39,31 +37,23 @@ pub async fn init(
                 return Ok(());
             }
             Some(ApiCommand::Connect(request)) => {
-                monitor
-                    .dispatch(endpoints::connect(request, manager_to_processor.clone()))
-                    .await;
+                monitor.dispatch(endpoints::connect(request, manager_to_processor.clone()));
             }
             Some(ApiCommand::SendData(request)) => {
                 // TODO: FEC controller — assign real batch_id, fec_info, byte_range_start
-                monitor
-                    .dispatch(endpoints::send_data(request, manager_to_processor.clone()))
-                    .await;
+                monitor.dispatch(endpoints::send_data(request, manager_to_processor.clone()));
             }
             Some(ApiCommand::CloseSession(session_id)) => {
-                monitor
-                    .dispatch(endpoints::close_session(
-                        session_id,
-                        manager_to_processor.clone(),
-                    ))
-                    .await;
+                monitor.dispatch(endpoints::close_session(
+                    session_id,
+                    manager_to_processor.clone(),
+                ));
             }
             Some(ApiCommand::CloseStream(session_id)) => {
-                monitor
-                    .dispatch(endpoints::close_stream(
-                        session_id,
-                        manager_to_processor.clone(),
-                    ))
-                    .await;
+                monitor.dispatch(endpoints::close_stream(
+                    session_id,
+                    manager_to_processor.clone(),
+                ));
             }
         }
     }

@@ -672,7 +672,7 @@ impl ProtocolState {
                                         session_id,
                                         outbound_sender.clone(),
                                         byte_ranges,
-                                    )).await;
+                                    ));
                             }
                             StreamEvent::Retransmit(_) => {}
                         }
@@ -685,7 +685,7 @@ impl ProtocolState {
                                 session_id,
                                 outbound_sender.clone(),
                                 PACKET_COUNT_PER_BATCH,
-                            )).await;
+                            ));
                     }
                 }
             }
@@ -773,7 +773,7 @@ async fn retransmit_action(
     }) = session
         && let Some(chunks) = stream.retransmit(ranges)
     {
-        send_data_packets(chunks, &outbound_sender, session_id, *lock_read!(address)).await;
+        send_data_packets(chunks, &outbound_sender, session_id, *lock_read!(address));
     }
 }
 
@@ -811,7 +811,7 @@ async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToPro
     };
 
     if let Some((chunks, addr, close_event)) = action {
-        send_data_packets(chunks, &outbound_sender, session_id, addr).await;
+        send_data_packets(chunks, &outbound_sender, session_id, addr);
         if let Some(event) = close_event {
             event.update(StreamEvent::Close).await;
         }
@@ -833,7 +833,7 @@ async fn close_outgoing_stream_action(session_id: SessionId) {
     }
 }
 
-async fn send_data_packets(
+fn send_data_packets(
     chunks: Vec<(BytePosition, Box<[u8]>)>,
     outbound_sender: &ManagerToProcessor,
     session_id: SessionId,
@@ -850,8 +850,7 @@ async fn send_data_packets(
         );
         get_state!()
             .global_handle_monitor
-            .dispatch(packet.send(outbound_sender.clone(), address))
-            .await;
+            .dispatch(packet.send(outbound_sender.clone(), address));
     }
 }
 
@@ -1297,8 +1296,8 @@ impl PendingAckMonitor {
         Self { table }
     }
 
-    pub async fn add(&self, packet: Packet) {
-        self.table.add(packet).await;
+    pub fn add(&self, packet: Packet) {
+        self.table.add(packet);
     }
 }
 
@@ -1410,18 +1409,18 @@ impl PendingAckWindow {
         }
     }
 
-    pub async fn init(self: Arc<Self>) {
+    pub fn init(self: Arc<Self>) {
         get_state!()
             .global_handle_monitor
-            .dispatch(self.prune())
-            .await;
+            .clone()
+            .dispatch(self.prune());
     }
 
-    pub async fn add(&'static self, packet: Packet) {
+    pub fn add(&'static self, packet: Packet) {
         get_state!()
             .global_handle_monitor
-            .dispatch(self.inner_add(packet))
-            .await;
+            .clone()
+            .dispatch(self.inner_add(packet));
     }
 
     pub async fn acknowledge(&self, fingerprint: impl Into<PacketFingerprint>) {
@@ -1534,11 +1533,8 @@ impl FingerprintWindow {
     const PRUNE_INTERVAL: u64 = PACKET_DISCARD_TIME_MS;
     const BUFFERING_TIME: u64 = 2 * 1000;
 
-    pub async fn init(self: Arc<Self>) {
-        get_state!()
-            .global_handle_monitor
-            .dispatch(self.prune())
-            .await;
+    pub fn init(self: Arc<Self>) {
+        get_state!().global_handle_monitor.dispatch(self.prune());
     }
 
     #[must_use]
