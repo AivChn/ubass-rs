@@ -1,5 +1,11 @@
 #![allow(clippy::unwrap_used)]
-use std::time::{Duration, Instant};
+use std::{
+    net::{Ipv4Addr, SocketAddrV4},
+    thread,
+    time::{Duration, Instant},
+};
+
+use ubass::api::{AppEvent, IncomingConnectionTrait, PendingConnectionTrait};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 //comment
@@ -28,6 +34,46 @@ fn wait_timeout(
             None => std::thread::sleep(Duration::from_millis(50)),
         }
     }
+}
+
+#[tokio::test]
+async fn connection_refused() {
+    let server_port = free_port();
+    let client_port = free_port();
+
+    let server = thread::spawn(move || {
+        tokio::spawn(async move {
+            let api = ubass::open("server_connection_refused", Some(server_port))
+                .await
+                .unwrap();
+
+            eprintln!("listening on {server_port}");
+            let AppEvent::IncomingConnection(incoming) = api.listen().await.unwrap() else {
+                panic!("expected IncomingConnection");
+            };
+
+            assert!(incoming.reject("420").await.is_ok());
+        });
+    });
+
+    std::thread::sleep(Duration::from_millis(200));
+
+    let client = thread::spawn(move || {
+        tokio::spawn(async move {
+            let api = ubass::open("client_connection_refused", Some(client_port))
+                .await
+                .unwrap();
+
+            let pending = api
+                .connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port).into())
+                .await
+                .unwrap();
+
+            assert!(pending.ready().await.is_err());
+        })
+    });
+    server.join().unwrap();
+    client.join().unwrap();
 }
 
 #[test]
