@@ -1036,7 +1036,7 @@ impl HandshakeId {
         let lock = lock_read!(get_state!().handshakes);
         loop {
             let r = Self(rand::random::<u32>());
-            if !lock.contains_key(&r) {
+            if !lock.contains_key(&r) && r.0 != 0 {
                 return r;
             }
         }
@@ -1044,10 +1044,10 @@ impl HandshakeId {
 }
 
 pub struct HandshakeState {
-    peer_address: SocketAddr,
-    ephemeral_secret: EphemeralSecret,
-    session_id: SessionId,
-    response: oneshot::Sender<
+    pub peer_address: SocketAddr,
+    pub ephemeral_secret: EphemeralSecret,
+    pub session_id: SessionId,
+    pub response: oneshot::Sender<
         core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
     >,
 }
