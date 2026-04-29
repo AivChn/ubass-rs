@@ -8,6 +8,9 @@ use std::{
 };
 
 use tokio::{runtime::Builder as RuntimeBuilder, sync::mpsc::Receiver};
+#[cfg(debug_assertions)]
+use tracing::info;
+use tracing::{instrument, warn};
 
 use crate::{
     api::WriteableBuffer,
@@ -39,12 +42,15 @@ const CLOSE_SESSION_DELAY: Duration = Duration::from_millis(25);
 /// # Panics
 /// This function might panic if the oneshot channel used for the protocol to communicate an error
 /// closed before sending.
+#[instrument]
 pub fn open(
     port: u16,
     app_id: AppId,
     manager_to_api: ManagerToApi,
     manager_from_api: ManagerFromApi,
 ) -> core::result::Result<JoinHandle<core::result::Result<(), ApiErrors>>, ApiErrors> {
+    info!("protocol opened -- port {}, id {}", port, app_id);
+
     let (mos, mor): (SyncSender<core::result::Result<(), ApiErrors>>, _) = sync_channel(1);
 
     // ==================== manager =======================
@@ -81,6 +87,7 @@ pub fn open(
 /// Root Routine for the [`API::connect`] endpoint.
 /// This function creates a handshake entry and sends a [`HelloPacket`] to the given address,
 /// assuming that is the receiving port for the host.
+#[instrument]
 pub async fn connect(
     OneShot {
         data: address,
@@ -91,6 +98,8 @@ pub async fn connect(
     >,
     outbound_sender: ManagerToProcessor,
 ) {
+    info!("connection requested with {:?}", address);
+
     let session_id = SessionId::generate();
     let (ephemeral_secret, public_key) = key_exchange::create();
     let handshake_id = HandshakeId::generate().await;
@@ -134,6 +143,8 @@ pub async fn send_data(
     }: OneShot<SendDataRequest, core::result::Result<SessionId, ApiErrors>>,
     outbound_sender: ManagerToProcessor,
 ) {
+    info!("trying to send data to {:?}", target);
+
     let session_id = match resolve_target(target).await {
         Ok((session_id, _)) => session_id,
         Err(e) => {
@@ -188,6 +199,7 @@ pub fn listen() {
     todo!()
 }
 
+#[instrument]
 pub async fn request_track(
     OneShot {
         data:
@@ -201,9 +213,11 @@ pub async fn request_track(
     }: OneShot<RequestDataRequest, Result<SessionId, ApiErrors>>,
     outbound_sender: ManagerToProcessor,
 ) {
+    info!("requesting track from {:?}, id: \"{:?}\"", target, id);
+
     debug_assert!(
         id.len() <= MAX_PAYLOAD_LENGTH,
-        "Invariant broken in `send_data`: buffer exceeds `MAX_PAYLOAD_LENGTH` ({} > {})",
+        "Invariant broken in `request_track`: id exceeds `MAX_PAYLOAD_LENGTH` ({} > {})",
         id.len(),
         MAX_PAYLOAD_LENGTH
     );
@@ -211,6 +225,7 @@ pub async fn request_track(
     let (session_id, addr) = match resolve_target(target).await {
         Ok(pair) => pair,
         Err(e) => {
+            warn!("failed to resolve target: {}", e);
             _ = response.send(Err(e));
             return;
         }
@@ -235,7 +250,10 @@ pub fn request_metadata() {
     todo!()
 }
 
+#[instrument]
 pub async fn close_session(session_id: SessionId, sender: ManagerToProcessor) {
+    info!("closing session {}", session_id);
+
     // a delay is added as a best effort to add a small buffer for other packets to be received by the other hoest,
     // since ordering isnt guaranteed and receiving this packet will cause the other host to
     // immediately stop accepting from this session
@@ -251,7 +269,10 @@ pub async fn close_session(session_id: SessionId, sender: ManagerToProcessor) {
     get_state!().close_session(session_id).await;
 }
 
+#[instrument]
 pub async fn close_stream(session_id: SessionId, sender: ManagerToProcessor) {
+    info!("closing stream for session {}", session_id);
+
     get_state!().close_stream(session_id, sender.clone()).await;
 
     let address = o_unwrap_or_return!(get_state!().connections.address(session_id).await);

@@ -40,6 +40,7 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 rand = "0.10.0"
 rustc-hash = "2.1.2"
 socket2 = "0.6.3"
+tracing = "0.1.44"
 
 [build-dependencies]
 uniffi = { version = "0.31.0", features = ["build"] }
