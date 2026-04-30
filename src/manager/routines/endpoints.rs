@@ -10,7 +10,7 @@ use std::{
 use tokio::{runtime::Builder as RuntimeBuilder, sync::mpsc::Receiver};
 #[cfg(debug_assertions)]
 use tracing::info;
-use tracing::{instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::{
     api::WriteableBuffer,
@@ -27,8 +27,8 @@ use crate::{
     },
     o_unwrap_or_return,
     utils::{
-        ConnectionEvent, Flags, OneShot, PanicInDebug, RequestDataRequest, SendDataRequest,
-        SendPacket, SendTarget, StreamEvent,
+        ConnectionEvent, Flags, LogFail, OneShot, PanicInDebug, RequestDataRequest,
+        SendDataRequest, SendPacket, SendTarget, StreamEvent,
     },
 };
 
@@ -60,12 +60,14 @@ pub fn open(
             .enable_all()
             .thread_name(thread_name)
             .build()
-            .map_err(ApiErrors::FailedToBuildRuntime);
+            .map_err(ApiErrors::FailedToBuildRuntime)
+            .log_error("Failed to build runtime!");
 
         match runtime {
             Err(e) => {
                 _ = mos.send(Err(e));
                 Err(ApiErrors::ThreadFailed(thread_name))
+                    .log_error(&format!("failed to build thread {thread_name}"))
             }
             Ok(runtime) => {
                 _ = mos.send(Ok(()));
@@ -131,6 +133,7 @@ pub async fn connect(
 /// Resolves the target to a session, validates it is free, and sends a single [`DataPacket`].
 /// Replies to the caller via the embedded oneshot with `Ok(())` on success or an [`ApiErrors`]
 /// variant on failure.
+#[instrument]
 pub async fn send_data(
     OneShot {
         data:
@@ -145,7 +148,7 @@ pub async fn send_data(
 ) {
     info!("trying to send data to {:?}", target);
 
-    let session_id = match resolve_target(target).await {
+    let session_id = match resolve_target(&target).await {
         Ok((session_id, _)) => session_id,
         Err(e) => {
             _ = reply.send(Err(e));
@@ -160,35 +163,35 @@ pub async fn send_data(
 }
 
 async fn resolve_target(
-    target: SendTarget,
+    target: &SendTarget,
 ) -> core::result::Result<(SessionId, SocketAddr), ApiErrors> {
+    info!("trying to resolve target {target:?}");
     match target {
         SendTarget::Session(session_id) => {
             let lock = lock_read!(get_state!().connections);
-            let connection = lock
-                .get(&session_id)
-                .ok_or(ApiErrors::SessionDoesNotExist)?;
+            let connection = lock.get(session_id).ok_or(ApiErrors::SessionDoesNotExist)?;
 
-            let address = match connection {
-                ConnectionStates::Established(box EstablishedState {
-                    address,
-                    state: SessionStates::Up | SessionStates::Down,
-                    ..
-                }) => *lock_read!(address),
-                _ => return Err(ApiErrors::SessionOccupied),
-            };
-            Ok((session_id, address))
-        }
-        SendTarget::Address(addr) => {
-            let session_id = get_state!()
-                .address_session
-                .free_session(addr)
-                .await
-                .ok_or(ApiErrors::NoFreeSession)?;
+            if let ConnectionStates::Established(box EstablishedState {
+                address,
+                state: SessionStates::Up | SessionStates::Down,
+                ..
+            }) = connection
+            {
+                let address = *lock_read!(address);
 
-            Ok((session_id, addr))
+                Ok((*session_id, address))
+            } else {
+                Err(ApiErrors::SessionOccupied)
+            }
         }
+        SendTarget::Address(address) => get_state!()
+            .address_session
+            .free_session(*address)
+            .await
+            .ok_or(ApiErrors::NoFreeSession)
+            .map(|s| (s, *address)),
     }
+    .log_warn(&format!("could not resolve target {:?}", &target))
 }
 
 pub fn close() {
@@ -219,13 +222,12 @@ pub async fn request_track(
         id.len() <= MAX_PAYLOAD_LENGTH,
         "Invariant broken in `request_track`: id exceeds `MAX_PAYLOAD_LENGTH` ({} > {})",
         id.len(),
-        MAX_PAYLOAD_LENGTH
+        MAX_PAYLOAD_LENGTH,
     );
 
-    let (session_id, addr) = match resolve_target(target).await {
+    let (session_id, addr) = match resolve_target(&target).await {
         Ok(pair) => pair,
         Err(e) => {
-            warn!("failed to resolve target: {}", e);
             _ = response.send(Err(e));
             return;
         }
@@ -240,6 +242,7 @@ pub async fn request_track(
             ))
     )
     .streaming_from(buffer, sender);
+    debug!("session {} switched to `StreamingFrom` state", session_id);
 
     TrackRequestPacket::request_track(Options::none(), session_id, id.into())
         .send(outbound_sender, addr)
@@ -267,6 +270,7 @@ pub async fn close_session(session_id: SessionId, sender: ManagerToProcessor) {
         .await;
 
     get_state!().close_session(session_id).await;
+    debug!("session {} closed.", session_id);
 }
 
 #[instrument]

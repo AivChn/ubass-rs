@@ -1,6 +1,6 @@
 use std::{
     any::Any,
-    fmt::Debug,
+    fmt::{Debug, format},
     net::SocketAddr,
     ops::Deref,
     sync::{Arc, atomic::AtomicBool},
@@ -17,6 +17,7 @@ use tokio::{
 pub mod messages;
 
 pub use messages::*;
+use tracing::{error, info, warn};
 
 #[macro_export]
 macro_rules! debug_match_or_return {
@@ -168,6 +169,75 @@ impl<T> PanicInDebug for Option<T> {
     #[inline]
     fn panic_in_debug(self, msg: &str) -> Self {
         debug_assert!(self.is_some(), "{msg}");
+
+        self
+    }
+}
+
+pub trait LogFail {
+    #[must_use]
+    fn log_warn(self, msg: &str) -> Self;
+
+    #[must_use]
+    fn log_error(self, msg: &str) -> Self;
+
+    #[must_use]
+    fn log_info(self, msg: &str) -> Self;
+}
+
+impl<T> LogFail for Option<T> {
+    #[inline]
+    fn log_warn(self, msg: &str) -> Self {
+        if self.is_none() {
+            warn!("{}", msg);
+        }
+
+        self
+    }
+
+    #[inline]
+    fn log_error(self, msg: &str) -> Self {
+        if self.is_none() {
+            error!("{}", msg);
+        }
+
+        self
+    }
+
+    #[inline]
+    fn log_info(self, msg: &str) -> Self {
+        if self.is_none() {
+            info!("{}", msg);
+        }
+
+        self
+    }
+}
+
+impl<T, E: Debug> LogFail for Result<T, E> {
+    #[inline]
+    fn log_warn(self, msg: &str) -> Self {
+        if let Err(ref e) = self {
+            warn!("{}: {:?}", msg, e);
+        }
+
+        self
+    }
+
+    #[inline]
+    fn log_error(self, msg: &str) -> Self {
+        if let Err(ref e) = self {
+            error!("{}: {:?}", msg, e);
+        }
+
+        self
+    }
+
+    #[inline]
+    fn log_info(self, msg: &str) -> Self {
+        if let Err(ref e) = self {
+            info!("{}: {:?}", msg, e);
+        }
 
         self
     }
