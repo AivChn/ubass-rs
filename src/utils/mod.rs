@@ -185,6 +185,32 @@ pub trait LogFail {
     fn log_info(self, msg: &str) -> Self;
 }
 
+impl LogFail for bool {
+    fn log_warn(self, msg: &str) -> Self {
+        if self {
+            warn!("{msg}");
+        }
+
+        self
+    }
+
+    fn log_error(self, msg: &str) -> Self {
+        if self {
+            error!("{msg}");
+        }
+
+        self
+    }
+
+    fn log_info(self, msg: &str) -> Self {
+        if self {
+            info!("{msg}");
+        }
+
+        self
+    }
+}
+
 impl<T> LogFail for Option<T> {
     #[inline]
     fn log_warn(self, msg: &str) -> Self {
