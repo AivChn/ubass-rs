@@ -2,10 +2,12 @@
 #![allow(clippy::len_without_is_empty)]
 use std::{fmt::Debug, ops::Range, ptr, slice::SliceIndex};
 
+use tracing::debug;
+
 use crate::{
     manager::packets::{BytePosition, MAX_PAYLOAD_LENGTH},
     o_unwrap_or_return,
-    utils::PanicInDebug,
+    utils::{LogFail, PanicInDebug},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -93,20 +95,14 @@ impl WriteableBuffer {
 
     #[allow(clippy::cast_possible_truncation)]
     pub fn advance_head(&mut self) {
-        let mut i =
-            o_unwrap_or_return!(self.position_to_index(self.head).panic_in_debug(&format!(
-                "Invariant broken in `advance_head`: head was not a valid index for the buffer \
-                        (head: {}, buffer length: {})",
-                self.head,
-                self.len()
-            )));
+        let mut i = o_unwrap_or_return!(self.position_to_index(self.head));
 
-        while i < self.map.len() - 1 && self.map[i] {
+        while i < self.map.len() && self.map[i] {
             *self.head += MAX_PAYLOAD_LENGTH as u32;
             i += 1;
         }
 
-        if i == self.map.len() - 1 {
+        if i == self.map.len() {
             *self.head = self.len() as u32;
         }
     }
@@ -117,13 +113,20 @@ impl WriteableBuffer {
         to_write: impl AsRef<[u8]>,
     ) -> Option<Range<usize>> {
         let to_write = to_write.as_ref();
-        if self.position_occupied(position)?
+        if self
+            .position_occupied(position)
+            .log_warn("position not valid")?
+            .log_warn("position occupied")
             || (to_write.len() != MAX_PAYLOAD_LENGTH
                 && self.position_to_index(position)? != self.map.len() - 1)
-            || *position as usize + to_write.len() > self.buffer.len()
+                .log_warn("position isnt last but size isnt max")
+            || (*position as usize + to_write.len() > self.buffer.len())
+                .log_warn("buffer doesnt fit")
         {
             return None;
         }
+
+        debug!("{:?}", unsafe { self.buffer.0.as_ref() });
 
         self.occupy(position);
         let position = *position as usize;
@@ -195,6 +198,28 @@ impl ReadableBuffer {
     }
 }
 
+pub trait PendingStream {
+    type Stream: Stream;
+    type Error: std::error::Error;
+
+    async fn ready(self) -> core::result::Result<Self::Stream, Self::Error>;
+    async fn discard(self) -> core::result::Result<(), Self::Error>;
+}
+
+pub trait RequestedStream: Sized {
+    type Stream: Stream;
+    type Error: std::error::Error;
+
+    fn track_id(&self) -> &[u8];
+    async fn reject(self, reason: impl Into<String>) -> Result<(), Self>;
+    async fn approve_and_ready(self) -> core::result::Result<Self::Stream, Self::Error>;
+    async fn approve_if_and_ready(
+        self,
+        f: impl FnOnce(&[u8]) -> bool,
+        reject_reason: impl Into<String>,
+    ) -> Option<core::result::Result<Self::Stream, Self::Error>>;
+}
+
 pub trait Stream {
     type Error: std::error::Error;
     type Idx: SliceIndex<[u8]>;
@@ -216,8 +241,6 @@ pub trait IncomingConnection: Sized {
 
     fn app_id(&self) -> &str;
     async fn reject(self, reason: impl Into<String>) -> Result<(), Self>;
-    async fn approve(&mut self) -> core::result::Result<(), Self::Error>;
-    async fn ready(self) -> Option<core::result::Result<Self::Connection, Self::Error>>;
     async fn approve_and_ready(self) -> core::result::Result<Self::Connection, Self::Error>;
     async fn approve_if_and_ready(
         self,

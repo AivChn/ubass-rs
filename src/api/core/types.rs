@@ -138,15 +138,11 @@ impl ApiInner {
         buffer: ReadableBuffer,
         sender: watch::Sender<StreamMessage>,
     ) -> Result<SessionId, ApiErrors> {
-        if buffer.len() > MAX_PAYLOAD_LENGTH {
-            return Err(ApiErrors::BufferTooLarge);
-        }
-        let (request, reply): (_, ResponseReceiver<Result<SessionId, ApiErrors>>) =
-            OneShot::new(SendDataRequest {
-                target,
-                buffer,
-                sender,
-            });
+        let (request, reply) = OneShot::new(SendDataRequest {
+            target,
+            buffer,
+            sender,
+        });
         self.api_to_manager
             .send(ApiCommand::SendData(request))
             .await
@@ -331,7 +327,7 @@ impl api::types::IncomingConnection for IncomingConnection {
         Ok(())
     }
 
-    async fn approve(&mut self) -> Result<(), Self::Error> {
+    async fn approve_and_ready(mut self) -> core::result::Result<Self::Connection, Self::Error> {
         let sender = self.approve_channel.take();
         debug_assert!(
             sender.is_some(),
@@ -342,29 +338,18 @@ impl api::types::IncomingConnection for IncomingConnection {
 
         sender
             .send(AppResponse::AppApproved)
-            .map_err(|_| ConnectionError::ProtocolClosed)
-    }
+            .map_err(|_| ConnectionError::ProtocolClosed)?;
 
-    async fn ready(self) -> Option<core::result::Result<Self::Connection, Self::Error>> {
-        if self.approve_channel.is_some() {
-            None
-        } else {
-            match self.reply.recv().await {
-                Err(e) => Some(Err(ConnectionError::from_api(e))),
-                Ok(Err(e)) => Some(Err(e)),
-                Ok(Ok((session_id, receiver))) => Some(Ok(Connection::new(
-                    self.api,
-                    session_id,
-                    self.peer_address,
-                    receiver,
-                ))),
-            }
+        match self.reply.recv().await {
+            Err(e) => Err(ConnectionError::from_api(e)),
+            Ok(Err(e)) => Err(e),
+            Ok(Ok((session_id, receiver))) => Ok(Connection::new(
+                self.api,
+                session_id,
+                self.peer_address,
+                receiver,
+            )),
         }
-    }
-
-    async fn approve_and_ready(mut self) -> core::result::Result<Self::Connection, Self::Error> {
-        self.approve().await?;
-        self.ready().await.expect("Invariant broken in `approve_and_ready`: `approve_channel` is somehow `Some` after calling `approve`")
     }
 
     async fn approve_if_and_ready(
@@ -499,13 +484,74 @@ impl api::types::Connection for Connection {
                 length,
                 receiver,
             )),
-            Err(error) => Err(ConnectionError::from_api(error)),
+            Err(e) => Err(ConnectionError::from_api(e)),
         }
     }
 
     async fn close(self) {
         let api: Arc<ApiInner> = o_unwrap_or_return!(self.api.upgrade());
         api.close_session(self.session_id);
+    }
+}
+
+#[derive(Debug)]
+pub struct RequestedStream {
+    api: Weak<ApiInner>,
+    track_id: Box<[u8]>,
+    session: SessionId,
+    stream_size: usize,
+    connection: Connection,
+    update: watch::Receiver<StreamMessage>,
+}
+
+impl api::types::RequestedStream for RequestedStream {
+    type Stream = OutputStream;
+    type Error = ConnectionError;
+
+    fn track_id(&self) -> &[u8] {
+        self.track_id.as_ref()
+    }
+
+    async fn reject(self, reason: impl Into<String>) -> Result<(), Self> {
+        todo!()
+    }
+
+    async fn approve_and_ready(self) -> core::result::Result<Self::Stream, Self::Error> {
+        todo!()
+    }
+
+    async fn approve_if_and_ready(
+        self,
+        f: impl FnOnce(&[u8]) -> bool,
+        reject_reason: impl Into<String>,
+    ) -> Option<core::result::Result<Self::Stream, Self::Error>> {
+        if f(self.track_id.as_ref()) {
+            Some(self.approve_and_ready().await)
+        } else {
+            self.reject(reject_reason).await;
+            None
+        }
+    }
+}
+
+pub struct PendingStream {
+    api: Weak<ApiInner>,
+    session: SessionId,
+    stream_size: usize,
+    connection: Connection,
+    update: watch::Receiver<StreamMessage>,
+}
+
+impl api::types::PendingStream for PendingStream {
+    type Stream = InputStream;
+    type Error = ConnectionError;
+
+    async fn ready(self) -> core::result::Result<Self::Stream, Self::Error> {
+        todo!()
+    }
+
+    async fn discard(self) -> core::result::Result<(), Self::Error> {
+        todo!()
     }
 }
 
