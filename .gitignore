@@ -7,3 +7,4 @@ cargo.lock
 /Cargo.lock
 /.nextcloudsync*
 /.sync*
+/logs
