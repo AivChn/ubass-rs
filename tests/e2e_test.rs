@@ -5,19 +5,18 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ubass::{
-    api::{AppEvent, ConnectionTrait, IncomingConnectionTrait, PendingConnectionTrait},
-    utils::ConnectionEvent,
-};
+use ubass::api::{AppEvent, IncomingConnectionTrait, PendingConnectionTrait};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 //comment
 
-const LOREM_IPSUM: &[u8] = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, \
+const LOREM_IPSUM: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, \
     sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, \
     quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute \
     irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. \
     Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum";
+
+const BIN_PATH: &str = "/home/aiv/dev/ubass-rs/integration/target/debug/integration";
 
 /// Bind to port 0 to get a free UDP port from the OS.
 fn free_port() -> u16 {
@@ -90,14 +89,16 @@ fn connection_refused() {
 #[test]
 fn e2e_echo() {
     let server_port = free_port();
+    let server_address = format!("127.0.0.1:{server_port}");
     let client_port = free_port();
-    let binary = "/home/aiv/dev/ubass-rs/target/debug/e2e_peer";
 
-    let mut server = std::process::Command::new(binary)
+    let mut server = std::process::Command::new(BIN_PATH)
         .args([
-            "server",
+            "--port",
             &server_port.to_string(),
-            str::from_utf8(LOREM_IPSUM).unwrap(),
+            "--name",
+            "echo",
+            "server",
         ])
         .spawn()
         .expect("failed to spawn server");
@@ -105,11 +106,17 @@ fn e2e_echo() {
     // give the server time to bind and start listening
     std::thread::sleep(Duration::from_millis(200));
 
-    let mut client = std::process::Command::new(binary)
+    let mut client = std::process::Command::new(BIN_PATH)
         .args([
-            "client",
+            "--port",
             &client_port.to_string(),
-            &format!("127.0.0.1:{server_port}"),
+            "--name",
+            "echo",
+            "client",
+            "--server-address",
+            &server_address,
+            "--message",
+            LOREM_IPSUM,
         ])
         .spawn()
         .expect("failed to spawn client");
@@ -128,27 +135,39 @@ fn e2e_echo() {
 }
 
 #[test]
-fn e2e_echo_multiple_data() {
+fn test_data_bigger_than_packet() {
     let server_port = free_port();
+    let server_address = format!("127.0.0.1:{server_port}");
     let client_port = free_port();
-    let binary = "/home/aiv/dev/ubass-rs/target/debug/e2e_peer";
-    let mut message = String::from_utf8(LOREM_IPSUM.into()).unwrap();
+    let message = LOREM_IPSUM.repeat((1500 / LOREM_IPSUM.len()) * 2);
 
-    message.extend(message.clone().chars());
-
-    let mut server = std::process::Command::new(binary)
-        .args(["server", &server_port.to_string(), &message])
+    let mut server = std::process::Command::new(BIN_PATH)
+        .args([
+            "--port",
+            &server_port.to_string(),
+            "--name",
+            "bigger",
+            "server",
+            "--reply",
+            &message,
+        ])
         .spawn()
         .expect("failed to spawn server");
 
     // give the server time to bind and start listening
     std::thread::sleep(Duration::from_millis(200));
 
-    let mut client = std::process::Command::new(binary)
+    let mut client = std::process::Command::new(BIN_PATH)
         .args([
-            "client",
+            "--port",
             &client_port.to_string(),
-            &format!("127.0.0.1:{server_port}"),
+            "--name",
+            "bigger",
+            "client",
+            "--server-address",
+            &server_address,
+            "--message",
+            &message,
         ])
         .spawn()
         .expect("failed to spawn client");
