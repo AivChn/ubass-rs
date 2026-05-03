@@ -167,12 +167,19 @@ pub enum PipeDirection {
     Outbound,
 }
 
+#[derive(Debug, Display, Clone, Copy)]
+pub enum Layer {
+    Manager,
+    PacketProcessor,
+    Transport,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ChannelError {
     #[error("{0} channel has failed")]
-    ChannelFailed(PipeDirection),
+    ChannelFailed(PipeDirection, Layer),
     #[error("{0} channel has closed unexpectedly")]
-    ChannelClosed(PipeDirection),
+    ChannelClosed(PipeDirection, Layer),
 }
 
 impl From<ChannelError> for Error {
