@@ -8,3 +8,5 @@ cargo.lock
 /.nextcloudsync*
 /.sync*
 /logs
+target/
+**/target/
