@@ -6,9 +6,11 @@ use tokio::{
     net::UdpSocket,
     time::{Duration, Instant, timeout},
 };
+use tracing::{debug, error, instrument};
 
 use super::types::{BUFFER_TIMEOUT, MAX_CONCURRENT_SENDS, MAX_PACKET_BUFFER_SIZE, OutboundSockets};
 
+#[instrument]
 pub async fn init(mut receiver: OutboundReceiver) -> ErrResult {
     // set up handle monitor
     let monitor = Arc::from(HandleMonitor::default());
@@ -22,6 +24,7 @@ pub async fn init(mut receiver: OutboundReceiver) -> ErrResult {
     // packet buffer
     let mut buffer = Vec::with_capacity(MAX_PACKET_BUFFER_SIZE);
 
+    debug!("listening for packets to send...");
     loop {
         let start_time = Instant::now();
 
@@ -36,7 +39,12 @@ pub async fn init(mut receiver: OutboundReceiver) -> ErrResult {
                 Err(_) => break,
                 // channel closed
                 Ok(None) => {
-                    return Err(ChannelError::ChannelClosed(PipeDirection::Outbound).into());
+                    error!("Channel closed on receiver side for Outbound Transport");
+                    return Err(ChannelError::ChannelClosed(
+                        PipeDirection::Outbound,
+                        Layer::Transport,
+                    )
+                    .into());
                 }
                 // close pipeline
                 Ok(Some(TransportMessage::Close)) => {
@@ -54,17 +62,26 @@ pub async fn init(mut receiver: OutboundReceiver) -> ErrResult {
             buffer.push(data);
         }
 
-        while monitor.size().await > MAX_CONCURRENT_SENDS {
-            #[allow(clippy::cast_possible_truncation)]
-            let _ = sockets
-                .update(start_time.elapsed().as_millis() as u64)
-                .await;
-        }
+        while monitor.size().await > MAX_CONCURRENT_SENDS {}
+
+        #[allow(clippy::cast_possible_truncation)]
+        let _ = sockets
+            .update(start_time.elapsed().as_millis() as u64)
+            .await;
 
         if buffer.is_empty() {
             continue;
         }
 
+        #[cfg(debug_assertions)]
+        if buffer.len() == 1 {
+            debug!(
+                "single packet being sent: {:?}",
+                str::from_utf8(&buffer[0].data).unwrap_or(&format!("RAW: {:?}", &buffer[0].data))
+            );
+        }
+
+        debug!("sending packet buffer with {} packets", buffer.len());
         #[allow(clippy::drain_collect)]
         monitor.dispatch(send_packets(buffer.drain(..).collect(), sockets.retrieve()));
     }

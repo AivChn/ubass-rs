@@ -1,3 +1,4 @@
+use std::error;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 
 use crate::prelude::*;
@@ -5,6 +6,7 @@ use crate::transport::types::InboundSender;
 use socket2::{Domain, Protocol, SockAddrStorage, Socket, Type};
 
 use tokio::net::UdpSocket;
+use tracing::{debug, error, info, warn};
 
 use super::send_to_processing_layer;
 use super::types::{MAX_PACKET_SIZE, ReceivedPacket};
@@ -41,6 +43,7 @@ pub async fn init(port: u16, sender: InboundSender) -> ErrResult {
 
     let mut fail_count = 0u32;
 
+    info!("listening on {port}");
     loop {
         let mut buffer = vec![0u8; MAX_PACKET_SIZE];
 
@@ -51,13 +54,16 @@ pub async fn init(port: u16, sender: InboundSender) -> ErrResult {
                 break addr;
             }
 
+            warn!("failed to receive {fail_count} times.");
             fail_count += 1;
 
             if fail_count >= MAX_ALLOWED_FAILS {
+                error!("failed to receive too many times");
                 return Err(TransportError::RecvFailedTooManyTimes.into());
             }
         };
 
+        debug!("received packet: {:?}", &buffer);
         let packet = ReceivedPacket {
             src_addr: addr,
             data: buffer,
@@ -150,7 +156,8 @@ mod test {
         assert!(matches!(
             handle.await.unwrap(),
             Err(Error::Channel(ChannelError::ChannelClosed(
-                crate::error::PipeDirection::Inbound
+                crate::error::PipeDirection::Inbound,
+                _
             )))
         ));
     }
