@@ -88,8 +88,8 @@ pub enum ApiMessage {
 #[derive(Debug)]
 pub enum ConnectionEvent {
     TrackRequest(Box<[u8]>),
-    Closed,
     ProtocolClosed(Vec<ConnectionEvent>),
+    ConnectionClosed,
 }
 
 #[derive(Debug, Default)]

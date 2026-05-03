@@ -5,10 +5,19 @@ use std::{
     time::{Duration, Instant},
 };
 
-use ubass::api::{AppEvent, IncomingConnectionTrait, PendingConnectionTrait};
+use ubass::{
+    api::{AppEvent, ConnectionTrait, IncomingConnectionTrait, PendingConnectionTrait},
+    utils::ConnectionEvent,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 //comment
+
+const LOREM_IPSUM: &[u8] = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, \
+    sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, \
+    quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute \
+    irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. \
+    Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum";
 
 /// Bind to port 0 to get a free UDP port from the OS.
 fn free_port() -> u16 {
@@ -36,13 +45,14 @@ fn wait_timeout(
     }
 }
 
-#[tokio::test]
-async fn connection_refused() {
+#[test]
+fn connection_refused() {
     let server_port = free_port();
     let client_port = free_port();
 
     let server = thread::spawn(move || {
-        tokio::spawn(async move {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(async move {
             let api = ubass::open("server_connection_refused", Some(server_port))
                 .await
                 .unwrap();
@@ -59,7 +69,8 @@ async fn connection_refused() {
     std::thread::sleep(Duration::from_millis(200));
 
     let client = thread::spawn(move || {
-        tokio::spawn(async move {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.spawn(async move {
             let api = ubass::open("client_connection_refused", Some(client_port))
                 .await
                 .unwrap();
@@ -83,7 +94,50 @@ fn e2e_echo() {
     let binary = "/home/aiv/dev/ubass-rs/target/debug/e2e_peer";
 
     let mut server = std::process::Command::new(binary)
-        .args(["server", &server_port.to_string()])
+        .args([
+            "server",
+            &server_port.to_string(),
+            str::from_utf8(LOREM_IPSUM).unwrap(),
+        ])
+        .spawn()
+        .expect("failed to spawn server");
+
+    // give the server time to bind and start listening
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut client = std::process::Command::new(binary)
+        .args([
+            "client",
+            &client_port.to_string(),
+            &format!("127.0.0.1:{server_port}"),
+        ])
+        .spawn()
+        .expect("failed to spawn client");
+
+    let client_status = wait_timeout(&mut client, TIMEOUT).expect("client timed out");
+    assert!(
+        client_status.success(),
+        "client exited with: {client_status}"
+    );
+
+    let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
+    assert!(
+        server_status.success(),
+        "server exited with: {server_status}"
+    );
+}
+
+#[test]
+fn e2e_echo_multiple_data() {
+    let server_port = free_port();
+    let client_port = free_port();
+    let binary = "/home/aiv/dev/ubass-rs/target/debug/e2e_peer";
+    let mut message = String::from_utf8(LOREM_IPSUM.into()).unwrap();
+
+    message.extend(message.clone().chars());
+
+    let mut server = std::process::Command::new(binary)
+        .args(["server", &server_port.to_string(), &message])
         .spawn()
         .expect("failed to spawn server");
 

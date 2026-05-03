@@ -244,15 +244,10 @@ impl api::types::PendingConnection for PendingConnection {
             .reply
             .recv()
             .await
-            .map_err(|_| ConnectionError::ProtocolClosed)
+            .map_err(|_| ConnectionError::ProtocolClosed)?
         {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                println!("1. error: {e:?}");
-                return Err(e);
-            }
+            Ok(v) => v,
             Err(e) => {
-                println!("2. error: {e:?}");
                 return Err(e);
             }
         };

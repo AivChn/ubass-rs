@@ -1,7 +1,5 @@
 #![allow(clippy::unwrap_used)]
-use std::net::Ipv4Addr;
 use std::net::SocketAddr;
-use std::net::SocketAddrV4;
 use std::panic;
 use std::time::Duration;
 use tokio::time::timeout;
@@ -14,44 +12,21 @@ use ubass::utils::ConnectionEvent;
 use ubass::api::open;
 use ubass::utils::PanicInDebug;
 
-const MESSAGE: &[u8] = b"Lorem ipsum dolor sit amet, consectetur adipiscing elit, \
-    sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, \
-    quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute \
-    irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. \
-    Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum";
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), ()> {
     let args: Vec<String> = std::env::args().collect();
     match args[1].as_str() {
         "server" => server(args[2].parse().unwrap()).await?,
-        "client" => client(args[2].parse().unwrap(), args[3].parse().unwrap()).await?,
+        "client" => {
+            client(
+                args[2].parse().unwrap(),
+                args[3].parse().unwrap(),
+                args[4].parse().unwrap(),
+            )
+            .await?
+        }
         _ => panic!("usage: e2e_peer <server|client> <port> [server_addr]"),
     }
-    Ok(())
-}
-
-#[allow(unused)]
-async fn client_example(port: u16) -> Result<(), ()> {
-    let app_id = "client_example";
-    let api = ubass::open(app_id, Some(port)).await.unwrap();
-
-    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8455);
-    let pending_connection = api.connect(addr.into()).await.unwrap();
-
-    let connection = pending_connection.ready().await.unwrap();
-
-    let track_size = 128 * 1024;
-    let mut buffer = vec![0u8; track_size];
-    let track_id = b"some track ID".as_slice();
-    let stream = connection
-        .request(track_id, buffer.as_mut_slice())
-        .await
-        .unwrap();
-
-    let connection = stream.complete().await.unwrap();
-
-    connection.close().await;
     Ok(())
 }
 
@@ -91,7 +66,7 @@ async fn server(port: u16) -> Result<(), ()> {
     Ok(())
 }
 
-async fn client(port: u16, server_addr: SocketAddr) -> Result<(), ()> {
+async fn client(port: u16, server_addr: SocketAddr, message: String) -> Result<(), ()> {
     let api = open("e2e-client".to_string(), Some(port))
         .await
         .map_err(|_| println!("api open"))?;
@@ -108,10 +83,10 @@ async fn client(port: u16, server_addr: SocketAddr) -> Result<(), ()> {
     .map_err(|_| println!("ready timeout"))?
     .map_err(|_| println!("ready failed!"))?;
 
-    let mut buffer = vec![0; MESSAGE.len()];
+    let mut buffer = vec![0; message.len()];
     let stream = timeout(
         Duration::from_secs(2),
-        connection.request(MESSAGE, buffer.as_mut_slice()),
+        connection.request(message.clone().into_bytes(), buffer.as_mut_slice()),
     )
     .await
     .map_err(|_| println!("request timeout"))?
@@ -122,6 +97,6 @@ async fn client(port: u16, server_addr: SocketAddr) -> Result<(), ()> {
         .map_err(|_| println!("stream complete timeout"))?
         .map_err(|_| println!("stream complete error"))?;
 
-    assert_eq!(buffer, MESSAGE);
+    assert_eq!(buffer, message.into_bytes());
     Ok(())
 }
