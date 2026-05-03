@@ -7,6 +7,7 @@ use tokio::{
     sync::{Mutex, RwLock, mpsc, oneshot, watch},
     time::interval,
 };
+use tracing::{debug, instrument};
 use x25519_dalek::EphemeralSecret;
 
 use crate::{
@@ -323,6 +324,7 @@ impl ConnectionStates {
 
     // TODO:
     /// # Errors
+    #[instrument]
     pub fn received_data_packet(&mut self, packet: DataPacket) -> ErrResult {
         if let ConnectionStates::Established(box EstablishedState {
             state:
@@ -337,11 +339,13 @@ impl ConnectionStates {
             let payload = packet.payload.take();
             buffer
                 .write(packet.byte_range_start, payload)
-                .ok_or(ChannelError::ChannelClosed(Inbound))?;
-            stream.send_modify(|m| m.head = buffer.head());
-            if buffer.is_done() {
-                stream.send_modify(|m| m.closed = true);
-            }
+                .ok_or(ChannelError::ChannelClosed(Inbound, Layer::Manager))?;
+
+            debug!("buffer done: {}", buffer.is_done());
+            stream.send_modify(|m| {
+                m.head = buffer.head();
+                m.closed = buffer.is_done();
+            });
 
             Ok(())
         } else {
