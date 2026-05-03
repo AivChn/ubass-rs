@@ -151,7 +151,7 @@ pub async fn send_data(
     let session_id = match resolve_target(&target).await {
         Ok((session_id, _)) => session_id,
         Err(e) => {
-            _ = reply.send(Err(e));
+            _ = reply.send(Err(e).panic_in_debug("Failed while resolving target!"));
             return;
         }
     };

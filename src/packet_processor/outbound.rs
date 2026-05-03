@@ -70,7 +70,10 @@ pub async fn init(
 
     loop {
         let received = p_receiver.recv().await;
-        let msg = received.ok_or(ChannelError::ChannelClosed(Outbound))?;
+        let msg = received.ok_or(ChannelError::ChannelClosed(
+            Outbound,
+            Layer::PacketProcessor,
+        ))?;
 
         let packet = match msg {
             PacketProcessingMessage::SendPacket(packet_wrapper) => packet_wrapper,
@@ -345,7 +348,11 @@ async fn send_packet_to_transport(
         .await
         .is_err()
     {
-        send_to_manager(Err(ChannelError::ChannelFailed(Outbound).into()), p_sender).await;
+        send_to_manager(
+            Err(ChannelError::ChannelFailed(Outbound, Layer::PacketProcessor).into()),
+            p_sender,
+        )
+        .await;
     }
 }
 

@@ -18,7 +18,7 @@ pub async fn handle_errors(error: Error, sender: ManagerToProcessor) {
     dbg!(&error);
     match error {
         error @ (Error::Task(TaskFailed)
-        | Error::Channel(ChannelFailed(_) | ChannelClosed(_))
+        | Error::Channel(ChannelFailed(_, _) | ChannelClosed(_, _))
         | Error::Transport(FailedToBind | RecvFailedTooManyTimes)) => panicking_error(&error),
         Error::PacketProcessor(
             WrongHeaderSize(_, _) | InvalidPacketTypeHeader(_) | FailedToDeserialize,

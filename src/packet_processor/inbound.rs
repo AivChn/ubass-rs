@@ -27,7 +27,7 @@ pub async fn init(
     loop {
         let received = t_receiver.recv().await;
         let Some(message) = received else {
-            return Err(ChannelError::ChannelClosed(Inbound).into());
+            return Err(ChannelError::ChannelClosed(Inbound, Layer::PacketProcessor).into());
         };
 
         let packet = match message {

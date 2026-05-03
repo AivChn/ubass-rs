@@ -50,18 +50,31 @@ pub async fn init(
 
     tokio::select! {
         res = &mut inbound_handle => {
-            _ = t_sender.send(TransportMessage::Close).await;
-            _ = outbound_handle.await;
             match res {
-                Err(_) => Err(TaskError::TaskFailed.into()),
-                Ok(res) =>  res,
+                Err(_) => {
+                    _ = t_sender.send(TransportMessage::Close).await;
+                    _ = outbound_handle.await;
+                    Err(TaskError::TaskFailed.into())
+                },
+                Ok(res) =>  {
+                    _ = outbound_handle.await;
+                    _ = t_sender.send(TransportMessage::Close).await;
+                    res
+                },
             }
         },
         res = &mut outbound_handle => {
-            inbound_handle.abort();
             match res {
-                Err(_) => Err(TaskError::TaskFailed.into()),
-                Ok(res) => res,
+                Err(_) => {
+                    _ = t_sender.send(TransportMessage::Close).await;
+                    inbound_handle.abort();
+                    Err(TaskError::TaskFailed.into())
+                },
+                Ok(res) =>  {
+                    inbound_handle.abort();
+                    _ = t_sender.send(TransportMessage::Close).await;
+                    res
+                },
             }
         }
     }

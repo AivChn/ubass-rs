@@ -22,7 +22,7 @@ pub async fn init(
     loop {
         match inbound_receiver.recv().await {
             None => {
-                return Err(ChannelError::ChannelClosed(Inbound).into());
+                return Err(ChannelError::ChannelClosed(Inbound, Layer::Manager).into());
             }
             Some(Err(error)) => monitor.dispatch(handle_errors(error, outbound_sender.clone())),
             Some(Ok(ManagerMessage::Closed)) => {

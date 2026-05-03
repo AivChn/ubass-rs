@@ -21,7 +21,7 @@ pub async fn init(
     loop {
         match manager_from_api.recv().await {
             None => {
-                return Err(ChannelError::ChannelClosed(Outbound).into());
+                return Err(ChannelError::ChannelClosed(Outbound, Layer::Manager).into());
             }
             Some(ApiCommand::RequestData(one_shot)) => {
                 monitor.dispatch(endpoints::request_track(
