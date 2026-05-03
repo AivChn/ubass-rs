@@ -472,6 +472,12 @@ impl PlaybackStatusPacket {
     pub fn stop(opts: Options, session_id: SessionId) -> Box<Self> {
         Self::new(opts, session_id, PlaybackControlType::Stop)
     }
+
+    #[inline]
+    #[must_use]
+    pub fn done(opts: Options, session_id: SessionId) -> Box<Self> {
+        Self::new(opts, session_id, PlaybackControlType::Done)
+    }
 }
 
 #[derive(Debug, SendPacket, Clone, Serialize)]
@@ -1281,6 +1287,7 @@ pub enum PlaybackControlType {
     Play = 101,
     Pause = 102,
     Stop = 103,
+    Done = 104,
 }
 
 impl From<PlaybackControlType> for ControlType {
