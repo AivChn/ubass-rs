@@ -1,6 +1,6 @@
-use crate::packet_processor::types::ProcessedPacket;
 use crate::prelude::*;
 use crate::transport::types::OutboundReceiver;
+use crate::{manager::packets::PacketType, packet_processor::types::ProcessedPacket};
 use std::{mem, sync::Arc, vec};
 use tokio::{
     net::UdpSocket,
@@ -11,7 +11,7 @@ use tracing::{debug, error, instrument};
 use super::types::{BUFFER_TIMEOUT, MAX_CONCURRENT_SENDS, MAX_PACKET_BUFFER_SIZE, OutboundSockets};
 
 #[instrument]
-pub async fn init(mut receiver: OutboundReceiver) -> ErrResult {
+pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocket>) -> ErrResult {
     // set up handle monitor
     let monitor = Arc::from(HandleMonitor::default());
     HandleMonitor::init(monitor.clone());
@@ -59,7 +59,11 @@ pub async fn init(mut receiver: OutboundReceiver) -> ErrResult {
                 Ok(Some(TransportMessage::SendPacket(data))) => data,
             };
 
-            buffer.push(data);
+            if data.packet_type == PacketType::KeepAlive {
+                send_keep_alive(data, &listening_socket);
+            } else {
+                buffer.push(data);
+            }
         }
 
         while monitor.size().await > MAX_CONCURRENT_SENDS {}
@@ -100,13 +104,20 @@ async fn send_packets(buffer: Box<[ProcessedPacket]>, socket: Arc<UdpSocket>) {
     }
 }
 
+fn send_keep_alive(packet: ProcessedPacket, socket: &UdpSocket) {
+    for _ in 0..packet.duplicate_count {
+        socket.send(&packet.data);
+    }
+    drop(packet);
+}
+
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod test {
     use core::net;
     use std::{
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-        sync::atomic::AtomicU16,
+        sync::{Arc, atomic::AtomicU16},
     };
 
     use tokio::{net::UdpSocket, task::JoinHandle};
@@ -115,7 +126,7 @@ mod test {
         error::ErrResult,
         manager::packets::PacketType,
         packet_processor::types::{OutboundSender, ProcessedPacket},
-        transport::{outbound, types::OutboundReceiver},
+        transport::{bind_listen_socket, outbound, types::OutboundReceiver},
         utils::{TransportMessage, messages},
     };
 
@@ -126,8 +137,9 @@ mod test {
     }
 
     fn prepare_init() -> (OutboundSender, JoinHandle<ErrResult>) {
+        let socket = Arc::new(bind_listen_socket(next_port()).unwrap());
         let (sender, receiver): (OutboundSender, _) = tokio::sync::mpsc::channel(1);
-        (sender, tokio::spawn(outbound::init(receiver)))
+        (sender, tokio::spawn(outbound::init(receiver, socket)))
     }
 
     #[tokio::test]

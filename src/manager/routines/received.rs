@@ -44,7 +44,22 @@ pub async fn received_close_session_packet(packet: Box<CloseSessionPacket>) {
     get_state!().close_session(packet.session_id);
 }
 
+pub async fn received_keep_alive_packet(packet: Box<KeepAlivePacket>) {
+    get_state!()
+        .global_handle_monitor
+        .dispatch(update_last_activity(packet.session_id, packet.timestamp));
+    get_state!()
+        .update_address(
+            packet.session_id,
+            SocketAddr::V4(o_unwrap_or_return!(packet.address)),
+        )
+        .await;
+}
+
 pub async fn received_track_request_packet(packet: Box<TrackRequestPacket>) {
+    get_state!()
+        .global_handle_monitor
+        .dispatch(update_last_activity(packet.session_id, packet.timestamp));
     let track_id = packet.payload.take();
     let sender = {
         let lock = lock_read!(get_state!().connections);

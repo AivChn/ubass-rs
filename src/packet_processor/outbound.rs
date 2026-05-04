@@ -57,9 +57,9 @@ macro_rules! add_ack {
 
 pub async fn init(
     OutboundChannels {
-        t_sender,
-        p_sender,
-        mut p_receiver,
+        to_transport: t_sender,
+        to_manager: p_sender,
+        from_manager: mut p_receiver,
     }: OutboundChannels,
     encryption_monitor: EncryptionMonitor,
     pending_ack_monitor: PendingAckMonitor,
@@ -179,6 +179,19 @@ async fn handle_packet(
 
             let session_id = packet.session_id;
             process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
+        }
+        Packet::KeepAlivePacket(packet) => {
+            let session_id = packet.session_id;
+            let mut serialized;
+            serialize!(packet -> serialized);
+
+            encryption::tag(&mut serialized, session_id, encryption_monitor).await;
+            ProcessedPacket {
+                dest_addr: addr,
+                packet_type: PacketType::KeepAlive,
+                data: serialized,
+                duplicate_count: 3,
+            }
         }
         // could not be acked
         Packet::UnexpectedPacketErrorPacket(packet) => {
@@ -512,9 +525,9 @@ mod integration_tests {
 
         let handle = tokio::spawn(super::init(
             OutboundChannels {
-                t_sender: dud2_sender.clone(),
-                p_sender: dud_sender.clone(),
-                p_receiver: t_receiver,
+                to_transport: dud2_sender.clone(),
+                to_manager: dud_sender.clone(),
+                from_manager: t_receiver,
             },
             encryption_monitor,
             pending_ack_monitor,
@@ -535,9 +548,9 @@ mod integration_tests {
 
         let handle = tokio::spawn(super::init(
             OutboundChannels {
-                t_sender: dud2_sender,
-                p_sender: dud_sender,
-                p_receiver: t_receiver,
+                to_transport: dud2_sender,
+                to_manager: dud_sender,
+                from_manager: t_receiver,
             },
             encryption_monitor,
             pending_ack_monitor,
@@ -564,9 +577,9 @@ mod integration_tests {
 
         let handle = tokio::spawn(super::init(
             OutboundChannels {
-                t_sender: dud2_sender.clone(),
-                p_sender: dud_sender.clone(),
-                p_receiver: t_receiver,
+                to_transport: dud2_sender.clone(),
+                to_manager: dud_sender.clone(),
+                from_manager: t_receiver,
             },
             encryption_monitor,
             pending_ack_monitor,

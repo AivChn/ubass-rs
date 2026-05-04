@@ -9,7 +9,11 @@ use crate::{
 };
 
 use core::ops::Deref;
-use std::{fmt::Display, net::SocketAddr, result, vec};
+use std::{
+    fmt::Display,
+    net::{SocketAddr, SocketAddrV4},
+    result, vec,
+};
 
 use crate::packet_processor::serialize::Serialize;
 use async_trait::async_trait;
@@ -35,6 +39,7 @@ pub enum Packet {
     MetadataPacket(Box<MetadataPacket>),
     ParityPacket(Box<ParityPacket>),
     AckPacket(Box<AckPacket>),
+    KeepAlivePacket(Box<KeepAlivePacket>),
     HandshakeAckPacket(Box<HandshakeAckPacket>),
     RetransmitPacket(Box<RetransmitPacket>),
     PlaybackStatusPacket(Box<PlaybackStatusPacket>),
@@ -68,6 +73,7 @@ impl Packet {
             Packet::AppRejectErrorPacket(packet) => Some(packet.session_id),
             Packet::CloseSessionPacket(packet) => Some(packet.session_id),
             Packet::HandshakeRejection(packet) => Some(packet.session_id),
+            Packet::KeepAlivePacket(packet) => Some(packet.session_id),
             Packet::IncompatibleVersionPacket(_) | Packet::HandshakeAckPacket(_) => {
                 debug_assert!(
                     false,
@@ -105,6 +111,7 @@ impl SendPacket for Packet {
             Packet::MetadataPacket(packet) => packet.send(sender, address),
             Packet::ParityPacket(packet) => packet.send(sender, address),
             Packet::AckPacket(packet) => packet.send(sender, address),
+            Packet::KeepAlivePacket(packet) => packet.send(sender, address),
             Packet::RetransmitPacket(packet) => packet.send(sender, address),
             Packet::PlaybackStatusPacket(packet) => packet.send(sender, address),
             Packet::IncompatibleVersionPacket(packet) => packet.send(sender, address),
@@ -135,6 +142,7 @@ impl TryFrom<&Packet> for PacketFingerprint {
             Packet::CloseSessionPacket(packet) => packet.as_ref().into(),
             _x @ (Packet::AckPacket(_)
             | Packet::IncompatibleVersionPacket(_)
+            | Packet::KeepAlivePacket(_)
             | Packet::SessionDoesNotExistErrorPacket(_)
             | Packet::HandshakeAckPacket(_)
             | Packet::HandshakeRejection(_)) => {
@@ -519,6 +527,64 @@ impl AckPacket {
             timestamp,
             fingerprint,
         })
+    }
+}
+
+impl Serialize for Option<SocketAddrV4> {
+    fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
+        if buf.len() < self.sized() {
+            return Err(());
+        }
+
+        match self {
+            None => [0u8; 6].serialize(buf),
+            Some(addr) => addr.serialize(buf),
+        }
+    }
+
+    fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
+        if [0u8; 6][..] == bytes[..6] {
+            Ok(None)
+        } else {
+            Ok(Some(SocketAddrV4::deserialize(bytes)?))
+        }
+    }
+
+    fn sized(&self) -> usize {
+        6
+    }
+}
+
+#[derive(Debug, SendPacket, Clone, Serialize)]
+pub struct KeepAlivePacket {
+    pub version: Version,
+    pub opts: Options,
+    pub packet_type: PacketType,
+    reserved: Reserved<3>,
+    pub session_id: SessionId,
+    pub timestamp: Timestamp,
+    pub address: Option<SocketAddrV4>,
+}
+
+impl KeepAlivePacket {
+    #[must_use]
+    pub fn new(opts: Options, session_id: SessionId) -> Self {
+        let version = Version::CURRENT_VERSION;
+        let opts = opts.unset(OptionFlags::RequireAck);
+        let packet_type = PacketType::KeepAlive;
+        let reserved = Reserved;
+        let timestamp = Timestamp::now();
+        let address = None;
+
+        Self {
+            version,
+            opts,
+            packet_type,
+            reserved,
+            session_id,
+            timestamp,
+            address,
+        }
     }
 }
 
@@ -1082,6 +1148,34 @@ impl BufferId {
     }
 }
 
+impl Serialize for Option<BufferId> {
+    fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
+        if buf.len() < self.sized() {
+            return Err(());
+        }
+        match self {
+            None => {
+                buf[0] = 0;
+                buf[1] = 0;
+            }
+            Some(id) => id.serialize(buf)?,
+        }
+        Ok(())
+    }
+
+    fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
+        let rep = u16::deserialize(bytes)?;
+        match rep {
+            0 => Ok(None),
+            id => Ok(Some(BufferId::new(id))),
+        }
+    }
+
+    fn sized(&self) -> usize {
+        std::mem::size_of::<BufferId>()
+    }
+}
+
 #[derive(Deref, Debug, Clone, Copy, Serialize, Display)]
 #[repr(transparent)]
 pub struct BufferSize(u32);
@@ -1215,6 +1309,7 @@ pub enum PacketType {
     Session = 8,
     Playback = 9,
     Error = 10,
+    KeepAlive = 11,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -4,7 +4,7 @@ use crate::{
     manager::{
         routines::{
             errors::{self, handle_errors},
-            received::{self, received_handshake_ack_packet},
+            received::{self, received_handshake_ack_packet, received_keep_alive_packet},
         },
         types::{ManagerFromProcessor, ManagerToApi, ManagerToProcessor},
     },
@@ -88,6 +88,9 @@ async fn handle_message(
             }
             packets::Packet::CloseSessionPacket(close_session_packet) => todo!(),
             packets::Packet::HandshakeRejection(handshake_rejection) => todo!(),
+            packets::Packet::KeepAlivePacket(keep_alive_packet) => {
+                received_keep_alive_packet(keep_alive_packet).await;
+            }
         },
         ManagerMessage::Closed => unreachable!("This arm is handled in the `init` match"),
     }

@@ -7,7 +7,6 @@ use std::ops::{BitXor, BitXorAssign};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use futures::future::Map;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 

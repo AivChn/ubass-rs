@@ -24,7 +24,6 @@ use std::{
 };
 
 use aes_gcm_siv::Error;
-use futures::Stream;
 use tokio::{
     runtime::Runtime,
     sync::{
