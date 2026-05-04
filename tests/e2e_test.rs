@@ -44,6 +44,41 @@ fn wait_timeout(
     }
 }
 
+fn prep_client_args<'a>(
+    port: &'a str,
+    name: &'a str,
+    message: &'a str,
+    is_path: bool,
+    address: &'a str,
+) -> Vec<&'a str> {
+    let mut v = vec!["--port", port, "--name", name, "--message", message];
+
+    if is_path {
+        v.push("--path");
+    }
+    v.extend(&["client", "--server-address", address]);
+
+    v
+}
+
+fn prep_server_args<'a>(
+    port: &'a str,
+    name: &'a str,
+    message: &'a str,
+    is_path: bool,
+    is_echo: bool,
+) -> Vec<&'a str> {
+    let mut v = vec!["--port", port, "--name", name, "--message", message];
+    if is_path {
+        v.push("--path");
+    }
+    v.push("server");
+    if is_echo {
+        v.push("--echo");
+    }
+    v
+}
+
 #[test]
 fn connection_refused() {
     let server_port = free_port();
@@ -93,13 +128,13 @@ fn e2e_echo() {
     let client_port = free_port();
 
     let mut server = std::process::Command::new(BIN_PATH)
-        .args([
-            "--port",
+        .args(prep_server_args(
             &server_port.to_string(),
-            "--name",
             "echo",
-            "server",
-        ])
+            "",
+            false,
+            true,
+        ))
         .spawn()
         .expect("failed to spawn server");
 
@@ -107,17 +142,13 @@ fn e2e_echo() {
     std::thread::sleep(Duration::from_millis(200));
 
     let mut client = std::process::Command::new(BIN_PATH)
-        .args([
-            "--port",
+        .args(prep_client_args(
             &client_port.to_string(),
-            "--name",
             "echo",
-            "client",
-            "--server-address",
-            &server_address,
-            "--message",
             LOREM_IPSUM,
-        ])
+            false,
+            &server_address,
+        ))
         .spawn()
         .expect("failed to spawn client");
 
@@ -142,15 +173,13 @@ fn test_data_bigger_than_packet() {
     let message = LOREM_IPSUM.repeat((1500 / LOREM_IPSUM.len()) * 2);
 
     let mut server = std::process::Command::new(BIN_PATH)
-        .args([
-            "--port",
+        .args(prep_server_args(
             &server_port.to_string(),
-            "--name",
             "bigger",
-            "server",
-            "--reply",
             &message,
-        ])
+            false,
+            false,
+        ))
         .spawn()
         .expect("failed to spawn server");
 
@@ -158,17 +187,58 @@ fn test_data_bigger_than_packet() {
     std::thread::sleep(Duration::from_millis(200));
 
     let mut client = std::process::Command::new(BIN_PATH)
-        .args([
-            "--port",
+        .args(prep_client_args(
             &client_port.to_string(),
-            "--name",
             "bigger",
-            "client",
-            "--server-address",
-            &server_address,
-            "--message",
             &message,
-        ])
+            false,
+            &server_address,
+        ))
+        .spawn()
+        .expect("failed to spawn client");
+
+    let client_status = wait_timeout(&mut client, TIMEOUT).expect("client timed out");
+    assert!(
+        client_status.success(),
+        "client exited with: {client_status}"
+    );
+
+    let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
+    assert!(
+        server_status.success(),
+        "server exited with: {server_status}"
+    );
+}
+
+#[test]
+fn very_big_data() {
+    let server_port = free_port();
+    let server_address = format!("127.0.0.1:{server_port}");
+    let client_port = free_port();
+    let message_path = "/home/aiv/dev/ubass-rs/tests/very_big_data.txt";
+
+    let mut server = std::process::Command::new(BIN_PATH)
+        .args(prep_server_args(
+            &server_port.to_string(),
+            "very big",
+            message_path,
+            true,
+            false,
+        ))
+        .spawn()
+        .expect("failed to spawn server");
+
+    // give the server time to bind and start listening
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut client = std::process::Command::new(BIN_PATH)
+        .args(prep_client_args(
+            &client_port.to_string(),
+            "very big",
+            message_path,
+            true,
+            &server_address,
+        ))
         .spawn()
         .expect("failed to spawn client");
 
