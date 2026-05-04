@@ -80,7 +80,7 @@ pub async fn init(port: u16, sender: InboundSender) -> ErrResult {
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod test {
-    use std::{sync::atomic::AtomicU16, time::Duration};
+    use std::{net::SocketAddrV4, sync::atomic::AtomicU16, time::Duration};
 
     use aes_gcm_siv::aead::generic_array::typenum::type_operators;
     use tokio::{net::UdpSocket, task::JoinHandle};
