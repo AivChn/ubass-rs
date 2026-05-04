@@ -1,5 +1,6 @@
 use std::error;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::Arc;
 
 use crate::prelude::*;
 use crate::transport::types::InboundSender;
@@ -13,37 +14,9 @@ use super::types::{MAX_PACKET_SIZE, ReceivedPacket};
 
 const MAX_ALLOWED_FAILS: u32 = 10;
 
-pub async fn init(port: u16, sender: InboundSender) -> ErrResult {
-    debug_assert!(
-        !matches!(port, 1..=1024),
-        "Invariant broken while initializing inbound transport: \
-             system port was used ({port})"
-    );
-
-    let Ok(socket) = Socket::new(Domain::IPV4, Type::DGRAM, None) else {
-        _ = send_to_processing_layer(sender, Err(TransportError::FailedToBind.into())).await;
-        return Err(TransportError::FailedToBind.into());
-    };
-    assert!(socket.set_reuse_address(true).is_ok());
-    assert!(socket.set_reuse_port(true).is_ok());
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-    let addr = socket2::SockAddr::from(addr);
-
-    if socket.bind(&addr).is_err() {
-        _ = send_to_processing_layer(sender, Err(TransportError::FailedToBind.into())).await;
-        return Err(TransportError::FailedToBind.into());
-    }
-
-    let std_socket: std::net::UdpSocket = socket.into();
-    _ = std_socket.set_nonblocking(true);
-    let Ok(socket) = UdpSocket::from_std(std_socket) else {
-        _ = send_to_processing_layer(sender, Err(TransportError::FailedToBind.into())).await;
-        return Err(TransportError::FailedToBind.into());
-    };
-
+pub async fn init(socket: Arc<UdpSocket>, sender: InboundSender) -> ErrResult {
     let mut fail_count = 0u32;
 
-    info!("listening on {port}");
     loop {
         let mut buffer = vec![0u8; MAX_PACKET_SIZE];
 
@@ -80,7 +53,11 @@ pub async fn init(port: u16, sender: InboundSender) -> ErrResult {
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod test {
-    use std::{net::SocketAddrV4, sync::atomic::AtomicU16, time::Duration};
+    use std::{
+        net::SocketAddrV4,
+        sync::{Arc, atomic::AtomicU16},
+        time::Duration,
+    };
 
     use aes_gcm_siv::aead::generic_array::typenum::type_operators;
     use tokio::{net::UdpSocket, task::JoinHandle};
@@ -90,7 +67,7 @@ mod test {
         error::{ChannelError, ErrResult, Error},
         packet_processor::types::InboundReceiver,
         transport::{
-            inbound,
+            bind_listen_socket, inbound,
             types::{InboundSender, OutboundReceiver, ReceivedPacket},
         },
         utils::PacketProcessingMessage,
@@ -102,16 +79,17 @@ mod test {
         PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn init_inbound(port: u16) -> (InboundReceiver, JoinHandle<ErrResult>) {
+    fn init_inbound(socket: Arc<UdpSocket>) -> (InboundReceiver, JoinHandle<ErrResult>) {
         let (sender, receiver): (InboundSender, _) = tokio::sync::mpsc::channel(1);
 
-        (receiver, tokio::spawn(inbound::init(port, sender)))
+        (receiver, tokio::spawn(inbound::init(socket, sender)))
     }
 
     #[tokio::test]
     async fn get_packet() {
         let port = next_port();
-        let (mut receiver, handle) = init_inbound(port);
+        let socket = Arc::new(bind_listen_socket(port).unwrap());
+        let (mut receiver, handle) = init_inbound(socket);
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         assert!(
             socket
@@ -134,16 +112,10 @@ mod test {
     }
 
     #[tokio::test]
-    async fn invalid_port() {
-        let port = 1;
-        let (_, handle) = init_inbound(port);
-        assert!(handle.await.is_err());
-    }
-
-    #[tokio::test]
     async fn error_on_channel_close() {
         let port = next_port();
-        let (mut receiver, handle) = init_inbound(port);
+        let socket = Arc::new(bind_listen_socket(port).unwrap());
+        let (mut receiver, handle) = init_inbound(socket);
         receiver.close();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         assert!(

@@ -2,9 +2,16 @@ mod inbound;
 mod outbound;
 pub mod types;
 
+use std::{
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
+    sync::Arc,
+};
+
 use crate::{prelude::*, transport::types::InboundSender};
 
-use tracing::{debug, error, instrument};
+use socket2::{Domain, Socket, Type};
+use tokio::{net::UdpSocket, sync::oneshot};
+use tracing::{debug, error, info, instrument};
 use types::TransportChannels;
 
 /// initialize the transport layer
@@ -18,10 +25,21 @@ use types::TransportChannels;
 pub async fn init(
     port: u16,
     TransportChannels { receiver, sender }: TransportChannels,
+    signal: oneshot::Sender<ErrResult>,
 ) -> ErrResult {
-    let mut recv_handle = tokio::spawn(inbound::init(port, sender.clone()));
-    let mut send_handle = tokio::spawn(outbound::init(receiver));
+    let listening_socket = match bind_listen_socket(port) {
+        None => {
+            sender.send(Err(TransportError::FailedToBind.into())).await;
+            return Err(TransportError::FailedToBind.into());
+        }
+        Some(s) => Arc::new(s),
+    };
+
+    info!("listening on {port}");
+    let mut recv_handle = tokio::spawn(inbound::init(listening_socket.clone(), sender.clone()));
+    let mut send_handle = tokio::spawn(outbound::init(receiver, listening_socket.clone()));
     debug!("initializing the transport layer");
+    signal.send(Ok(()));
 
     tokio::select! {
         res = &mut recv_handle, if !recv_handle.is_finished() => {
@@ -57,4 +75,25 @@ async fn send_to_processing_layer(
         error!("failed to send on Inbound channel from Transport to Packet Processor");
         ChannelError::ChannelFailed(Inbound, Layer::Transport).into()
     })
+}
+
+fn bind_listen_socket(port: u16) -> Option<UdpSocket> {
+    debug_assert!(
+        !matches!(port, 1..=1024),
+        "Invariant broken while initializing inbound transport: \
+             system port was used ({port})"
+    );
+
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).ok()?;
+
+    assert!(socket.set_reuse_address(true).is_ok());
+    assert!(socket.set_reuse_port(true).is_ok());
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let addr = socket2::SockAddr::from(addr);
+
+    socket.bind(&addr).ok()?;
+
+    let std_socket: std::net::UdpSocket = socket.into();
+    _ = std_socket.set_nonblocking(true);
+    UdpSocket::from_std(std_socket).ok()
 }
