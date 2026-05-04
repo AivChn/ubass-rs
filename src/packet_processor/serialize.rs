@@ -101,33 +101,6 @@ impl Serialize for Vec<u8> {
     }
 }
 
-impl<T: Serialize + Default + PartialEq> Serialize for Option<T> {
-    fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
-        if buf.len() < self.sized() {
-            Err(())
-        } else {
-            match self {
-                None => Ok(T::default().serialize(buf)?),
-                Some(value) => Ok(value.serialize(buf)?),
-            }
-        }
-    }
-
-    fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
-        let value = T::deserialize(bytes)?;
-
-        if value == T::default() {
-            Ok(None)
-        } else {
-            Ok(Some(value))
-        }
-    }
-
-    fn sized(&self) -> usize {
-        size_of::<T>()
-    }
-}
-
 impl<const N: usize> Serialize for [u8; N] {
     fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
         if buf.len() < N {
