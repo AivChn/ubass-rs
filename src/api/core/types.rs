@@ -17,12 +17,14 @@ use crate::{
 };
 use core::result::Result;
 use std::{
+    marker::PhantomData,
     net::SocketAddr,
     sync::{Arc, Weak, atomic::AtomicBool},
     thread::JoinHandle,
 };
 
 use aes_gcm_siv::Error;
+use futures::Stream;
 use tokio::{
     runtime::Runtime,
     sync::{
@@ -491,67 +493,6 @@ impl api::types::Connection for Connection {
     async fn close(self) {
         let api: Arc<ApiInner> = o_unwrap_or_return!(self.api.upgrade());
         api.close_session(self.session_id);
-    }
-}
-
-#[derive(Debug)]
-pub struct RequestedStream {
-    api: Weak<ApiInner>,
-    track_id: Box<[u8]>,
-    session: SessionId,
-    stream_size: usize,
-    connection: Connection,
-    update: watch::Receiver<StreamMessage>,
-}
-
-impl api::types::RequestedStream for RequestedStream {
-    type Stream = OutputStream;
-    type Error = ConnectionError;
-
-    fn track_id(&self) -> &[u8] {
-        self.track_id.as_ref()
-    }
-
-    async fn reject(self, reason: impl Into<String>) -> Result<(), Self> {
-        todo!()
-    }
-
-    async fn approve_and_ready(self) -> core::result::Result<Self::Stream, Self::Error> {
-        todo!()
-    }
-
-    async fn approve_if_and_ready(
-        self,
-        f: impl FnOnce(&[u8]) -> bool,
-        reject_reason: impl Into<String>,
-    ) -> Option<core::result::Result<Self::Stream, Self::Error>> {
-        if f(self.track_id.as_ref()) {
-            Some(self.approve_and_ready().await)
-        } else {
-            self.reject(reject_reason).await;
-            None
-        }
-    }
-}
-
-pub struct PendingStream {
-    api: Weak<ApiInner>,
-    session: SessionId,
-    stream_size: usize,
-    connection: Connection,
-    update: watch::Receiver<StreamMessage>,
-}
-
-impl api::types::PendingStream for PendingStream {
-    type Stream = InputStream;
-    type Error = ConnectionError;
-
-    async fn ready(self) -> core::result::Result<Self::Stream, Self::Error> {
-        todo!()
-    }
-
-    async fn discard(self) -> core::result::Result<(), Self::Error> {
-        todo!()
     }
 }
 
