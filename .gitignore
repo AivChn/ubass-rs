@@ -10,3 +10,4 @@ cargo.lock
 /logs
 target/
 **/target/
+/integration/Cargo.lock
