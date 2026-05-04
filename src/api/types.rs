@@ -201,23 +201,32 @@ impl ReadableBuffer {
 pub trait PendingStream {
     type Stream: Stream;
     type Error: std::error::Error;
+    type OwningConnection: Connection;
 
-    async fn ready(self) -> core::result::Result<Self::Stream, Self::Error>;
+    async fn ready(
+        self,
+        connection: Self::OwningConnection,
+    ) -> core::result::Result<Self::Stream, (Self::Error, Self::OwningConnection)>;
     async fn discard(self) -> core::result::Result<(), Self::Error>;
 }
 
 pub trait RequestedStream: Sized {
     type Stream: Stream;
     type Error: std::error::Error;
+    type OwningConnection: Connection;
 
     fn track_id(&self) -> &[u8];
     async fn reject(self, reason: impl Into<String>) -> Result<(), Self>;
-    async fn approve_and_ready(self) -> core::result::Result<Self::Stream, Self::Error>;
+    async fn approve_and_ready(
+        self,
+        connection: Self::OwningConnection,
+    ) -> core::result::Result<Self::Stream, (Self::Error, Self::OwningConnection)>;
     async fn approve_if_and_ready(
         self,
         f: impl FnOnce(&[u8]) -> bool,
         reject_reason: impl Into<String>,
-    ) -> Option<core::result::Result<Self::Stream, Self::Error>>;
+        connection: Self::OwningConnection,
+    ) -> Option<core::result::Result<Self::Stream, (Self::Error, Self::OwningConnection)>>;
 }
 
 pub trait Stream {
