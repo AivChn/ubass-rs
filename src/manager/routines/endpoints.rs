@@ -53,10 +53,9 @@ pub fn open(
 
     let (mos, mor): (SyncSender<core::result::Result<(), ApiErrors>>, _) = sync_channel(1);
 
-    // ==================== manager =======================
     let manager_handle = std::thread::spawn(move || {
         let thread_name = "Manager";
-        let runtime = RuntimeBuilder::new_current_thread()
+        let runtime = RuntimeBuilder::new_multi_thread()
             .enable_all()
             .thread_name(thread_name)
             .build()

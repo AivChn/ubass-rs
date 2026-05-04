@@ -22,6 +22,8 @@ pub enum ApiErrors {
     InvalidAppId,
     #[error("Cannot use port {0}, already in use.")]
     PortAlreadyInUse(u16),
+    #[error("Failed to open the protocol")]
+    FailedToOpen,
     #[error("Failed to build runtime: {0:?}")]
     FailedToBuildRuntime(io::Error),
     #[error("thread {0} failed at some point.")]

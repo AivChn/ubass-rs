@@ -1,5 +1,7 @@
 #![allow(clippy::wildcard_imports)]
 
+use std::net::SocketAddr;
+
 use crate::{
     get_state,
     manager::{self, EncryptionMonitor, FingerprintMonitor, packets::*},
@@ -18,8 +20,8 @@ const SECONDARY_TYPE_OFFSET: usize = 5;
 
 pub async fn init(
     InboundChannels {
-        mut t_receiver,
-        p_sender,
+        from_transport: mut t_receiver,
+        to_manager: p_sender,
     }: InboundChannels,
     encryption_monitor: EncryptionMonitor,
     fingerprint_monitor: FingerprintMonitor,
@@ -87,7 +89,7 @@ async fn handle_packet(
     let packet_type =
         r_unwrap_or_return!(PacketType::deserialize(&packet.data[PACKET_TYPE_OFFSET..]));
 
-    let ready_packet = r_unwrap_or_return!(
+    let mut ready_packet = r_unwrap_or_return!(
         deserialize_and_decrypt(
             packet_type,
             packet.data,
@@ -96,6 +98,14 @@ async fn handle_packet(
         )
         .await
     );
+
+    if let Packet::KeepAlivePacket(keep_alive_packet) = &mut ready_packet {
+        let SocketAddr::V4(addr) = packet.src_addr else {
+            // TODO: figure out how to handle this case gracefully
+            unimplemented!()
+        };
+        keep_alive_packet.address.replace(addr);
+    }
 
     send_up(
         Ok(ManagerMessage::Packet(ready_packet.wrap(packet.src_addr))),
@@ -106,7 +116,7 @@ async fn handle_packet(
 
 async fn deserialize_and_decrypt(
     packet_type: PacketType,
-    data: Vec<u8>,
+    mut data: Vec<u8>,
     encryption_monitor: EncryptionMonitor,
     fingerprint_monitor: FingerprintMonitor,
 ) -> core::result::Result<Packet, ()> {
@@ -129,10 +139,14 @@ async fn deserialize_and_decrypt(
         }
 
         PacketType::Ack => {
-            // AckPackets complete the handshake — the session cipher and fingerprint table may
-            // not be established yet when they arrive, so authentication is deferred to the manager.
             let packet = Packet::AckPacket(Box::new(AckPacket::deserialize(&data)?));
             Ok(packet)
+        }
+
+        PacketType::KeepAlive => {
+            authenticate(&mut data, session_id, encryption_monitor).await?;
+            let packet = Box::new(KeepAlivePacket::deserialize(&data)?);
+            Ok(Packet::KeepAlivePacket(packet))
         }
 
         PacketType::HandshakeAck => Ok(Packet::HandshakeAckPacket(Box::new(

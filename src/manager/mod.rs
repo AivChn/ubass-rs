@@ -6,10 +6,7 @@ mod routines;
 pub mod state;
 pub mod types;
 
-use std::{
-    sync::{OnceLock, mpsc as std_mpsc},
-    thread::JoinHandle,
-};
+use std::sync::{OnceLock, mpsc as std_mpsc};
 
 use crate::{
     lock_read,
@@ -18,12 +15,17 @@ use crate::{
         packets::SessionId,
         state::{Port, ProtocolState},
     },
-    packet_processor::{self},
+    packet_processor::{self, types::PacketProcessorChannels},
     prelude::*,
     transport::{self, types::TransportChannels},
 };
 
-use tokio::{runtime::Builder as RuntimeBuilder, sync::mpsc, time::Instant};
+use tokio::{
+    runtime::Builder as RuntimeBuilder,
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+    time::Instant,
+};
 
 pub use routines::endpoints;
 pub use state::{AppId, EncryptionMonitor, FingerprintMonitor, PendingAckMonitor};
@@ -88,7 +90,9 @@ pub async fn init(
     _ = PROTOCOL_EPOCH.set(Instant::now());
 
     let (transport_handle, processor_handle) =
-        setup_layers(port, processor_to_manager, processor_from_manager)?;
+        setup_layers(port, processor_to_manager, processor_from_manager)
+            .await
+            .map_err(|_| ApiErrors::FailedToOpen)?;
 
     get_state!()
         .set_handles(transport_handle, processor_handle)
@@ -134,11 +138,11 @@ pub async fn session_exists(session_id: SessionId) -> bool {
     lock_read!(get_state!().connections).contains_key(&session_id)
 }
 
-fn setup_layers(
+async fn setup_layers(
     port: u16,
     processor_to_manager: packet_processor::types::InboundSender,
     processor_from_manager: packet_processor::types::OutboundReceiver,
-) -> core::result::Result<(JoinHandle<()>, JoinHandle<()>), ApiErrors> {
+) -> core::result::Result<(JoinHandle<ErrResult>, JoinHandle<ErrResult>), Error> {
     // create all the channels for the layers
     let (transport_to_processor, processor_from_transport): (transport::types::InboundSender, _) =
         mpsc::channel(CHANNEL_BUFFER_SIZE);
@@ -149,77 +153,37 @@ fn setup_layers(
 
     // ============= packet_processor =======================
     // create psuedo oneshot channel to get errors without disrupting the thread if succeeded
-    let (pos, por): (std_mpsc::SyncSender<core::result::Result<(), ApiErrors>>, _) =
-        std_mpsc::sync_channel(1);
+    let (pos, por) = oneshot::channel::<ErrResult>();
 
-    // initialize the processor layer
-    let processor_handle = std::thread::spawn(move || {
-        let runtime = RuntimeBuilder::new_current_thread()
-            .enable_all()
-            .thread_name("Packet Processor")
-            .build()
-            .map_err(ApiErrors::FailedToBuildRuntime);
+    let processor_handle = tokio::spawn(packet_processor::init(
+        PacketProcessorChannels {
+            from_manager: processor_from_manager,
+            to_manager: processor_to_manager,
+            from_transport: processor_from_transport,
+            to_transport: processor_to_transport,
+        },
+        encryption_monitor(),
+        fingerprint_monitor(),
+        pending_ack_monitor(),
+        pos,
+    ));
 
-        match runtime {
-            Err(e) => _ = pos.send(Err(e)),
-            Ok(runtime) => {
-                _ = pos.send(Ok(()));
-                runtime.block_on(async {
-                    _ = packet_processor::init(
-                        processor_from_manager,
-                        processor_to_manager,
-                        processor_from_transport,
-                        processor_to_transport,
-                        encryption_monitor(),
-                        fingerprint_monitor(),
-                        pending_ack_monitor(),
-                    )
-                    .await;
-                });
-            }
-        }
-    });
-
-    // wait on response from channel and return if error
-    por.recv().expect(
-        "Invariant broken while receiving on sync oneshot channel for packet processor:\
-                            Channel closed before sending",
-    )?;
+    por.await
+        .map_err(|_| Error::Task(TaskError::TaskFailed))??;
 
     // ============= transport =======================
-    let (tos, tor): (std_mpsc::SyncSender<core::result::Result<(), ApiErrors>>, _) =
-        std_mpsc::sync_channel(1);
+    let (tos, tor) = oneshot::channel::<ErrResult>();
 
-    // initialize the transport layer
-    let transport_handle = std::thread::spawn(move || {
-        let runtime = RuntimeBuilder::new_current_thread()
-            .enable_all()
-            .thread_name("Transport")
-            .build()
-            .map_err(ApiErrors::FailedToBuildRuntime);
+    let transport_handle = tokio::spawn(transport::init(
+        port,
+        TransportChannels {
+            receiver: transport_from_processor,
+            sender: transport_to_processor,
+        },
+        tos,
+    ));
 
-        match runtime {
-            Err(e) => _ = tos.send(Err(e)),
-            Ok(runtime) => {
-                _ = tos.send(Ok(()));
-                _ = runtime.block_on(async {
-                    transport::init(
-                        port,
-                        TransportChannels {
-                            receiver: transport_from_processor,
-                            sender: transport_to_processor,
-                        },
-                    )
-                    .await
-                });
-            }
-        }
-    });
-
-    tor.recv().expect(
-        "Invariant broken while receiving on sync oneshot channel for transport:\
-                            Channel closed before sending",
-    )?;
-
+    tor.await
+        .map_err(|_| Error::Task(TaskError::TaskFailed))??;
     Ok((transport_handle, processor_handle))
 }

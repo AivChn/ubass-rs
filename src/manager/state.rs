@@ -1,11 +1,11 @@
-#![allow(private_interfaces)]
 use aes_gcm_siv::Aes256GcmSiv;
 use derive_more::{Deref, Display};
 use reed_solomon_simd::engine::tables;
 use tokio::{
     select,
     sync::{Mutex, RwLock, mpsc, oneshot, watch},
-    time::interval,
+    task::JoinHandle,
+    time::{interval, sleep as tokio_sleep},
 };
 use tracing::{debug, instrument};
 use x25519_dalek::EphemeralSecret;
@@ -16,8 +16,8 @@ use crate::{
     manager::{
         CHANNEL_BUFFER_SIZE, STATE,
         packets::{
-            BatchID, BytePosition, ByteRange, DataPacket, FECInfo, MAX_PAYLOAD_LENGTH, Options,
-            Packet, PacketFingerprint, SessionId,
+            BatchID, BytePosition, ByteRange, DataPacket, FECInfo, KeepAlivePacket,
+            MAX_PAYLOAD_LENGTH, Options, Packet, PacketFingerprint, SessionId,
         },
         types::{ForeignTimestamp, ManagerToProcessor},
     },
@@ -29,19 +29,19 @@ use crate::{
 use core::panic;
 use std::{
     collections::{HashSet, VecDeque, hash_map::Entry},
-    fmt::Display,
+    fmt::{Display, format},
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    thread::JoinHandle,
     time::Duration,
 };
 
 const PACKET_DISCARD_TIME_MS: u64 = 7 * 1000;
 const SEND_TIMEOUT: u64 = 25;
 const PACKET_COUNT_PER_BATCH: usize = 5;
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(500);
 
 macro_rules! sessions_state_fields {
     ($($name:ident($key:ty => $value:ty)),*) => {
@@ -355,6 +355,13 @@ impl ConnectionStates {
             })
         }
     }
+
+    pub async fn update_address(&self, new: SocketAddr) {
+        let (ConnectionStates::Established(box EstablishedState { address, .. })
+        | ConnectionStates::Handshake { address, .. }) = self;
+
+        *lock_write!(address) = new;
+    }
 }
 
 pub struct ProtocolState {
@@ -392,15 +399,13 @@ impl ProtocolState {
     }
 
     /// Joins both layer threads.
-    /// **DANGEROUS**: This function blocks the entire async runtime, only use if the protocol is
-    /// shutting down, when no other tasks need to be done.
     pub async fn join_layers(&mut self) {
         let handles = o_unwrap_or_return!(lock!(self.handles).take().panic_in_debug(
             "Invariant broken while joining the layer threads: \
             function was called more than once",
         ));
 
-        handles.blocking_join();
+        handles.join();
     }
 
     pub fn app_id(&self) -> AppId {
@@ -415,7 +420,11 @@ impl ProtocolState {
         lock_read!(self.connections).contains_key(&session_id)
     }
 
-    pub async fn set_handles(&self, transport: JoinHandle<()>, processor: JoinHandle<()>) {
+    pub async fn set_handles(
+        &self,
+        transport: JoinHandle<ErrResult>,
+        processor: JoinHandle<ErrResult>,
+    ) {
         _ = lock!(self.handles).insert(LayerHandles {
             transport,
             processor,
@@ -752,6 +761,60 @@ impl ProtocolState {
             *state = SessionStates::Up;
         }
     }
+
+    pub async fn update_address(
+        &self,
+        session_id: SessionId,
+        new: SocketAddr,
+    ) -> Option<SocketAddr> {
+        let curr = {
+            let lock = lock_read!(self.connections);
+            let (ConnectionStates::Handshake { address, .. }
+            | ConnectionStates::Established(box EstablishedState { address, .. })) =
+                lock.get(&session_id)?;
+            let curr = *lock_read!(address);
+
+            (new != curr).then_some(())?;
+
+            curr
+        };
+
+        get_state!()
+            .address_session
+            .move_session(curr, session_id, new)
+            .await
+            .panic_in_debug(&format!("Invariant broken in `update_address`:\
+                session ID {session_id} was in the connections table, but its current address ({curr})\
+                could not be found"))?;
+
+        lock_write!(get_state!().connections)
+            .get_mut(&session_id)?
+            .update_address(new);
+
+        Some(new)
+    }
+
+    pub async fn send_keep_alive_on_session(
+        &self,
+        session_id: SessionId,
+        sender: ManagerToProcessor,
+    ) {
+        loop {
+            tokio_sleep(KEEP_ALIVE_INTERVAL).await;
+            let addr = o_unwrap_or_return!(
+                get_state!()
+                    .connections
+                    .address(session_id)
+                    .await
+                    .log_debug(&format!(
+                        "session with ID {session_id} closed, stopping keepalive"
+                    ))
+            );
+            Box::new(KeepAlivePacket::new(Options::none(), session_id))
+                .send(sender.clone(), addr)
+                .await;
+        }
+    }
 }
 
 async fn retransmit_action(
@@ -876,6 +939,20 @@ impl AddressSessionIdTable {
             .copied()
     }
 
+    pub async fn move_session(
+        &self,
+        source_address: SocketAddr,
+        session_id: SessionId,
+        destination_address: SocketAddr,
+    ) -> Option<SocketAddr> {
+        _ = self.remove(source_address, session_id).await?;
+        lock_write!(self)
+            .entry(destination_address)
+            .and_modify(|v| v.push(session_id))
+            .or_insert(vec![session_id]);
+        Some(destination_address)
+    }
+
     pub async fn remove(&self, address: SocketAddr, session_id: SessionId) -> Option<SessionId> {
         let mut lock = lock_write!(self);
         let v = lock.get_mut(&address)?;
@@ -963,12 +1040,12 @@ pub enum AppOptionFlag {
 }
 
 struct LayerHandles {
-    transport: JoinHandle<()>,
-    processor: JoinHandle<()>,
+    transport: JoinHandle<ErrResult>,
+    processor: JoinHandle<ErrResult>,
 }
 
 impl LayerHandles {
-    fn new(transport: JoinHandle<()>, processor: JoinHandle<()>) -> Self {
+    fn new(transport: JoinHandle<ErrResult>, processor: JoinHandle<ErrResult>) -> Self {
         Self {
             transport,
             processor,
@@ -976,11 +1053,14 @@ impl LayerHandles {
     }
 
     /// Joins both layers
-    /// **DANGEROUS**: This function blocks the entire async runtime, only use if the protocol is
-    /// shutting down, when no other tasks need to be done.
-    fn blocking_join(self) {
-        _ = self.transport.join();
-        _ = self.processor.join();
+    async fn join(self) -> ErrResult {
+        self.processor
+            .await
+            .map_err(|_| Error::Task(TaskError::TaskFailed))??;
+        self.transport
+            .await
+            .map_err(|_| Error::Task(TaskError::TaskFailed))??;
+        Ok(())
     }
 }
 

@@ -16,15 +16,22 @@ pub type InboundSender = Sender<Result<ManagerMessage>>;
 
 /// packages the channels needed for the inbound task
 pub struct InboundChannels {
-    pub t_receiver: InboundReceiver,
-    pub p_sender: InboundSender,
+    pub from_transport: InboundReceiver,
+    pub to_manager: InboundSender,
 }
 
 /// packages the channels needed for the outbound task
 pub struct OutboundChannels {
-    pub t_sender: OutboundSender,
-    pub p_sender: InboundSender,
-    pub p_receiver: OutboundReceiver,
+    pub to_transport: OutboundSender,
+    pub to_manager: InboundSender,
+    pub from_manager: OutboundReceiver,
+}
+
+pub struct PacketProcessorChannels {
+    pub from_manager: OutboundReceiver,
+    pub to_manager: InboundSender,
+    pub from_transport: InboundReceiver,
+    pub to_transport: OutboundSender,
 }
 
 /// Represents a serialized packet with minimal data necessary for the transport layer.
