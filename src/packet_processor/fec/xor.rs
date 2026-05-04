@@ -27,10 +27,10 @@ impl BitXorAssign for FECData {
     }
 }
 
-/// impl `^` for `FECData`
 impl BitXor for FECData {
     type Output = FECData;
 
+    /// impl `^` for `FECData`
     fn bitxor(mut self, rhs: Self) -> Self::Output {
         self ^= rhs;
         self
@@ -40,7 +40,7 @@ impl BitXor for FECData {
 #[allow(clippy::doc_markdown)]
 /// Represents a sinle inbound batch
 ///
-/// `product`: The result of XORing all received packets other than parity.
+/// `product`: The result of "XORing" all received packets other than parity.
 /// `parity`: The parity packet, if one was received.
 /// `batch_size`: const, the number of packets expected this batch.
 /// `packets_received`: number of packets received.
@@ -73,6 +73,8 @@ impl InboundBatchData {
                 & 1
                 == 0
         {
+            self.batch_mask[(data.fec_info.batch_pos / 128) as usize] |=
+                1 << (data.fec_info.batch_pos % 128);
             self.product ^= data.data;
             self.packets_received += 1;
             true
