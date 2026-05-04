@@ -9,17 +9,18 @@ use std::sync::LazyLock;
 
 use crate::packet_processor::serialize::Serialize;
 
-use crate::manager::packets::{BatchID, DataPacket, FECInfo, MAX_PAYLOAD_LENGTH};
+use crate::manager::packets::{BatchID, BytePosition, DataPacket, FECInfo, MAX_PAYLOAD_LENGTH};
 use crate::manager::packets::{ParityPacket, SessionId};
 use crate::transport::types::ReceivedPacket;
 
+use derive_more::Deref;
 use tokio::sync::OnceCell;
 
 /// alias for the max size of the payload
 const FEC_DATA_SIZE: usize = ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH;
 
 /// Wrapper for the data this module will work on
-#[derive(Debug, Clone)]
+#[derive(Deref, Debug, Clone)]
 #[repr(align(32))]
 struct FECData(Box<[u8; FEC_DATA_SIZE]>);
 
@@ -47,8 +48,8 @@ impl Default for FECData {
 /// Represents a recovered packet, includes all necessary data for full recovery
 #[derive(Debug)]
 pub struct RecoverdPacket {
-    byte_range_start: u32,
-    payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
+    pub byte_range_start: BytePosition,
+    pub payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
 }
 
 #[derive(Debug)]
@@ -62,7 +63,9 @@ impl TryFrom<&[u8]> for RecoverdPacket {
             Err(NotARecoveredPacket)
         } else {
             Ok(RecoverdPacket {
-                byte_range_start: <u32>::deserialize(&value[..4]).expect("Exact size"),
+                byte_range_start: BytePosition(
+                    <u32>::deserialize(&value[..4]).expect("Exact size"),
+                ),
                 payload: Box::new(
                     <[u8; MAX_PAYLOAD_LENGTH]>::try_from(&value[4..4 + MAX_PAYLOAD_LENGTH])
                         .expect("Exact size"),
@@ -74,7 +77,8 @@ impl TryFrom<&[u8]> for RecoverdPacket {
 
 impl From<FECData> for RecoverdPacket {
     fn from(value: FECData) -> Self {
-        let byte_range_start = <u32>::deserialize(&value.0[..4]).expect("Size is exact");
+        let byte_range_start =
+            BytePosition(<u32>::deserialize(&value.0[..4]).expect("Size is exact"));
         let payload: Box<[u8; MAX_PAYLOAD_LENGTH]> = Box::new(
             value.0[4..]
                 .try_into()
@@ -143,6 +147,9 @@ pub trait FECCompatible: Into<FECPacket> {}
 impl FECCompatible for DataPacket {}
 impl FECCompatible for ParityPacket {}
 
+#[cfg(all(feature = "fec_rs", feature = "fec_xor"))]
+compile_error!("cannot enable both fec_rs and fec_xor, disable fec_xor to use Reed-Solomon");
+
 #[cfg(feature = "fec_xor")]
 type FECImpl = xor::Xor;
 
@@ -156,8 +163,7 @@ pub async fn sent(packet: impl FECCompatible) -> Option<Vec<ParityPacket>> {
 }
 
 pub async fn received(packet: impl FECCompatible) -> bool {
-    let packet: FECPacket = packet.into();
-    FEC.received(packet).await
+    FEC.received(packet.into()).await
 }
 
 pub async fn recover(batch_id: BatchID, session_id: SessionId) -> Option<Recovered> {

@@ -1,11 +1,12 @@
 use crate::packet_processor::{inbound, outbound};
-use crate::prelude::*;
+use crate::{lock, prelude::*};
 
 use std::collections::HashMap;
 use std::mem::transmute;
 use std::ops::{BitXor, BitXorAssign};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use std::vec;
 
 use tokio::sync::Mutex;
 use tokio::time::Instant;
@@ -44,11 +45,12 @@ impl BitXor for FECData {
 /// `parity`: The parity packet, if one was received.
 /// `batch_size`: const, the number of packets expected this batch.
 /// `packets_received`: number of packets received.
+#[derive(Debug, Clone)]
 struct InboundBatchData {
     product: FECData,
     parity: Option<FECData>,
     batch_size: u8,
-    packets_received: u8,
+    data_received: u8,
     batch_mask: [u128; 2],
 }
 
@@ -60,14 +62,14 @@ impl InboundBatchData {
             product: FECData::default(),
             parity: None,
             batch_size,
-            packets_received: 0,
+            data_received: 0,
             batch_mask: [0; 2],
         }
     }
 
     /// Add a packet to the FEC batch. Returns `true` if the packet wasnt already in the batch
     fn add(&mut self, data: FECPacket) -> bool {
-        if self.packets_received < self.batch_size
+        if self.data_received < self.batch_size
             && (self.batch_mask[(data.fec_info.batch_pos / 128) as usize]
                 >> (data.fec_info.batch_pos % 128))
                 & 1
@@ -76,7 +78,7 @@ impl InboundBatchData {
             self.batch_mask[(data.fec_info.batch_pos / 128) as usize] |=
                 1 << (data.fec_info.batch_pos % 128);
             self.product ^= data.data;
-            self.packets_received += 1;
+            self.data_received += 1;
             true
         } else {
             false
@@ -90,7 +92,6 @@ impl InboundBatchData {
             false
         } else {
             self.parity = Some(parity);
-            self.packets_received += 1;
             true
         }
     }
@@ -98,7 +99,7 @@ impl InboundBatchData {
     /// Recover a packet from this batch. This function returns `Some(ParityPacket)` if there are
     /// enough packets in the batch and the parity packet exists. Otherwise returns `None`
     fn recover(self) -> Option<FECData> {
-        if self.packets_received >= self.batch_size
+        if self.data_received == self.batch_size - 1
             && let Some(parity) = self.parity
         {
             Some(self.product ^ parity)
@@ -118,7 +119,7 @@ impl From<InboundBatchData> for Arc<Mutex<InboundBatchData>> {
 #[allow(clippy::doc_markdown)]
 /// Represents an outbound batch
 ///
-/// `product`: the result of XORing all the received packets so far.
+/// `product`: the result of "XORing" all the received packets so far.
 /// `batch_size`: const, the number of packets expected this batch.
 /// `current_size`: how many packets are currently in the batch.
 struct OutboundBatchData {
@@ -216,7 +217,7 @@ impl Xor {
             let fec_info = FECInfo::new(packet.fec_info.batch_size, 0, 1);
             let session_id = packet.session_id;
 
-            Some(vec![*ParityPacket::new(
+            Some(vec![ParityPacket::new(
                 opts,
                 packet.batch_id,
                 fec_info,
@@ -229,7 +230,7 @@ impl Xor {
     }
 
     /// Handled received packets (inbound)
-    /// returns the number of packets that can be recovered. The return value is a `u8` for parity with the Reed-Solomon implementation.
+    /// returns true if packets can be recovered.
     pub async fn received(&self, packet: FECPacket) -> bool {
         let entry = {
             let mut guard = self.inbound.lock().await;
@@ -239,11 +240,14 @@ impl Xor {
                 .clone()
         };
 
+        let mut entry = lock!(entry);
         if packet.is_parity {
-            entry.lock().await.parity(FECData(packet.data.0))
+            entry.parity(packet.data);
         } else {
-            entry.lock().await.add(packet)
+            entry.add(packet);
         }
+
+        (entry.data_received == entry.batch_size - 1) && entry.parity.is_some()
     }
 
     /// Handles recovering a packet from an inbound batch.
@@ -262,13 +266,7 @@ impl Xor {
             guard.remove(&(batch_id, session_id))
         })?;
 
-        // get the parity, assuming it exists
-        let parity = {
-            let mut batch = entry.lock().await;
-            batch.parity.clone()
-        }
-        .expect("This function should not be called before parity is ready");
-
-        Some(vec![parity.into()])
+        // HACK: This shouldnt clone in the final implementation
+        lock!(entry).clone().recover().map(|e| vec![e.into()])
     }
 }

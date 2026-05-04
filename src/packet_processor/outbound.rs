@@ -123,7 +123,7 @@ async fn handle_packet(
     let processed = match packet.packet {
         // fec + encrypted
         // could be acked
-        Packet::DataPacket(packet) => {
+        Packet::DataPacket(mut packet) => {
             add_ack!(for DataPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             handle_monitor.dispatch(handle_fec(
@@ -136,7 +136,11 @@ async fn handle_packet(
             ));
 
             let session_id = packet.session_id;
-            process_encrypted(packet, session_id, addr, encryption_monitor).await
+            encryption::encrypt(packet.as_mut(), session_id, encryption_monitor).await;
+
+            let mut serialized;
+            serialize!(packet -> serialized);
+            processed!(serialized to addr as Data 1 times)
         }
 
         //encrypted
