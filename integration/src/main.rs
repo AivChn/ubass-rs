@@ -14,14 +14,12 @@ use ubass::utils::ConnectionEvent;
 #[derive(Subcommand, Clone)]
 enum Side {
     Server {
-        #[arg(short, long)]
-        reply: Option<String>,
+        #[arg(long)]
+        echo: bool,
     },
     Client {
         #[arg(short, long)]
         server_address: SocketAddr,
-        #[arg(short, long)]
-        message: String,
     },
 }
 
@@ -31,6 +29,10 @@ struct Args {
     port: u16,
     #[arg(short, long)]
     name: String,
+    #[arg(long)]
+    message: String,
+    #[arg(long)]
+    path: bool,
     #[command(subcommand)]
     side: Side,
 }
@@ -40,7 +42,7 @@ async fn main() -> Result<(), ()> {
     std::panic::set_hook(Box::new(|info| eprintln!("panicked in thread: {info}")));
     let args = Args::parse();
     match args.side {
-        Side::Server { reply } => {
+        Side::Server { echo } => {
             let file = fs::File::create(format!(
                 "/home/aiv/dev/ubass-rs/logs/server_{}.log",
                 args.name
@@ -52,12 +54,15 @@ async fn main() -> Result<(), ()> {
                 .pretty()
                 .with_ansi(false)
                 .init();
-            server(args.port, reply).await
+
+            let reply = (!echo).then_some(if args.path {
+                fs::read(args.message).unwrap()
+            } else {
+                args.message.into_bytes()
+            });
+            server(args.port, reply.map(Box::from)).await
         }
-        Side::Client {
-            server_address,
-            message,
-        } => {
+        Side::Client { server_address } => {
             let file = fs::File::create(format!(
                 "/home/aiv/dev/ubass-rs/logs/client_{}.log",
                 args.name
@@ -69,13 +74,17 @@ async fn main() -> Result<(), ()> {
                 .pretty()
                 .with_ansi(false)
                 .init();
-
+            let message = if args.path {
+                fs::read(args.message).unwrap()
+            } else {
+                args.message.into_bytes()
+            };
             client(args.port, server_address, message).await
         }
     }
 }
 
-async fn server(port: u16, reply: Option<String>) -> Result<(), ()> {
+async fn server(port: u16, reply: Option<Box<[u8]>>) -> Result<(), ()> {
     let api = open("e2e-server".to_string(), Some(port))
         .await
         .map_err(|_| println!("open"))?;
@@ -109,7 +118,7 @@ async fn server(port: u16, reply: Option<String>) -> Result<(), ()> {
     };
 
     let stream = match reply {
-        Some(reply) => connection.send(reply.into_bytes()).await.unwrap(),
+        Some(reply) => connection.send(reply).await.unwrap(),
         None => connection.send(id).await.unwrap(),
     };
 
@@ -118,7 +127,7 @@ async fn server(port: u16, reply: Option<String>) -> Result<(), ()> {
     Ok(())
 }
 
-async fn client(port: u16, server_addr: SocketAddr, message: String) -> Result<(), ()> {
+async fn client(port: u16, server_addr: SocketAddr, message: Vec<u8>) -> Result<(), ()> {
     let api = open("e2e-client".to_string(), Some(port))
         .await
         .map_err(|_| println!("api open"))?;
@@ -138,7 +147,7 @@ async fn client(port: u16, server_addr: SocketAddr, message: String) -> Result<(
     .map_err(|_| println!("ready failed!"))?;
 
     let mut buffer = vec![0; message.len()];
-    let mut id = message.clone().into_bytes();
+    let mut id = message.clone();
     id.truncate(MAX_PAYLOAD_LENGTH);
     let stream = timeout(
         Duration::from_secs(2),
@@ -153,7 +162,7 @@ async fn client(port: u16, server_addr: SocketAddr, message: String) -> Result<(
         .map_err(|_| println!("stream complete timeout"))?
         .map_err(|_| println!("stream complete error"))?;
 
-    assert_eq!(buffer, message.clone().into_bytes());
+    assert_eq!(buffer, message.clone());
     //print!("{} == {}", str::from_utf8(&buffer).unwrap(), &message);
     Ok(())
 }
