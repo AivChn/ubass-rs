@@ -5,6 +5,7 @@ use crate::{
     lock,
     manager::state::{ConnectionStates, EstablishedState, SessionStates, StreamState},
     match_or_return,
+    packet_processor::fec,
     prelude::*,
     utils::PanicInDebug,
 };
@@ -121,6 +122,21 @@ pub async fn received_ack_packet(packet: Box<AckPacket>) {
     get_state!().ack.acknowledge(packet.fingerprint).await;
 }
 
+pub async fn received_parity_packet(packet: ParityPacket, outbound_sender: ManagerToProcessor) {
+    get_state!()
+        .global_handle_monitor
+        .dispatch(update_last_activity(packet.session_id, packet.timestamp));
+
+    // TODO: handle state mismatch
+    let session_id = packet.session_id;
+    let batch_id = packet.batch_id;
+    if fec::received(packet).await {
+        let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id).await);
+        _ = o_unwrap_or_return!(lock_write!(get_state!().connections).get_mut(&session_id))
+            .recovered_packet(recovered);
+    }
+}
+
 pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerToProcessor) {
     get_state!()
         .global_handle_monitor
@@ -153,22 +169,31 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
 
     let fingerprint = PacketFingerprint::from(&packet);
     let session_id = packet.session_id;
-    if o_unwrap_or_return!(lock_write!(get_state!().connections).get_mut(&packet.session_id))
+    let batch_id = packet.batch_id;
+    match o_unwrap_or_return!(lock_write!(get_state!().connections).get_mut(&packet.session_id))
         .received_data_packet(packet)
-        .is_err_and(|e| matches!(e, Error::StateMismatch { .. }))
+        .await
     {
-        UnexpectedPacketErrorPacket::unexpected(
-            Options::none(),
-            session_id,
-            PacketType::Data,
-            SecondaryType::none(),
-            fingerprint,
-        )
-        .send(
-            outbound_sender,
-            o_unwrap_or_return!(get_state!().connections.address(session_id).await),
-        )
-        .await;
+        Ok(b) if b => {
+            let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id).await);
+            _ = o_unwrap_or_return!(lock_write!(get_state!().connections).get_mut(&session_id))
+                .recovered_packet(recovered);
+        }
+        Err(Error::StateMismatch { .. }) => {
+            UnexpectedPacketErrorPacket::unexpected(
+                Options::none(),
+                session_id,
+                PacketType::Data,
+                SecondaryType::none(),
+                fingerprint,
+            )
+            .send(
+                outbound_sender,
+                o_unwrap_or_return!(get_state!().connections.address(session_id).await),
+            )
+            .await;
+        }
+        _ => {}
     }
 }
 

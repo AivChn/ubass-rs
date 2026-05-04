@@ -408,7 +408,7 @@ impl ParityPacket {
         fec_info: FECInfo,
         session_id: SessionId,
         payload: impl Into<ParityPayload>,
-    ) -> Box<Self> {
+    ) -> Self {
         #[cfg(debug_assertions)]
         assert_opts_valid(opts, "ParityPacket");
         let version = Version::CURRENT_VERSION;
@@ -416,7 +416,7 @@ impl ParityPacket {
         let timestamp = Timestamp::now();
         let payload = payload.into();
 
-        Box::new(Self {
+        Self {
             version,
             opts,
             packet_type,
@@ -425,7 +425,7 @@ impl ParityPacket {
             session_id,
             timestamp,
             payload,
-        })
+        }
     }
 }
 
@@ -1402,7 +1402,7 @@ pub enum ErrorType {
     SessionDoesNotExist,
 }
 
-#[derive(Debug, Display, Deref, Serialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Display, Deref, DerefMut, Serialize, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(transparent)]
 pub struct BatchID(u16);
 

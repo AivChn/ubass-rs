@@ -22,7 +22,7 @@ use crate::{
         types::{ForeignTimestamp, ManagerToProcessor},
     },
     match_or_return, o_unwrap_or_return,
-    packet_processor::fec::inference,
+    packet_processor::fec::{self, Recovered, inference},
     prelude::*,
     r_unwrap_or_return,
 };
@@ -40,7 +40,7 @@ use std::{
 
 const PACKET_DISCARD_TIME_MS: u64 = 7 * 1000;
 const SEND_TIMEOUT: u64 = 25;
-const PACKET_COUNT_PER_BATCH: usize = 5;
+pub const PACKET_COUNT_PER_BATCH: usize = 28;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(500);
 
 macro_rules! sessions_state_fields {
@@ -83,6 +83,7 @@ impl ConnectionStatesTable {
 #[derive(Debug)]
 pub struct StreamingTo {
     pub buffer: ReadableBuffer,
+    pub current_batch: BatchID,
     pub event: Arc<Shared<StreamEvent>>,
 }
 
@@ -260,6 +261,7 @@ impl ConnectionStates {
                     streaming: Streaming::To(StreamingTo {
                         buffer,
                         event: Arc::default(),
+                        current_batch: BatchID::new(1),
                     }),
                     stream: sender,
                     fec: SessionFecState::default(),
@@ -325,7 +327,7 @@ impl ConnectionStates {
     // TODO:
     /// # Errors
     #[instrument]
-    pub fn received_data_packet(&mut self, packet: DataPacket) -> ErrResult {
+    pub async fn received_data_packet(&mut self, packet: DataPacket) -> Result<bool> {
         if let ConnectionStates::Established(box EstablishedState {
             state:
                 SessionStates::Streaming(StreamState {
@@ -336,7 +338,7 @@ impl ConnectionStates {
             ..
         }) = self
         {
-            let payload = packet.payload.take();
+            let payload = packet.payload.clone().take();
             buffer
                 .write(packet.byte_range_start, payload)
                 .ok_or(ChannelError::ChannelClosed(Inbound, Layer::Manager))?;
@@ -346,6 +348,38 @@ impl ConnectionStates {
                 m.head = buffer.head();
                 m.closed = buffer.is_done();
             });
+
+            Ok(fec::received(packet).await)
+        } else {
+            Err(Error::StateMismatch {
+                expected: FlatState::StreamingFrom,
+                found: (&*self).into(),
+            })
+        }
+    }
+
+    // TODO:
+    /// # Errors
+    pub fn recovered_packet(&mut self, recovered: Recovered) -> ErrResult {
+        if let ConnectionStates::Established(box EstablishedState {
+            state:
+                SessionStates::Streaming(StreamState {
+                    streaming: Streaming::From(buffer),
+                    stream,
+                    ..
+                }),
+            ..
+        }) = self
+        {
+            for packet in recovered.packets {
+                buffer.write(packet.byte_range_start, packet.payload.as_ref());
+
+                debug!("buffer done: {}", buffer.is_done());
+                stream.send_modify(|m| {
+                    m.head = buffer.head();
+                    m.closed = buffer.is_done();
+                });
+            }
 
             Ok(())
         } else {
@@ -840,10 +874,29 @@ async fn retransmit_action(
     }) = session
         && let Some(chunks) = stream.retransmit(ranges)
     {
-        send_data_packets(chunks, &outbound_sender, session_id, *lock_read!(address));
+        let StreamState {
+            streaming: Streaming::To(StreamingTo { current_batch, .. }),
+            ..
+        } = stream
+        else {
+            debug_assert!(
+                false,
+                "state diverged changed while holding exclusive reference"
+            );
+            return;
+        };
+        **current_batch += 1;
+        send_data_packets(
+            chunks,
+            &outbound_sender,
+            session_id,
+            *lock_read!(address),
+            *current_batch,
+        );
     }
 }
 
+#[instrument]
 async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToProcessor, n: usize) {
     let action = {
         let mut lock = lock_write!(get_state!().connections);
@@ -865,20 +918,26 @@ async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToPro
             && let Some(chunks) = stream.get_chunks(n)
         {
             let addr = *lock_read!(address);
-            let close_event =
-                if let Streaming::To(StreamingTo { buffer, event }) = &stream.streaming {
-                    buffer.is_done().then(|| event.clone())
-                } else {
-                    None
-                };
-            Some((chunks, addr, close_event))
+            let (close_event, current_batch) = if let Streaming::To(StreamingTo {
+                buffer,
+                event,
+                current_batch,
+            }) = &mut stream.streaming
+            {
+                **current_batch += 1;
+                (buffer.is_done().then(|| event.clone()), *current_batch)
+            } else {
+                debug!("session {session_id} has unexpectedly stopped streaming, exitting task");
+                return;
+            };
+            Some((chunks, addr, close_event, current_batch))
         } else {
             None
         }
     };
 
-    if let Some((chunks, addr, close_event)) = action {
-        send_data_packets(chunks, &outbound_sender, session_id, addr);
+    if let Some((chunks, addr, close_event, current_batch)) = action {
+        send_data_packets(chunks, &outbound_sender, session_id, addr, current_batch);
         if let Some(event) = close_event {
             event.update(StreamEvent::Close).await;
         }
@@ -900,17 +959,24 @@ async fn close_outgoing_stream_action(session_id: SessionId) {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn send_data_packets(
     chunks: Vec<(BytePosition, Box<[u8]>)>,
     outbound_sender: &ManagerToProcessor,
     session_id: SessionId,
     address: SocketAddr,
+    current_batch: BatchID,
 ) {
-    for (position, payload) in chunks {
+    let len = chunks.len() as u8;
+    for (i, (position, payload)) in chunks.into_iter().enumerate() {
         let packet = DataPacket::new(
             Options::none(),
-            BatchID::new(1),
-            inference::TEMP_FEC,
+            current_batch,
+            FECInfo {
+                batch_size: len,
+                batch_pos: i as u8,
+                recovery_count: 1,
+            },
             session_id,
             position,
             payload,
@@ -1302,7 +1368,7 @@ impl SessionFecState {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct FecBatchWindow {
     batch_size: u8,
     recovery_count: u8,

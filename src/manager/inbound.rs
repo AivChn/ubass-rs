@@ -1,13 +1,18 @@
 use std::sync::Arc;
 
 use crate::{
+    get_state,
     manager::{
         routines::{
             errors::{self, handle_errors},
-            received::{self, received_handshake_ack_packet, received_keep_alive_packet},
+            received::{
+                self, received_handshake_ack_packet, received_keep_alive_packet,
+                received_parity_packet,
+            },
         },
         types::{ManagerFromProcessor, ManagerToApi, ManagerToProcessor},
     },
+    packet_processor::fec::received,
     prelude::*,
 };
 
@@ -70,7 +75,9 @@ async fn handle_message(
             packets::Packet::TrackRequestPacket(track_request_packet) => {
                 received::received_track_request_packet(track_request_packet).await;
             }
-            packets::Packet::ParityPacket(_parity_packet) => todo!(),
+            packets::Packet::ParityPacket(box parity_packet) => {
+                received_parity_packet(parity_packet, outbound_sender.clone()).await;
+            }
             packets::Packet::AckPacket(ack_packet) => {
                 received::received_ack_packet(ack_packet).await;
             }
