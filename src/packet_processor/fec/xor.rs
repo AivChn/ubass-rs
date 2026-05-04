@@ -37,6 +37,7 @@ impl BitXor for FECData {
         self
     }
 }
+
 #[allow(clippy::doc_markdown)]
 /// Represents a sinle inbound batch
 ///
