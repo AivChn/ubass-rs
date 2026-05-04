@@ -8,7 +8,6 @@ use std::{
 };
 
 use async_trait::async_trait;
-use futures::future::OptionFuture;
 use tokio::{
     sync::{Mutex, Notify, RwLock},
     task::JoinHandle,
@@ -17,7 +16,7 @@ use tokio::{
 pub mod messages;
 
 pub use messages::*;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[macro_export]
 macro_rules! debug_match_or_return {
@@ -183,6 +182,9 @@ pub trait LogFail {
 
     #[must_use]
     fn log_info(self, msg: &str) -> Self;
+
+    #[must_use]
+    fn log_debug(self, msg: &str) -> Self;
 }
 
 impl LogFail for bool {
@@ -205,6 +207,14 @@ impl LogFail for bool {
     fn log_info(self, msg: &str) -> Self {
         if self {
             info!("{msg}");
+        }
+
+        self
+    }
+
+    fn log_debug(self, msg: &str) -> Self {
+        if self {
+            debug!("{msg}");
         }
 
         self
@@ -238,12 +248,20 @@ impl<T> LogFail for Option<T> {
 
         self
     }
+
+    fn log_debug(self, msg: &str) -> Self {
+        if self.is_none() {
+            debug!("{msg}");
+        }
+
+        self
+    }
 }
 
 impl<T, E: Debug> LogFail for Result<T, E> {
     #[inline]
     fn log_warn(self, msg: &str) -> Self {
-        if let Err(ref e) = self {
+        if let Err(e) = &self {
             warn!("{}: {:?}", msg, e);
         }
 
@@ -252,7 +270,7 @@ impl<T, E: Debug> LogFail for Result<T, E> {
 
     #[inline]
     fn log_error(self, msg: &str) -> Self {
-        if let Err(ref e) = self {
+        if let Err(e) = &self {
             error!("{}: {:?}", msg, e);
         }
 
@@ -261,8 +279,16 @@ impl<T, E: Debug> LogFail for Result<T, E> {
 
     #[inline]
     fn log_info(self, msg: &str) -> Self {
-        if let Err(ref e) = self {
+        if let Err(e) = &self {
             info!("{}: {:?}", msg, e);
+        }
+
+        self
+    }
+
+    fn log_debug(self, msg: &str) -> Self {
+        if let Err(e) = &self {
+            debug!("{}: {:?}", msg, e);
         }
 
         self
