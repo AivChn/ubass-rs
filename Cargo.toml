@@ -21,7 +21,6 @@ uniffi-api = []
 [dependencies]
 thiserror = "2"
 ubass_macros = { path = "ubass_macros" }
-uniffi = { version = "0.31.0", features = ["cli"] }
 aes-gcm-siv = "0.11.1"
 reed-solomon-simd = "3.1.0"
 tokio = { version = "1.49.0", features = [
