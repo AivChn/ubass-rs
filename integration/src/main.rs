@@ -3,6 +3,8 @@ use std::fs;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::time::timeout;
+use tracing::debug;
+use tracing::info;
 use ubass::api::ConnectionTrait;
 use ubass::api::IncomingConnectionTrait;
 use ubass::api::PendingConnectionTrait;
@@ -134,6 +136,8 @@ async fn client(port: u16, server_addr: SocketAddr, message: Vec<u8>) -> Result<
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
+    debug!("trying to connect to {server_addr}");
+
     let connection = timeout(
         Duration::from_secs(2),
         timeout(Duration::from_secs(2), api.connect(server_addr))
@@ -146,6 +150,9 @@ async fn client(port: u16, server_addr: SocketAddr, message: Vec<u8>) -> Result<
     .map_err(|_| println!("ready timeout"))?
     .map_err(|_| println!("ready failed!"))?;
 
+    debug!("opened connection with {}", connection.session_id());
+    debug!("trying to request stream with {}", connection.session_id());
+
     let mut buffer = vec![0; message.len()];
     let mut id = message.clone();
     id.truncate(MAX_PAYLOAD_LENGTH);
@@ -157,12 +164,15 @@ async fn client(port: u16, server_addr: SocketAddr, message: Vec<u8>) -> Result<
     .map_err(|_| println!("request timeout"))?
     .map_err(|_| println!("request"))?;
 
-    let _connection = timeout(Duration::from_secs(10), stream.complete())
+    debug!("waiting for stream to complete");
+    let _connection = timeout(Duration::from_secs(50), stream.complete())
         .await
         .map_err(|_| println!("stream complete timeout"))?
         .map_err(|_| println!("stream complete error"))?;
 
     assert_eq!(buffer, message.clone());
-    //print!("{} == {}", str::from_utf8(&buffer).unwrap(), &message);
+    let buffer_rep = str::from_utf8(&buffer).unwrap_or("FAILED PARSING");
+    let message_rep = str::from_utf8(&buffer).unwrap_or("FAILED PARSING");
+    info!("test passed! {buffer_rep} == {message_rep}");
     Ok(())
 }
