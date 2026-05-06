@@ -6,7 +6,8 @@ use crate::{
         routines::{
             errors::{self, handle_errors},
             received::{
-                self, received_handshake_ack_packet, received_keep_alive_packet,
+                self, received_close_session_packet, received_handshake_ack_packet,
+                received_handshake_rejected_packet, received_keep_alive_packet,
                 received_parity_packet,
             },
         },
@@ -22,7 +23,6 @@ pub async fn init(
     app_sender: ManagerToApi,
 ) -> ErrResult {
     let monitor = Arc::new(HandleMonitor::default());
-    monitor.clone().init();
 
     loop {
         match inbound_receiver.recv().await {
@@ -93,8 +93,12 @@ async fn handle_message(
             packets::Packet::UnexpectedPacketErrorPacket(_unexpected_packet_error_packet) => {
                 todo!()
             }
-            packets::Packet::CloseSessionPacket(close_session_packet) => todo!(),
-            packets::Packet::HandshakeRejection(handshake_rejection) => todo!(),
+            packets::Packet::CloseSessionPacket(close_session_packet) => {
+                received_close_session_packet(close_session_packet).await;
+            }
+            packets::Packet::HandshakeRejection(handshake_rejection) => {
+                received_handshake_rejected_packet(handshake_rejection).await;
+            }
             packets::Packet::KeepAlivePacket(keep_alive_packet) => {
                 received_keep_alive_packet(keep_alive_packet).await;
             }
