@@ -17,8 +17,8 @@ unsafe impl Send for Buffer {}
 unsafe impl Sync for Buffer {}
 
 impl Buffer {
-    pub fn new(ptr: &mut [u8]) -> Self {
-        Self(ptr::from_mut(ptr))
+    pub fn new(ptr: *mut [u8]) -> Self {
+        Self(ptr)
     }
 
     pub const fn len(self) -> usize {
@@ -37,12 +37,12 @@ pub struct WriteableBuffer {
     map: Vec<bool>,
 }
 
-impl<'buf, T> From<&'buf mut T> for WriteableBuffer
+impl<T> From<*mut T> for WriteableBuffer
 where
-    &'buf mut T: Into<&'buf mut [u8]>,
+    *mut T: Into<*mut [u8]>,
     T: ?Sized,
 {
-    fn from(value: &'buf mut T) -> Self {
+    fn from(value: *mut T) -> Self {
         let value = value.into();
         Self {
             buffer: Buffer::new(value),
@@ -94,6 +94,18 @@ impl WriteableBuffer {
     }
 
     #[allow(clippy::cast_possible_truncation)]
+    #[must_use]
+    // TODO:
+    /// # Panics
+    pub fn find_holes(&self, until: BytePosition) -> Vec<BytePosition> {
+        (0..self
+            .position_to_index(until.min(self.head))
+            .expect("head is always a valid position"))
+            .filter_map(|i| (!self.map[i]).then_some(BytePosition((i * MAX_PAYLOAD_LENGTH) as u32)))
+            .collect()
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
     pub fn advance_head(&mut self) {
         let mut i = o_unwrap_or_return!(self.position_to_index(self.head));
 
@@ -129,6 +141,7 @@ impl WriteableBuffer {
         self.occupy(position);
         let position = *position as usize;
         let range = position..position + to_write.len();
+        // TODO: make this error explicitly
         let buf = unsafe { self.buffer.as_mut()? };
         buf[range.clone()].copy_from_slice(to_write);
         self.advance_head();
