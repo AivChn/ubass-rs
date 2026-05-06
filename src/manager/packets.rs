@@ -434,7 +434,7 @@ pub struct PlaybackStatusPacket {
     pub version: Version,
     pub opts: Options,
     pub packet_type: PacketType,
-    pub control_type: ControlType,
+    pub control_type: PlaybackControlType,
     pub reserved: Reserved<2>,
     pub session_id: SessionId,
     pub timestamp: Timestamp,
@@ -442,13 +442,18 @@ pub struct PlaybackStatusPacket {
 
 impl PlaybackStatusPacket {
     #[inline]
-    fn new(opts: Options, session_id: SessionId, playback_type: PlaybackControlType) -> Box<Self> {
+    #[must_use]
+    pub fn new(
+        opts: Options,
+        session_id: SessionId,
+        playback_type: PlaybackControlType,
+    ) -> Box<Self> {
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
         #[cfg(debug_assertions)]
         assert_opts_valid(opts, "PlaybackStatusPacket");
         let packet_type = PacketType::Playback;
-        let control_type = playback_type.into();
+        let control_type = playback_type;
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
@@ -477,8 +482,8 @@ impl PlaybackStatusPacket {
 
     #[inline]
     #[must_use]
-    pub fn stop(opts: Options, session_id: SessionId) -> Box<Self> {
-        Self::new(opts, session_id, PlaybackControlType::Stop)
+    pub fn close(opts: Options, session_id: SessionId) -> Box<Self> {
+        Self::new(opts, session_id, PlaybackControlType::Close)
     }
 
     #[inline]
@@ -1381,7 +1386,7 @@ impl From<SessionControlType> for ControlType {
 pub enum PlaybackControlType {
     Play = 101,
     Pause = 102,
-    Stop = 103,
+    Close = 103,
     Done = 104,
 }
 
