@@ -30,6 +30,7 @@ pub async fn handle_errors(error: Error, sender: ManagerToProcessor) {
             received_packet_with_invalid_session(addr, sender.clone(), session_id).await;
         }
         Error::StateMismatch { .. } => todo!(),
+        Error::IrrelevantError => todo!(),
     }
 }
 

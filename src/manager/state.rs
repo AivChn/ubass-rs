@@ -7,7 +7,7 @@ use tokio::{
     task::JoinHandle,
     time::{interval, sleep as tokio_sleep},
 };
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 use x25519_dalek::EphemeralSecret;
 
 use crate::{
@@ -39,7 +39,7 @@ use std::{
 };
 
 const PACKET_DISCARD_TIME_MS: u64 = 7 * 1000;
-const SEND_TIMEOUT: u64 = 25;
+const SEND_INTERVAL: Duration = Duration::from_millis(25);
 pub const PACKET_COUNT_PER_BATCH: usize = 28;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(500);
 
@@ -55,7 +55,6 @@ macro_rules! sessions_state_fields {
 sessions_state_fields!(
     GeneralStateTable(SessionId => GeneralSessionState),
     EncryptionTable(SessionId => EncryptionWindow),
-    FingerprintTable(SessionId => Arc<FingerprintWindow>),
     FecStateTable(SessionId => SessionFecState),
     SessionAppIdTable(SessionId => AppId),
     SessionAddressTable(SessionId => SocketAddr),
@@ -326,7 +325,6 @@ impl ConnectionStates {
 
     // TODO:
     /// # Errors
-    #[instrument]
     pub async fn received_data_packet(&mut self, packet: DataPacket) -> Result<bool> {
         if let ConnectionStates::Established(box EstablishedState {
             state:
@@ -338,16 +336,24 @@ impl ConnectionStates {
             ..
         }) = self
         {
+            debug!("received data: {}", packet.byte_range_start);
             let payload = packet.payload.clone().take();
-            buffer
-                .write(packet.byte_range_start, payload)
-                .ok_or(ChannelError::ChannelClosed(Inbound, Layer::Manager))?;
+            if buffer.write(packet.byte_range_start, payload).is_none() {
+                warn!(
+                    "received_data_packet: write failed at {}",
+                    packet.byte_range_start
+                );
+                return Err(Error::IrrelevantError);
+            }
 
-            debug!("buffer done: {}", buffer.is_done());
             stream.send_modify(|m| {
                 m.head = buffer.head();
                 m.closed = buffer.is_done();
             });
+
+            if buffer.is_done() {
+                debug!("received_data_packet: buffer complete");
+            }
 
             Ok(fec::received(packet).await)
         } else {
@@ -374,7 +380,6 @@ impl ConnectionStates {
             for packet in recovered.packets {
                 buffer.write(packet.byte_range_start, packet.payload.as_ref());
 
-                debug!("buffer done: {}", buffer.is_done());
                 stream.send_modify(|m| {
                     m.head = buffer.head();
                     m.closed = buffer.is_done();
@@ -408,26 +413,23 @@ pub struct ProtocolState {
     pub handshakes: HandshakeStateTable,
     pub ack: PendingAckWindow,
     pub encryption: EncryptionTable,
-    pub fingerprints: FingerprintTable,
+    pub fingerprints: FingerprintWindow,
     pub address_session: AddressSessionIdTable,
 }
 
 impl ProtocolState {
     #[must_use]
     pub fn new(port: Port, app_id: AppId, sender: ManagerToProcessor) -> Self {
-        let global_handle_monitor = Arc::new(HandleMonitor::default());
-        global_handle_monitor.clone().init();
-
         Self {
             app_id,
             port,
             handles: Mutex::default(),
-            global_handle_monitor,
+            global_handle_monitor: Arc::default(),
             connections: ConnectionStatesTable::default(),
             handshakes: HandshakeStateTable::default(),
             ack: PendingAckWindow::new(sender),
             encryption: EncryptionTable::default(),
-            fingerprints: FingerprintTable::default(),
+            fingerprints: FingerprintWindow::default(),
             address_session: AddressSessionIdTable::default(),
         }
     }
@@ -478,20 +480,12 @@ impl ProtocolState {
             core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
         >,
     )> {
-        let Some(HandshakeState {
+        let HandshakeState {
             ephemeral_secret,
             session_id,
             response,
             ..
-        }) = self.handshakes.take(handshake_id).await
-        else {
-            debug_assert!(
-                false,
-                "Invariant broken while promoting handshake {handshake_id}: \
-                    could not find handshake entry"
-            );
-            return None;
-        };
+        } = self.handshakes.take(handshake_id).await?;
 
         let mut lock = lock_write!(self.connections);
         let Entry::Vacant(entry) = lock.entry(new_session_id) else {
@@ -549,13 +543,13 @@ impl ProtocolState {
 
     pub async fn handshake_done(&self, session_id: SessionId) {
         let mut lock = lock_write!(self.connections);
-        match lock.remove(&session_id) {
-            Some(ConnectionStates::Handshake {
+        match o_unwrap_or_return!(lock.remove(&session_id)) {
+            ConnectionStates::Handshake {
                 ack_triggered_response,
                 app_id,
                 address,
                 signal,
-            }) => {
+            } => {
                 let (sender, receiver) = mpsc::channel(CHANNEL_BUFFER_SIZE);
                 lock.insert(
                     session_id,
@@ -571,15 +565,8 @@ impl ProtocolState {
                 _ = ack_triggered_response.send(Ok((session_id, receiver)));
                 signal.send_modify(|m| *m = true);
             }
-            Some(established @ ConnectionStates::Established { .. }) => {
+            established @ ConnectionStates::Established { .. } => {
                 lock.insert(session_id, established);
-            }
-            None => {
-                debug_assert!(
-                    false,
-                    "Invariant broken while finishing a handshake: \
-                        the given session ID {session_id} had no associated sessions"
-                );
             }
         }
     }
@@ -608,8 +595,6 @@ impl ProtocolState {
             signal: watch::channel(false).0,
             address: RwLock::new(address),
         });
-
-        lock_write!(self.fingerprints).insert(session_id, Arc::new(FingerprintWindow::default()));
 
         lock_write!(self.address_session)
             .entry(address)
@@ -694,7 +679,7 @@ impl ProtocolState {
         };
 
         let mut playing = true;
-        let mut interval = interval(Duration::from_millis(SEND_TIMEOUT));
+        let mut interval = interval(SEND_INTERVAL);
 
         loop {
             select! {
@@ -709,6 +694,7 @@ impl ProtocolState {
                             StreamEvent::Pause => playing = false,
                             StreamEvent::Play => playing = true,
                             StreamEvent::Close => {
+                                debug!("send_on_session: Close received for session {session_id}");
                                 close_outgoing_stream_action(session_id).await;
                                 return;
                             }
@@ -726,13 +712,11 @@ impl ProtocolState {
                     }
                 _ = interval.tick() => {
                     if playing {
-                        get_state!()
-                            .global_handle_monitor
-                            .dispatch(send_stream_action(
-                                session_id,
-                                outbound_sender.clone(),
-                                PACKET_COUNT_PER_BATCH,
-                            ));
+                        send_stream_action(
+                            session_id,
+                            outbound_sender.clone(),
+                            PACKET_COUNT_PER_BATCH,
+                        ).await;
                     }
                 }
             }
@@ -763,8 +747,6 @@ impl ProtocolState {
                 .remove(address, session_id)
                 .await
         );
-
-        get_state!().fingerprints.remove_session(session_id);
 
         lock_write!(get_state!().encryption).remove(&session_id);
     }
@@ -856,47 +838,49 @@ async fn retransmit_action(
     outbound_sender: ManagerToProcessor,
     ranges: Vec<ByteRange>,
 ) {
-    let mut lock = lock_write!(get_state!().connections);
-    let session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
-        "Invariant broken while trying to send on a session \
-                            with ID {session_id}: session does not exist"
-    )));
-    if let ConnectionStates::Established(box EstablishedState {
-        state:
-            SessionStates::Streaming(
-                stream @ StreamState {
-                    streaming: Streaming::To(_),
-                    ..
-                },
-            ),
-        address,
-        ..
-    }) = session
-        && let Some(chunks) = stream.retransmit(ranges)
-    {
-        let StreamState {
-            streaming: Streaming::To(StreamingTo { current_batch, .. }),
+    let action = {
+        let mut lock = lock_write!(get_state!().connections);
+        let session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
+            "Invariant broken while trying to send on a session \
+                                with ID {session_id}: session does not exist"
+        )));
+        if let ConnectionStates::Established(box EstablishedState {
+            state:
+                SessionStates::Streaming(
+                    stream @ StreamState {
+                        streaming: Streaming::To(_),
+                        ..
+                    },
+                ),
+            address,
             ..
-        } = stream
-        else {
-            debug_assert!(
-                false,
-                "state diverged changed while holding exclusive reference"
-            );
-            return;
-        };
-        **current_batch += 1;
-        send_data_packets(
-            chunks,
-            &outbound_sender,
-            session_id,
-            *lock_read!(address),
-            *current_batch,
-        );
+        }) = session
+            && let Some(chunks) = stream.retransmit(ranges)
+        {
+            let addr = *lock_read!(address);
+            let StreamState {
+                streaming: Streaming::To(StreamingTo { current_batch, .. }),
+                ..
+            } = stream
+            else {
+                debug_assert!(
+                    false,
+                    "state diverged changed while holding exclusive reference"
+                );
+                return;
+            };
+            **current_batch += 1;
+            Some((chunks, addr, *current_batch))
+        } else {
+            None
+        }
+    };
+
+    if let Some((chunks, addr, current_batch)) = action {
+        send_data_packets(chunks, &outbound_sender, session_id, addr, current_batch).await;
     }
 }
 
-#[instrument]
 async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToProcessor, n: usize) {
     let action = {
         let mut lock = lock_write!(get_state!().connections);
@@ -927,24 +911,32 @@ async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToPro
                 **current_batch += 1;
                 (buffer.is_done().then(|| event.clone()), *current_batch)
             } else {
-                debug!("session {session_id} has unexpectedly stopped streaming, exitting task");
+                debug!("send_stream_action: session {session_id} not Streaming::To after check");
                 return;
             };
+            debug!(
+                "send_stream_action: session {session_id} batch {current_batch}: {} chunks closing={}",
+                chunks.len(),
+                close_event.is_some()
+            );
             Some((chunks, addr, close_event, current_batch))
         } else {
+            debug!("send_stream_action: session {session_id} no action");
             None
         }
     };
 
     if let Some((chunks, addr, close_event, current_batch)) = action {
-        send_data_packets(chunks, &outbound_sender, session_id, addr, current_batch);
+        send_data_packets(chunks, &outbound_sender, session_id, addr, current_batch).await;
         if let Some(event) = close_event {
+            debug!("send_stream_action: session {session_id} batch {current_batch} firing Close");
             event.update(StreamEvent::Close).await;
         }
     }
 }
 
 async fn close_outgoing_stream_action(session_id: SessionId) {
+    debug!("close_outgoing_stream_action: session {session_id}");
     let mut lock = lock_write!(get_state!().connections);
     let session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
         "Invariant broken while trying to send on a session \
@@ -960,7 +952,7 @@ async fn close_outgoing_stream_action(session_id: SessionId) {
 }
 
 #[allow(clippy::cast_possible_truncation)]
-fn send_data_packets(
+async fn send_data_packets(
     chunks: Vec<(BytePosition, Box<[u8]>)>,
     outbound_sender: &ManagerToProcessor,
     session_id: SessionId,
@@ -968,6 +960,7 @@ fn send_data_packets(
     current_batch: BatchID,
 ) {
     let len = chunks.len() as u8;
+    debug!("send_data_packets: session {session_id} batch {current_batch}: {len} packets");
     for (i, (position, payload)) in chunks.into_iter().enumerate() {
         let packet = DataPacket::new(
             Options::none(),
@@ -981,9 +974,9 @@ fn send_data_packets(
             position,
             payload,
         );
-        get_state!()
-            .global_handle_monitor
-            .dispatch(packet.send(outbound_sender.clone(), address));
+        Box::new(packet)
+            .send(outbound_sender.clone(), address)
+            .await;
     }
 }
 
@@ -1067,16 +1060,6 @@ impl GeneralStateTable {
         let new = f(flags, flag);
         lock.get_mut(&session_id)?.flags = new;
         Some(())
-    }
-}
-
-impl FingerprintTable {
-    pub async fn add_session(&self, session_id: SessionId) {
-        lock_write!(self.0).insert(session_id, Arc::default());
-    }
-
-    pub async fn remove_session(&self, session_id: SessionId) {
-        lock_write!(self.0).remove(&session_id);
     }
 }
 
@@ -1479,33 +1462,21 @@ impl core::hash::Hash for FingerprintPtr {
 
 #[derive(Clone, Copy)]
 pub struct FingerprintMonitor {
-    table: &'static FingerprintTable,
+    table: &'static FingerprintWindow,
 }
 
 impl FingerprintMonitor {
-    pub fn new(table: &'static FingerprintTable) -> Self {
+    pub fn new(table: &'static FingerprintWindow) -> Self {
         Self { table }
     }
 
-    pub async fn add(&self, session_id: SessionId) {
-        let mut table = self.table.write().await;
-        table.insert(session_id, Arc::default());
+    pub async fn add(&self, fingerprint: PacketFingerprint) -> bool {
+        let fingerprint = fingerprint.into();
+        self.table.add(fingerprint).await
     }
 
-    /// returns an Arc to the window for this session
-    ///
-    /// # Panics
-    /// This function panics if the session is not yet initialized - an Invariant
-    pub async fn get(&self, session_id: &SessionId) -> Arc<FingerprintWindow> {
-        let table = self.table.read().await;
-        let Some(window) = table.get(session_id) else {
-            panic!(
-                "Invariant broken while trying to get a `FingerprintWindow`:\
-            {session_id} is not a valid session"
-            );
-        };
-
-        window.clone()
+    pub async fn contains(&self, fingerprint: &PacketFingerprint) -> bool {
+        self.table.contains(fingerprint).await
     }
 }
 
@@ -1689,8 +1660,7 @@ impl FingerprintWindow {
 
     #[must_use]
     pub async fn contains(&self, fingerprint: &PacketFingerprint) -> bool {
-        let fingerprints = self.fingerprints.read().await;
-        fingerprints.contains(fingerprint)
+        lock_read!(self.fingerprints).contains(fingerprint)
     }
 
     pub async fn add(&self, fingerprint: Box<PacketFingerprint>) -> bool {
@@ -1704,8 +1674,7 @@ impl FingerprintWindow {
             ptr
         };
 
-        let mut queue = self.queue.lock().await;
-        queue.push_back((Timestamp::now(), ptr));
+        lock!(self.queue).push_back((Timestamp::now(), ptr));
 
         true
     }

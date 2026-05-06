@@ -1,5 +1,9 @@
 #![allow(clippy::pedantic)]
-use std::{net::SocketAddr, ptr::dangling, sync::Arc};
+use std::{
+    net::SocketAddr,
+    ptr::dangling,
+    sync::{Arc, atomic::Ordering},
+};
 
 use tokio::sync::oneshot;
 
@@ -10,6 +14,7 @@ use crate::{
             BatchID, OptionFlags, Packet, PacketFingerprint, PacketType, PacketWrapper,
             ParityPacket, SessionId,
         },
+        state,
     },
     packet_processor::{
         encryption::{self, Encryptable},
@@ -66,7 +71,6 @@ pub async fn init(
 ) -> ErrResult {
     // initialize handle monitor
     let monitor = Arc::from(HandleMonitor::default());
-    HandleMonitor::init(monitor.clone());
 
     loop {
         let received = p_receiver.recv().await;
@@ -365,6 +369,7 @@ async fn send_packet_to_transport(
         .await
         .is_err()
     {
+        eprintln!("receiver dropped");
         send_to_manager(
             Err(ChannelError::ChannelFailed(Outbound, Layer::PacketProcessor).into()),
             p_sender,

@@ -293,12 +293,12 @@ async fn dedup_no_payload(
     session_id: SessionId,
     fingerprint_monitor: FingerprintMonitor,
 ) -> Option<Vec<u8>> {
-    let fingerprint = Box::new((&packet).into());
-    let window = fingerprint_monitor.get(&session_id).await;
-    if window.contains(&fingerprint).await {
+    let fingerprint = PacketFingerprint::from(&packet);
+
+    if fingerprint_monitor.contains(&fingerprint).await {
         None
     } else {
-        _ = window.add(fingerprint).await;
+        fingerprint_monitor.add(fingerprint).await;
         Some(packet)
     }
 }
@@ -308,12 +308,12 @@ async fn dedup_with_payload<T: Headers>(
     session_id: SessionId,
     fingerprint_monitor: FingerprintMonitor,
 ) -> Option<Box<T>> {
-    let window = fingerprint_monitor.get(&session_id).await;
-    let fingerprint: Box<PacketFingerprint> = Box::new(packet.as_ref().into());
-    if window.contains(&fingerprint).await {
+    let fingerprint: PacketFingerprint = packet.as_ref().into();
+
+    if fingerprint_monitor.contains(&fingerprint).await {
         None
     } else {
-        window.add(fingerprint).await;
+        fingerprint_monitor.add(fingerprint).await;
         Some(packet)
     }
 }
@@ -344,7 +344,7 @@ mod test {
         utils::Flags,
     };
 
-    static FINGERPRINTS: LazyLock<FingerprintTable> = LazyLock::new(FingerprintTable::default);
+    static FINGERPRINTS: LazyLock<FingerprintWindow> = LazyLock::new(FingerprintWindow::default);
 
     static SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -357,10 +357,6 @@ mod test {
     async fn dedup_without_payload_not_duplicate() {
         let session_id = next_session();
         let packet = b"random packet".to_vec();
-        FINGERPRINTS
-            .write()
-            .await
-            .insert(session_id, Arc::default());
         let fingerprint_monitor = FingerprintMonitor::new(&FINGERPRINTS);
         let some = dedup_no_payload(packet.clone(), session_id, fingerprint_monitor).await;
         assert_eq!(some, Some(packet));
@@ -371,19 +367,9 @@ mod test {
         let session_id = next_session();
         let mut packet = b"random packet".to_vec();
         packet.extend_from_slice(&session_id.to_be_bytes());
-        FINGERPRINTS
-            .write()
-            .await
-            .insert(session_id, Arc::default());
         let fingerprint_monitor = FingerprintMonitor::new(&FINGERPRINTS);
-        let fingerprint = Box::new((&packet).into());
-        assert!(
-            fingerprint_monitor
-                .get(&session_id)
-                .await
-                .add(fingerprint)
-                .await
-        );
+        let fingerprint = PacketFingerprint::from(&packet);
+        assert!(fingerprint_monitor.add(fingerprint).await);
         let none = dedup_no_payload(packet.clone(), session_id, fingerprint_monitor).await;
         dbg!(&none);
         assert!(none.is_none());
@@ -405,19 +391,9 @@ mod test {
             vec![1, 2, 3, 4, 5],
         );
         packet.payload.extend_from_slice(&session_id.to_be_bytes());
-        FINGERPRINTS
-            .write()
-            .await
-            .insert(session_id, Arc::default());
         let fingerprint_monitor = FingerprintMonitor::new(&FINGERPRINTS);
-        let fingerprint = Box::new(PacketFingerprint::from(&*packet));
-        assert!(
-            fingerprint_monitor
-                .get(&session_id)
-                .await
-                .add(fingerprint)
-                .await
-        );
+        let fingerprint = PacketFingerprint::from(&*packet);
+        assert!(fingerprint_monitor.add(fingerprint).await);
         //let none = dedup_no_payload(packet.clone(), session_id, fingerprint_monitor).await;
         let none = dedup_with_payload(packet, session_id, fingerprint_monitor).await;
         dbg!(&none);
@@ -440,10 +416,6 @@ mod test {
             vec![1, 2, 3, 4, 5],
         );
         packet.payload.extend_from_slice(&session_id.to_be_bytes());
-        FINGERPRINTS
-            .write()
-            .await
-            .insert(session_id, Arc::default());
         let fingerprint_monitor = FingerprintMonitor::new(&FINGERPRINTS);
         let some = dedup_with_payload(packet, session_id, fingerprint_monitor).await;
         dbg!(&some);

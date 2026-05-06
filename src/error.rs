@@ -4,7 +4,7 @@ use crate::{
     api::IncomingConnection,
     error,
     manager::{
-        packets::{BatchID, SessionId, Version},
+        packets::{BatchID, MAX_PAYLOAD_LENGTH, SessionId, Version},
         state::{ConnectionStates, EstablishedState, SessionStates, StreamState, Streaming},
     },
 };
@@ -108,6 +108,8 @@ pub enum Error {
         expected: FlatState,
         found: FlatState,
     },
+    #[error("Error used when the only thing that matters is that it happened")]
+    IrrelevantError,
 }
 
 #[derive(Debug, Display)]
