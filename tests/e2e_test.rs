@@ -254,3 +254,51 @@ fn very_big_data() {
         "server exited with: {server_status}"
     );
 }
+
+#[test]
+#[ignore = "takes 19 seconds to run"]
+fn audio_data() {
+    let server_port = free_port();
+    let server_address = format!("127.0.0.1:{server_port}");
+    let client_port = free_port();
+    let message_path = "/home/aiv/dev/ubass-rs/tests/song.flac";
+
+    let mut server = std::process::Command::new(BIN_PATH)
+        .args(prep_server_args(
+            &server_port.to_string(),
+            "song",
+            message_path,
+            true,
+            false,
+        ))
+        .spawn()
+        .expect("failed to spawn server");
+
+    // give the server time to bind and start listening
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut client = std::process::Command::new(BIN_PATH)
+        .args(prep_client_args(
+            &client_port.to_string(),
+            "song",
+            message_path,
+            true,
+            &server_address,
+        ))
+        .spawn()
+        .expect("failed to spawn client");
+
+    let client_status =
+        wait_timeout(&mut client, Duration::from_secs(120)).expect("client timed out");
+    assert!(
+        client_status.success(),
+        "client exited with: {client_status}"
+    );
+
+    let server_status =
+        wait_timeout(&mut server, Duration::from_secs(120)).expect("server timed out");
+    assert!(
+        server_status.success(),
+        "server exited with: {server_status}"
+    );
+}
