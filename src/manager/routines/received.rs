@@ -9,6 +9,7 @@ use crate::{
     prelude::*,
     utils::PanicInDebug,
 };
+use tracing::warn;
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
 use tokio::sync::mpsc::{self, Receiver};
 
@@ -170,10 +171,16 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
     let fingerprint = PacketFingerprint::from(&packet);
     let session_id = packet.session_id;
     let batch_id = packet.batch_id;
-    match o_unwrap_or_return!(lock_write!(get_state!().connections).get_mut(&packet.session_id))
-        .received_data_packet(packet)
-        .await
-    {
+
+    let result = {
+        let mut guard = lock_write!(get_state!().connections);
+        let Some(state) = guard.get_mut(&packet.session_id) else {
+            return;
+        };
+        state.received_data_packet(packet).await
+    };
+
+    match result {
         Ok(b) if b => {
             let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id).await);
             _ = o_unwrap_or_return!(lock_write!(get_state!().connections).get_mut(&session_id))
@@ -192,6 +199,9 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
                 o_unwrap_or_return!(get_state!().connections.address(session_id).await),
             )
             .await;
+        }
+        Err(e) => {
+            warn!("received_data_packet: unexpected error for session {session_id}: {e:?}");
         }
         _ => {}
     }
@@ -391,10 +401,6 @@ async fn session_id_collided(
                 ephemeral_secret,
             )
             .await
-            .panic_in_debug(
-                "Invariant broken in the `session_id_collided` routine: \
-                the handshake did not exist"
-            )
     );
 
     Box::new(HelloPacket::new(
