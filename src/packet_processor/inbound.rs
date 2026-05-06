@@ -149,9 +149,13 @@ async fn deserialize_and_decrypt(
             Ok(Packet::KeepAlivePacket(packet))
         }
 
-        PacketType::HandshakeAck => Ok(Packet::HandshakeAckPacket(Box::new(
-            HandshakeAckPacket::deserialize(&data)?,
-        ))),
+        PacketType::HandshakeAck => {
+            let data = dedup_no_payload(data, session_id, fingerprint_monitor)
+                .await
+                .ok_or(())?;
+            let packet = Box::new(HandshakeAckPacket::deserialize(&data)?);
+            Ok(Packet::HandshakeAckPacket(packet))
+        }
 
         // Subtypes
         PacketType::Host | PacketType::Session | PacketType::Playback => {
@@ -191,7 +195,11 @@ async fn deserialize_and_auth_control_packet(
                 // HelloPackets are pre-session — no shared key exists yet so they cannot
                 // be authenticated or deduplicated here. Authentication is handled at the
                 // app level via the approval mechanism.
-                Packet::HelloPacket(Box::new(HelloPacket::deserialize(&data)?))
+                let packet = Box::new(HelloPacket::deserialize(&data)?);
+                let packet = dedup_with_payload(packet, session_id, fingerprint_monitor)
+                    .await
+                    .ok_or(())?;
+                Packet::HelloPacket(packet)
             }
 
             ControlType::Host(HostControlType::HandshakeReject) => {
