@@ -1,7 +1,6 @@
 #![feature(box_patterns)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
-#![allow(unused_must_use)]
 #![allow(dead_code)]
 #![allow(clippy::wildcard_imports)]
 #![allow(clippy::cast_lossless)]

@@ -53,7 +53,7 @@ pub async fn init(
         encryption_monitor,
         pending_ack_monitor,
     ));
-    signal.send(Ok(()));
+    _ = signal.send(Ok(()));
 
     tokio::select! {
         res = &mut inbound_handle => {

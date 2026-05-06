@@ -179,7 +179,8 @@ impl ApiInner {
     }
 
     async fn close_stream(&self, session_id: SessionId) {
-        self.api_to_manager
+        _ = self
+            .api_to_manager
             .send(ApiCommand::CloseStream(session_id))
             .await;
     }
@@ -197,7 +198,8 @@ impl ApiInner {
         control: PlaybackControlType,
     ) -> ResponseReceiver<()> {
         let (sender, receiver) = OneShot::new((session_id, control));
-        self.api_to_manager
+        _ = self
+            .api_to_manager
             .send(ApiCommand::StreamAction(sender))
             .await;
         receiver
@@ -541,7 +543,8 @@ impl InputStream {
     ) -> Result<usize, ConnectionError> {
         let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
         // waits for the packet to be sent and the state to be actually updated
-        api.send_playback_control(self.session, control)
+        _ = api
+            .send_playback_control(self.session, control)
             .await
             .recv();
 

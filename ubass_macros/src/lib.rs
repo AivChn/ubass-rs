@@ -204,7 +204,7 @@ fn struct_serialization(input: DeriveInput) -> TokenStream {
 
             for (i, t) in idents.iter().zip(types) {
                 fields.push(quote! {#i,});
-                serialize_logic.push(quote! { self.#i.serialize(&mut buf[(#struct_size)..]); });
+                serialize_logic.push(quote! { self.#i.serialize(&mut buf[(#struct_size)..])?; });
                 deserialize_logic.push(
                     quote! { let #i =  <#t>::deserialize(&bytes[offset..])?; offset += #i.sized(); },
                 );
@@ -298,7 +298,7 @@ fn get_headers_impl(input: DeriveInput) -> TokenStream {
         if i.to_string().as_str() == "payload" {
             continue;
         }
-        serialize_logic.push(quote! { self.#i.serialize(&mut buf[(#struct_size)..]); });
+        serialize_logic.push(quote! { _ = self.#i.serialize(&mut buf[(#struct_size)..]); });
         struct_size = quote! { #struct_size + self.#i.sized() };
     }
 
@@ -354,7 +354,7 @@ pub fn send_packet_derive_macro(item: TokenStream) -> TokenStream {
                 type Sender = ManagerToProcessor;
 
                 async fn send(self: Box<Self>, sender: Self::Sender, address: SocketAddr) {
-                    sender
+                    _ = sender
                         .send(PacketProcessingMessage::SendPacket(
                             Packet::#ident(self).wrap(address),
                         ))

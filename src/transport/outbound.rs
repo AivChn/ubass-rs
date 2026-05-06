@@ -79,10 +79,10 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
                 total_received += 1;
             }
 
-            if data.packet_type == PacketType::KeepAlive {
+            if data.packet_type == PacketType::KeepAlive || data.packet_type == PacketType::Host {
                 let copy = listening_socket.clone();
                 monitor.dispatch(async move {
-                    copy.send_to(&data.data, data.dest_addr);
+                    _ = copy.send_to(&data.data, data.dest_addr).await;
                 });
             } else {
                 buffer.push(data);
@@ -109,7 +109,7 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
             );
         }
 
-        debug!("sending packet buffer with {} packets", buffer.len());
+        debug!("sending packet buffer with {} packets", buffer.len(),);
         #[allow(clippy::drain_collect)]
         monitor.dispatch(send_packets(buffer.drain(..).collect(), sockets.retrieve()));
     }
@@ -202,7 +202,7 @@ mod test {
             duplicate_count: 1,
         };
 
-        sender.send(TransportMessage::SendPacket(packet)).await;
+        _ = sender.send(TransportMessage::SendPacket(packet)).await;
         let result = receive.await;
         dbg!(&result);
         assert!(result.is_ok());
@@ -211,7 +211,7 @@ mod test {
     #[tokio::test]
     async fn graceful_close() {
         let (sender, handle) = prepare_init();
-        sender.send(TransportMessage::Close).await;
+        _ = sender.send(TransportMessage::Close).await;
         assert!(handle.await.unwrap().is_ok());
     }
 
@@ -245,7 +245,7 @@ mod test {
             .collect();
 
         for packet in packets {
-            sender.send(TransportMessage::SendPacket(packet)).await;
+            _ = sender.send(TransportMessage::SendPacket(packet)).await;
         }
         let result = receive.await.unwrap();
         dbg!(&result);

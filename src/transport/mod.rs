@@ -29,7 +29,7 @@ pub async fn init(
 ) -> ErrResult {
     let listening_socket = match bind_listen_socket(port) {
         None => {
-            sender.send(Err(TransportError::FailedToBind.into())).await;
+            _ = sender.send(Err(TransportError::FailedToBind.into())).await;
             return Err(TransportError::FailedToBind.into());
         }
         Some(s) => Arc::new(s),
@@ -39,7 +39,7 @@ pub async fn init(
     let mut recv_handle = tokio::spawn(inbound::init(listening_socket.clone(), sender.clone()));
     let mut send_handle = tokio::spawn(outbound::init(receiver, listening_socket.clone()));
     debug!("initializing the transport layer");
-    signal.send(Ok(()));
+    _ = signal.send(Ok(()));
 
     tokio::select! {
         res = &mut recv_handle, if !recv_handle.is_finished() => {
