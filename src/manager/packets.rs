@@ -1297,7 +1297,7 @@ impl Display for Version {
 }
 
 /// Enum of all possible packet types as of now
-#[derive(Debug, Serialize, Clone, Copy, PartialEq)]
+#[derive(Display, Debug, Serialize, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum PacketType {
     Data = 1,

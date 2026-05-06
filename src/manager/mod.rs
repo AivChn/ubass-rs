@@ -6,7 +6,7 @@ mod routines;
 pub mod state;
 pub mod types;
 
-use std::sync::{OnceLock, mpsc as std_mpsc};
+use std::sync::{OnceLock, atomic::Ordering, mpsc as std_mpsc};
 
 use crate::{
     lock_read,

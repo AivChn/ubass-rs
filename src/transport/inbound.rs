@@ -36,7 +36,6 @@ pub async fn init(socket: Arc<UdpSocket>, sender: InboundSender) -> ErrResult {
             }
         };
 
-        debug!("received packet: {:?}", &buffer);
         let packet = ReceivedPacket {
             src_addr: addr,
             data: buffer,

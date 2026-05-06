@@ -11,3 +11,6 @@ cargo.lock
 target/
 **/target/
 /integration/Cargo.lock
+/check_gaps.py
+/test
+/tests/song.flac

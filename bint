@@ -1,4 +1,5 @@
 #!/bin/bash
 
+cargo b
 cd ./integration
 cargo b

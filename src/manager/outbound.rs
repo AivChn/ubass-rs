@@ -1,10 +1,11 @@
-use std::sync::Arc;
+use std::sync::{Arc, atomic::Ordering};
 
 use crate::{
     get_state,
     manager::{
         STATE, outbound,
         routines::endpoints,
+        state,
         types::{ManagerFromApi, ManagerToProcessor},
     },
     prelude::*,
@@ -16,7 +17,6 @@ pub async fn init(
     manager_to_processor: ManagerToProcessor,
 ) -> ErrResult {
     let monitor = Arc::new(HandleMonitor::default());
-    monitor.clone().init();
 
     loop {
         match manager_from_api.recv().await {
@@ -31,6 +31,7 @@ pub async fn init(
             }
             Some(ApiCommand::Close) => {
                 monitor.flush().await;
+                get_state!().global_handle_monitor.flush().await;
                 _ = manager_to_processor
                     .send(PacketProcessingMessage::Close)
                     .await;
