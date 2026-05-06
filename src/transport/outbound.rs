@@ -14,15 +14,16 @@ use super::types::{BUFFER_TIMEOUT, MAX_CONCURRENT_SENDS, MAX_PACKET_BUFFER_SIZE,
 pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocket>) -> ErrResult {
     // set up handle monitor
     let monitor = Arc::from(HandleMonitor::default());
-    HandleMonitor::init(monitor.clone());
 
     // set up socket buffer
     let Ok(mut sockets) = OutboundSockets::new().await else {
+        error!("Failed to bind socket");
         return Err(TransportError::FailedToBind.into());
     };
 
     // packet buffer
     let mut buffer = Vec::with_capacity(MAX_PACKET_BUFFER_SIZE);
+    let mut total_received: usize = 0;
 
     debug!("listening for packets to send...");
     loop {
@@ -48,17 +49,25 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
                 }
                 // close pipeline
                 Ok(Some(TransportMessage::Close)) => {
+                    debug!(
+                        "outbound transport begins graceful shutdown: \
+                        buffer={} total_received={}",
+                        buffer.len(),
+                        total_received
+                    );
                     if !buffer.is_empty() {
                         monitor
                             .dispatch(send_packets(buffer.drain(..).collect(), sockets.retrieve()));
                     }
                     monitor.flush().await;
+                    debug!("graceful shutdown done");
                     return Ok(());
                 }
                 // get data
                 Ok(Some(TransportMessage::SendPacket(data))) => data,
             };
 
+            total_received += 1;
             if data.packet_type == PacketType::KeepAlive {
                 send_keep_alive(data, &listening_socket);
             } else {
@@ -66,7 +75,7 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
             }
         }
 
-        while monitor.size().await > MAX_CONCURRENT_SENDS {}
+        while monitor.size() > MAX_CONCURRENT_SENDS {}
 
         #[allow(clippy::cast_possible_truncation)]
         let _ = sockets
@@ -80,7 +89,8 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
         #[cfg(debug_assertions)]
         if buffer.len() == 1 {
             debug!(
-                "single packet being sent: {:?}",
+                "single {} packet being sent: {:?}",
+                buffer[0].packet_type,
                 str::from_utf8(&buffer[0].data).unwrap_or(&format!("RAW: {:?}", &buffer[0].data))
             );
         }
@@ -92,6 +102,10 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
 }
 
 async fn send_packets(buffer: Box<[ProcessedPacket]>, socket: Arc<UdpSocket>) {
+    let total = buffer.len();
+    let mut sent = 0usize;
+    let mut failed = 0usize;
+    debug!("send_packets: starting batch of {total} packets");
     for packet in buffer {
         debug_assert!(
             packet.duplicate_count != 0,
@@ -99,9 +113,16 @@ async fn send_packets(buffer: Box<[ProcessedPacket]>, socket: Arc<UdpSocket>) {
                 a packet had a duplicate count of 0 ({packet:?})"
         );
         for _ in 0..packet.duplicate_count {
-            let _ = socket.send_to(&packet.data, packet.dest_addr).await;
+            match socket.send_to(&packet.data, packet.dest_addr).await {
+                Ok(_) => sent += 1,
+                Err(e) => {
+                    error!("send_to failed: {e}");
+                    failed += 1;
+                }
+            }
         }
     }
+    debug!("send_packets: done — sent={sent} failed={failed} total={total}");
 }
 
 fn send_keep_alive(packet: ProcessedPacket, socket: &UdpSocket) {
