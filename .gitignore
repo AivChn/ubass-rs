@@ -14,3 +14,4 @@ target/
 /check_gaps.py
 /test
 /tests/song.flac
+/tests/logs

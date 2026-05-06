@@ -46,7 +46,7 @@ async fn main() -> Result<(), ()> {
     match args.side {
         Side::Server { echo } => {
             let file = fs::File::create(format!(
-                "/home/aiv/dev/ubass-rs/logs/server_{}.log",
+                "/home/aiv/dev/ubass-rs/tests/logs/server_{}.log",
                 args.name
             ))
             .unwrap();
@@ -66,7 +66,7 @@ async fn main() -> Result<(), ()> {
         }
         Side::Client { server_address } => {
             let file = fs::File::create(format!(
-                "/home/aiv/dev/ubass-rs/logs/client_{}.log",
+                "/home/aiv/dev/ubass-rs/tests/logs/client_{}.log",
                 args.name
             ))
             .unwrap();
@@ -109,7 +109,7 @@ async fn server(port: u16, reply: Option<Box<[u8]>>) -> Result<(), ()> {
         tokio::time::timeout(Duration::from_secs(10), incoming.approve_and_ready())
             .await
             .map_err(|_| println!("incoming timeout"))?
-            .map_err(|_| println!("incoming"))?;
+            .map_err(|e| println!("incoming: {e}"))?;
 
     let Ok(ConnectionEvent::TrackRequest(id)) =
         tokio::time::timeout(Duration::from_secs(10), connection.listen())
