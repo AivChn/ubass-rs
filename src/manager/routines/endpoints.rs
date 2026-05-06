@@ -42,7 +42,7 @@ const CLOSE_SESSION_DELAY: Duration = Duration::from_millis(25);
 /// # Panics
 /// This function might panic if the oneshot channel used for the protocol to communicate an error
 /// closed before sending.
-#[instrument]
+#[instrument(skip_all)]
 pub fn open(
     port: u16,
     app_id: AppId,
@@ -88,7 +88,7 @@ pub fn open(
 /// Root Routine for the [`API::connect`] endpoint.
 /// This function creates a handshake entry and sends a [`HelloPacket`] to the given address,
 /// assuming that is the receiving port for the host.
-#[instrument]
+#[instrument(skip_all)]
 pub async fn connect(
     OneShot {
         data: address,
@@ -132,7 +132,7 @@ pub async fn connect(
 /// Resolves the target to a session, validates it is free, and sends a single [`DataPacket`].
 /// Replies to the caller via the embedded oneshot with `Ok(())` on success or an [`ApiErrors`]
 /// variant on failure.
-#[instrument]
+#[instrument(skip_all)]
 pub async fn send_data(
     OneShot {
         data:
@@ -161,6 +161,7 @@ pub async fn send_data(
         .await;
 }
 
+#[instrument(skip_all)]
 async fn resolve_target(
     target: &SendTarget,
 ) -> core::result::Result<(SessionId, SocketAddr), ApiErrors> {
@@ -193,15 +194,17 @@ async fn resolve_target(
     .log_warn(&format!("could not resolve target {:?}", &target))
 }
 
+#[instrument(skip_all)]
 pub fn close() {
     todo!()
 }
 
+#[instrument(skip_all)]
 pub fn listen() {
     todo!()
 }
 
-#[instrument]
+#[instrument(skip_all)]
 pub async fn request_track(
     OneShot {
         data:
@@ -252,14 +255,14 @@ pub fn request_metadata() {
     todo!()
 }
 
-#[instrument]
+#[instrument(skip_all)]
 pub async fn close_session(session_id: SessionId, sender: ManagerToProcessor) {
     info!("closing session {}", session_id);
 
-    // a delay is added as a best effort to add a small buffer for other packets to be received by the other hoest,
+    // a delay is added as a best effort to add a small buffer for other packets to be received by the other host,
     // since ordering isnt guaranteed and receiving this packet will cause the other host to
     // immediately stop accepting from this session
-    tokio::time::sleep(CLOSE_SESSION_DELAY);
+    tokio::time::sleep(CLOSE_SESSION_DELAY).await;
 
     Box::new(CloseSessionPacket::new(Options::none(), session_id))
         .send(
@@ -268,11 +271,11 @@ pub async fn close_session(session_id: SessionId, sender: ManagerToProcessor) {
         )
         .await;
 
+    debug!("session {} close packet sent.", session_id);
     get_state!().close_session(session_id).await;
-    debug!("session {} closed.", session_id);
 }
 
-#[instrument]
+#[instrument(skip_all)]
 pub async fn close_stream(session_id: SessionId, sender: ManagerToProcessor) {
     info!("closing stream for session {}", session_id);
 
