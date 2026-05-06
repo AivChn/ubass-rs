@@ -443,11 +443,7 @@ pub struct PlaybackStatusPacket {
 impl PlaybackStatusPacket {
     #[inline]
     #[must_use]
-    pub fn new(
-        opts: Options,
-        session_id: SessionId,
-        playback_type: PlaybackControlType,
-    ) -> Box<Self> {
+    pub fn new(opts: Options, session_id: SessionId, playback_type: PlaybackControlType) -> Self {
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
         #[cfg(debug_assertions)]
@@ -457,7 +453,7 @@ impl PlaybackStatusPacket {
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
-        Box::new(Self {
+        Self {
             version,
             opts,
             packet_type,
@@ -465,30 +461,30 @@ impl PlaybackStatusPacket {
             reserved,
             session_id,
             timestamp,
-        })
+        }
     }
 
     #[inline]
     #[must_use]
-    pub fn play(opts: Options, session_id: SessionId) -> Box<Self> {
+    pub fn play(opts: Options, session_id: SessionId) -> Self {
         Self::new(opts, session_id, PlaybackControlType::Play)
     }
 
     #[inline]
     #[must_use]
-    pub fn pause(opts: Options, session_id: SessionId) -> Box<Self> {
+    pub fn pause(opts: Options, session_id: SessionId) -> Self {
         Self::new(opts, session_id, PlaybackControlType::Pause)
     }
 
     #[inline]
     #[must_use]
-    pub fn close(opts: Options, session_id: SessionId) -> Box<Self> {
+    pub fn close(opts: Options, session_id: SessionId) -> Self {
         Self::new(opts, session_id, PlaybackControlType::Close)
     }
 
     #[inline]
     #[must_use]
-    pub fn done(opts: Options, session_id: SessionId) -> Box<Self> {
+    pub fn done(opts: Options, session_id: SessionId) -> Self {
         Self::new(opts, session_id, PlaybackControlType::Done)
     }
 }
@@ -643,7 +639,7 @@ impl RetransmitPacket {
     const HEADER_SIZE: usize = size_of::<Self>() - Self::LOCAL_MAX_PAYLOAD_LENGTH;
 
     #[must_use]
-    pub fn data(opts: Options, session_id: SessionId, payload: Vec<ByteRange>) -> Box<Self> {
+    pub fn data(opts: Options, session_id: SessionId, payload: Vec<ByteRange>) -> Self {
         debug_assert!(
             payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
             "Invariant broken while constructing a `RetransmitPacket`:\
@@ -663,7 +659,7 @@ impl RetransmitPacket {
         let buffer_id = None;
         let timestamp = Timestamp::now();
 
-        Box::new(Self {
+        Self {
             version,
             opts,
             packet_type,
@@ -672,7 +668,7 @@ impl RetransmitPacket {
             session_id,
             timestamp,
             payload,
-        })
+        }
     }
 
     #[must_use]
@@ -1227,7 +1223,9 @@ impl Deref for PublicKey {
     }
 }
 
-#[derive(Deref, DerefMut, PartialEq, Debug, Serialize, Clone, Copy, Display)]
+#[derive(
+    Eq, PartialOrd, Ord, Deref, DerefMut, PartialEq, Debug, Serialize, Clone, Copy, Display,
+)]
 #[repr(transparent)]
 pub struct BytePosition(pub u32);
 
@@ -1504,7 +1502,7 @@ impl FECInfo {
     }
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Clone, Copy)]
 pub struct ByteRange {
     pub start: BytePosition,
     pub length: u16,
@@ -1522,14 +1520,17 @@ impl ByteRange {
     }
 
     pub fn concat(&mut self, other: &ByteRange) -> bool {
-        debug_assert!(
-            self.start.0 + self.length as u32 == other.start.0
-                || other.start.0 + other.length as u32 == self.start.0,
-            "Invariant broken while trying to concatincate two `ByteRange`s: The two are not continous. \
-            self: {self:?}, other: {other:?}"
-        );
+        //debug_assert!(
+        //    self.start.0 + self.length as u32 == other.start.0
+        //        || other.start.0 + other.length as u32 == self.start.0,
+        //    "Invariant broken while trying to concatincate two `ByteRange`s: The two are not continous. \
+        //    self: {self:?}, other: {other:?}"
+        //);
 
-        if let Some(res) = self.length.checked_add(other.length) {
+        if (self.start.0 + self.length as u32 == other.start.0
+            || other.start.0 + other.length as u32 == self.start.0)
+            && let Some(res) = self.length.checked_add(other.length)
+        {
             self.length = res;
             if other.start.0 + other.length as u32 == self.start.0 {
                 self.start = other.start;
