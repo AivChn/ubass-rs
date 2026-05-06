@@ -56,6 +56,17 @@ pub async fn init(
                     manager_to_processor.clone(),
                 ));
             }
+            Some(ApiCommand::StreamAction(OneShot {
+                data: (session_id, control),
+                response,
+            })) => {
+                monitor.dispatch(endpoints::send_playback_control_packet(
+                    session_id,
+                    control,
+                    response,
+                    manager_to_processor.clone(),
+                ));
+            }
         }
     }
 }

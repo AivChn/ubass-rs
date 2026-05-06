@@ -17,7 +17,8 @@ use crate::{
         CHANNEL_BUFFER_SIZE, STATE,
         packets::{
             BatchID, BytePosition, ByteRange, DataPacket, FECInfo, KeepAlivePacket,
-            MAX_PAYLOAD_LENGTH, Options, Packet, PacketFingerprint, SessionId,
+            MAX_PAYLOAD_LENGTH, OptionFlags, Options, Packet, PacketFingerprint,
+            PlaybackStatusPacket, SessionId,
         },
         types::{ForeignTimestamp, ManagerToProcessor},
     },
@@ -30,6 +31,7 @@ use core::panic;
 use std::{
     collections::{HashSet, VecDeque, hash_map::Entry},
     fmt::{Display, format},
+    mem,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
     sync::{
         Arc,
@@ -325,7 +327,11 @@ impl ConnectionStates {
 
     // TODO:
     /// # Errors
-    pub async fn received_data_packet(&mut self, packet: DataPacket) -> Result<bool> {
+    pub async fn received_data_packet(
+        &mut self,
+        packet: DataPacket,
+        sender: ManagerToProcessor,
+    ) -> Result<bool> {
         if let ConnectionStates::Established(box EstablishedState {
             state:
                 SessionStates::Streaming(StreamState {
@@ -333,6 +339,7 @@ impl ConnectionStates {
                     stream,
                     ..
                 }),
+            address,
             ..
         }) = self
         {
@@ -353,6 +360,13 @@ impl ConnectionStates {
 
             if buffer.is_done() {
                 debug!("received_data_packet: buffer complete");
+                Box::new(PlaybackStatusPacket::done(
+                    Options::construct(&[OptionFlags::RequireAck]),
+                    packet.session_id,
+                ))
+                .send(sender, *lock_read!(address))
+                .await;
+                return Ok(false);
             }
 
             Ok(fec::received(packet).await)
@@ -632,22 +646,18 @@ impl ProtocolState {
                         .await
                         .is_err()
                     {
-                        // TODO:
-                        // debug_assert!(
-                        //    false,
-                        //    "Invariant broken in `advertise_closed`: \
-                        //        channel to connection with session ID {} with {} ({}) was already closed. state: {}.",
-                        //    session_id,
-                        //    app_id,
-                        //    *lock_read!(address),
-                        //    state
-                        // );
+                        debug_assert!(
+                            false,
+                            "Invariant broken in `advertise_closed`: \
+                                channel to connection with session ID {session_id} was already closed.",
+                        );
                     }
                 }
             }
         }
     }
 
+    #[instrument(skip_all)]
     pub async fn send_on_session(
         &self,
         session_id: SessionId,
@@ -680,6 +690,7 @@ impl ProtocolState {
 
         let mut playing = true;
         let mut interval = interval(SEND_INTERVAL);
+        let mut paused_retransmits = vec![];
 
         loop {
             select! {
@@ -692,14 +703,29 @@ impl ProtocolState {
                     }) => {
                         match event {
                             StreamEvent::Pause => playing = false,
-                            StreamEvent::Play => playing = true,
+                            StreamEvent::Play => {
+                                playing = true;
+                                if !paused_retransmits.is_empty() {
+                                    self
+                                        .global_handle_monitor
+                                        .dispatch(retransmit_action(
+                                            session_id,
+                                            outbound_sender.clone(),
+                                            mem::take(&mut paused_retransmits),
+                                        ));
+                                }
+                            },
+                            StreamEvent::Done => {
+                                debug!("stream done for session {session_id}");
+                                self.close_stream(session_id, outbound_sender.clone()).await;
+                            }
                             StreamEvent::Close => {
-                                debug!("send_on_session: Close received for session {session_id}");
+                                debug!("Close received for session {session_id}");
                                 close_outgoing_stream_action(session_id).await;
                                 return;
                             }
                             StreamEvent::Retransmit(byte_ranges) if playing => {
-                                get_state!()
+                                self
                                     .global_handle_monitor
                                     .dispatch(retransmit_action(
                                         session_id,
@@ -707,17 +733,17 @@ impl ProtocolState {
                                         byte_ranges,
                                     ));
                             }
-                            StreamEvent::Retransmit(_) => {}
+                            StreamEvent::Retransmit(byte_ranges) => {
+                                paused_retransmits.extend(byte_ranges);
+                            }
                         }
                     }
-                _ = interval.tick() => {
-                    if playing {
-                        send_stream_action(
-                            session_id,
-                            outbound_sender.clone(),
-                            PACKET_COUNT_PER_BATCH,
-                        ).await;
-                    }
+                _ = interval.tick(), if playing => {
+                    send_stream_action(
+                        session_id,
+                        outbound_sender.clone(),
+                        PACKET_COUNT_PER_BATCH,
+                    ).await;
                 }
             }
         }
@@ -751,6 +777,7 @@ impl ProtocolState {
         lock_write!(get_state!().encryption).remove(&session_id);
     }
 
+    // CHECKPOINT
     pub async fn close_stream(&self, session_id: SessionId, outbound_sender: ManagerToProcessor) {
         let mut lock = lock_write!(self.connections);
         let session = o_unwrap_or_return!(lock.get_mut(&session_id));
@@ -760,11 +787,13 @@ impl ProtocolState {
                 SessionStates::Streaming(
                     StreamState {
                         streaming: Streaming::To(StreamingTo { event, .. }),
+                        stream,
                         ..
                     },
                     ..,
                 ) => {
                     event.update_with(|e| *e = StreamEvent::Close).await;
+                    stream.send_modify(|m| m.closed = true);
                 }
                 SessionStates::Streaming(StreamState { stream, .. }) => {
                     stream.send_modify(|m| m.closed = true);
@@ -902,36 +931,31 @@ async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToPro
             && let Some(chunks) = stream.get_chunks(n)
         {
             let addr = *lock_read!(address);
-            let (close_event, current_batch) = if let Streaming::To(StreamingTo {
+            let current_batch = if let Streaming::To(StreamingTo {
                 buffer,
                 event,
                 current_batch,
             }) = &mut stream.streaming
             {
                 **current_batch += 1;
-                (buffer.is_done().then(|| event.clone()), *current_batch)
+                *current_batch
             } else {
                 debug!("send_stream_action: session {session_id} not Streaming::To after check");
                 return;
             };
             debug!(
-                "send_stream_action: session {session_id} batch {current_batch}: {} chunks closing={}",
+                "send_stream_action: session {session_id} batch {current_batch}: {} chunks ",
                 chunks.len(),
-                close_event.is_some()
             );
-            Some((chunks, addr, close_event, current_batch))
+            Some((chunks, addr, current_batch))
         } else {
             debug!("send_stream_action: session {session_id} no action");
             None
         }
     };
 
-    if let Some((chunks, addr, close_event, current_batch)) = action {
+    if let Some((chunks, addr, current_batch)) = action {
         send_data_packets(chunks, &outbound_sender, session_id, addr, current_batch).await;
-        if let Some(event) = close_event {
-            debug!("send_stream_action: session {session_id} batch {current_batch} firing Close");
-            event.update(StreamEvent::Close).await;
-        }
     }
 }
 
@@ -942,13 +966,6 @@ async fn close_outgoing_stream_action(session_id: SessionId) {
         "Invariant broken while trying to send on a session \
                             with ID {session_id}: session does not exist"
     )));
-
-    if let ConnectionStates::Established(box EstablishedState { state, .. }) = session {
-        if let SessionStates::Streaming(stream_state) = state {
-            stream_state.close();
-        }
-        *state = SessionStates::Up;
-    }
 }
 
 #[allow(clippy::cast_possible_truncation)]

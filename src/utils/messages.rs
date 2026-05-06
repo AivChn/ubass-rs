@@ -3,7 +3,7 @@ use std::{fmt::Display, net::SocketAddr};
 
 use crate::api::{ReadableBuffer, WriteableBuffer};
 use crate::error::ApiErrors;
-use crate::manager::packets::ByteRange;
+use crate::manager::packets::{ByteRange, PlaybackControlType};
 
 use derive_more::{Display, derive};
 use tokio::sync::mpsc::Receiver;
@@ -105,7 +105,19 @@ pub enum StreamEvent {
     Play,
     Pause,
     Close,
+    Done,
     Retransmit(Vec<ByteRange>),
+}
+
+impl From<PlaybackControlType> for StreamEvent {
+    fn from(value: PlaybackControlType) -> Self {
+        match value {
+            PlaybackControlType::Play => Self::Play,
+            PlaybackControlType::Pause => Self::Pause,
+            PlaybackControlType::Close => Self::Close,
+            PlaybackControlType::Done => Self::Done,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -138,6 +150,7 @@ pub enum ApiCommand {
     // DiscardConnection()
     CloseSession(SessionId),
     CloseStream(SessionId),
+    StreamAction(OneShot<(SessionId, PlaybackControlType), ()>),
     RequestData(OneShot<RequestDataRequest, core::result::Result<SessionId, ApiErrors>>),
     SendData(OneShot<SendDataRequest, core::result::Result<SessionId, ApiErrors>>),
     Close,

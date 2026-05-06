@@ -3,15 +3,17 @@ use std::{net::SocketAddr, time::Duration};
 use crate::{
     error::ConnectionError,
     lock,
-    manager::state::{ConnectionStates, EstablishedState, SessionStates, StreamState},
+    manager::state::{
+        ConnectionStates, EstablishedState, SessionStates, StreamState, Streaming, StreamingTo,
+    },
     match_or_return,
     packet_processor::fec,
     prelude::*,
     utils::PanicInDebug,
 };
-use tracing::warn;
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
 use tokio::sync::mpsc::{self, Receiver};
+use tracing::warn;
 
 use crate::{
     DEFAULT_PORT, get_state, lock_read, lock_write,
@@ -177,7 +179,9 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
         let Some(state) = guard.get_mut(&packet.session_id) else {
             return;
         };
-        state.received_data_packet(packet).await
+        state
+            .received_data_packet(packet, outbound_sender.clone())
+            .await
     };
 
     match result {
@@ -413,6 +417,34 @@ async fn session_id_collided(
     ))
     .send(outbound_sender, src_addr)
     .await;
+}
+
+pub async fn received_playback_control_packet(
+    packet: Box<PlaybackStatusPacket>,
+    outbound_sender: ManagerToProcessor,
+) {
+    match packet.control_type {
+        new_event @ (PlaybackControlType::Done
+        | PlaybackControlType::Pause
+        | PlaybackControlType::Play) => {
+            if let Some(ConnectionStates::Established(box EstablishedState {
+                state:
+                    SessionStates::Streaming(StreamState {
+                        streaming: Streaming::To(StreamingTo { event, .. }),
+                        ..
+                    }),
+                ..
+            })) = lock_read!(get_state!().connections).get(&packet.session_id)
+            {
+                event.update(new_event.into()).await;
+            }
+        }
+        PlaybackControlType::Close => {
+            get_state!()
+                .close_stream(packet.session_id, outbound_sender)
+                .await;
+        }
+    }
 }
 
 pub async fn received_handshake_ack_packet(packet: Box<HandshakeAckPacket>) {

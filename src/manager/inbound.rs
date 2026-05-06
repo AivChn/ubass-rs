@@ -8,7 +8,7 @@ use crate::{
             received::{
                 self, received_close_session_packet, received_handshake_ack_packet,
                 received_handshake_rejected_packet, received_keep_alive_packet,
-                received_parity_packet,
+                received_parity_packet, received_playback_control_packet,
             },
         },
         types::{ManagerFromProcessor, ManagerToApi, ManagerToProcessor},
@@ -89,7 +89,10 @@ async fn handle_message(
             // TODO: future features
             packets::Packet::RetransmitPacket(_retransmit_packet) => todo!(),
             packets::Packet::MetadataPacket(_metadata_packet) => todo!(),
-            packets::Packet::PlaybackStatusPacket(_playback_status_packet) => todo!(),
+            packets::Packet::PlaybackStatusPacket(playback_status_packet) => {
+                received_playback_control_packet(playback_status_packet, outbound_sender.clone())
+                    .await;
+            }
             packets::Packet::UnexpectedPacketErrorPacket(_unexpected_packet_error_packet) => {
                 todo!()
             }

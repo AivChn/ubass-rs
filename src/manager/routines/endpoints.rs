@@ -7,7 +7,10 @@ use std::{
     time::Duration,
 };
 
-use tokio::{runtime::Builder as RuntimeBuilder, sync::mpsc::Receiver};
+use tokio::{
+    runtime::Builder as RuntimeBuilder,
+    sync::{mpsc::Receiver, oneshot},
+};
 #[cfg(debug_assertions)]
 use tracing::info;
 use tracing::{debug, instrument, warn};
@@ -25,10 +28,10 @@ use crate::{
         },
         types::{ManagerFromApi, ManagerToApi, ManagerToProcessor},
     },
-    o_unwrap_or_return,
+    match_or_return, o_unwrap_or_return,
     utils::{
         ConnectionEvent, Flags, LogFail, OneShot, PanicInDebug, RequestDataRequest,
-        SendDataRequest, SendPacket, SendTarget, StreamEvent,
+        SendDataRequest, SendPacket, SendTarget, StreamEvent, StreamMessage,
     },
 };
 
@@ -283,5 +286,42 @@ pub async fn close_stream(session_id: SessionId, sender: ManagerToProcessor) {
 
     let address = o_unwrap_or_return!(get_state!().connections.address(session_id).await);
 
-    Box::new(PlaybackStatusPacket::stop(Options::none(), session_id)).send(sender, address);
+    Box::new(PlaybackStatusPacket::close(Options::none(), session_id)).send(sender, address);
+}
+
+#[instrument(skip_all)]
+pub async fn send_playback_control_packet(
+    session_id: SessionId,
+    control: PlaybackControlType,
+    response: oneshot::Sender<()>,
+    sender: ManagerToProcessor,
+) {
+    let address = o_unwrap_or_return!(get_state!().connections.address(session_id).await);
+
+    let paused = match control {
+        PlaybackControlType::Play => Some(false),
+        PlaybackControlType::Pause => Some(true),
+        _ => None,
+    };
+
+    if let Some(paused) = paused {
+        match_or_return!(
+            lock_read!(get_state!().connections).get(&session_id),
+            Some(ConnectionStates::Established(box EstablishedState {
+                state: SessionStates::Streaming(StreamState { stream, ..}),
+                ..
+            })) => stream
+        )
+        .send_modify(|m| m.paused = paused);
+    }
+
+    response.send(());
+
+    Box::new(PlaybackStatusPacket::new(
+        Options::construct(&[OptionFlags::RequireAck]),
+        session_id,
+        control,
+    ))
+    .send(sender, address)
+    .await;
 }
