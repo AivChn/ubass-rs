@@ -152,13 +152,15 @@ async fn handle_packet(
             add_ack!(for TrackRequestPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            process_encrypted(packet, session_id, addr, encryption_monitor).await
+            let serialized = process_encrypted(packet, session_id, addr, encryption_monitor).await;
+            processed!(serialized to addr as Session 3 times)
         }
         Packet::AppRejectErrorPacket(packet) => {
             add_ack!(for AppRejectErrorPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            process_encrypted(packet, session_id, addr, encryption_monitor).await
+            let serialized = process_encrypted(packet, session_id, addr, encryption_monitor).await;
+            processed!(serialized to addr as Error 3 times)
         }
 
         // authenticated
@@ -166,17 +168,23 @@ async fn handle_packet(
             add_ack!(for RetransmitPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
+            let serialized =
+                process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await;
+            processed!(serialized to addr as Session 3 times)
         }
         Packet::PlaybackStatusPacket(packet) => {
             add_ack!(for PlaybackStatusPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
-            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
+            let serialized =
+                process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await;
+            processed!(serialized to addr as Playback 3 times)
         }
         Packet::CloseSessionPacket(packet) => {
             let session_id = packet.session_id;
-            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
+            let serialized =
+                process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await;
+            processed!(serialized to addr as Session 3 times)
         }
         Packet::SessionDoesNotExistErrorPacket(packet) => {
             add_ack!(
@@ -186,7 +194,9 @@ async fn handle_packet(
             );
 
             let session_id = packet.session_id;
-            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
+            let serialized =
+                process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await;
+            processed!(serialized to addr as Error 3 times)
         }
         Packet::KeepAlivePacket(packet) => {
             let session_id = packet.session_id;
@@ -204,11 +214,15 @@ async fn handle_packet(
         // could not be acked
         Packet::UnexpectedPacketErrorPacket(packet) => {
             let session_id = packet.session_id;
-            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
+            let serialized =
+                process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await;
+            processed!(serialized to addr as Error 3 times)
         }
         Packet::AckPacket(packet) => {
             let session_id = packet.session_id;
-            process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await
+            let serialized =
+                process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await;
+            processed!(serialized to addr as Ack 3 times)
         }
 
         // nothing
@@ -274,12 +288,12 @@ async fn process_encrypted(
     session_id: SessionId,
     addr: SocketAddr,
     encryption_monitor: EncryptionMonitor,
-) -> ProcessedPacket {
+) -> Vec<u8> {
     encryption::encrypt(packet.as_mut(), session_id, encryption_monitor).await;
 
     let mut serialized;
     serialize!(packet -> serialized);
-    processed!(serialized to addr as Error 3 times)
+    serialized
 }
 
 async fn process_authenticated(
@@ -287,12 +301,12 @@ async fn process_authenticated(
     session_id: SessionId,
     addr: SocketAddr,
     encryption_monitor: EncryptionMonitor,
-) -> ProcessedPacket {
+) -> Vec<u8> {
     let mut serialized;
     serialize!(packet -> serialized);
 
     encryption::tag(&mut serialized, session_id, encryption_monitor).await;
-    processed!(serialized to addr as Error 3 times)
+    serialized
 }
 
 async fn recover(
