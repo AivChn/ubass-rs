@@ -6,6 +6,7 @@ use std::{
 };
 
 use tokio::sync::oneshot;
+use tracing::{error, instrument};
 
 use crate::{
     manager::{
@@ -373,6 +374,7 @@ async fn send_to_manager(msg: Result<ManagerMessage>, p_sender: InboundSender) {
     _ = p_sender.send(msg).await;
 }
 
+#[instrument(skip_all)]
 async fn send_packet_to_transport(
     packet: ProcessedPacket,
     t_sender: OutboundSender,
@@ -383,7 +385,7 @@ async fn send_packet_to_transport(
         .await
         .is_err()
     {
-        eprintln!("receiver dropped");
+        error!("Channel closed!");
         send_to_manager(
             Err(ChannelError::ChannelFailed(Outbound, Layer::PacketProcessor).into()),
             p_sender,
