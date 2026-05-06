@@ -270,7 +270,9 @@ pub async fn close_session(session_id: SessionId, sender: ManagerToProcessor) {
     Box::new(CloseSessionPacket::new(Options::none(), session_id))
         .send(
             sender,
-            o_unwrap_or_return!(get_state!().connections.address(session_id).await),
+            o_unwrap_or_return!(lock_read!(get_state!().connections).get(&session_id))
+                .address()
+                .await,
         )
         .await;
 
@@ -284,9 +286,13 @@ pub async fn close_stream(session_id: SessionId, sender: ManagerToProcessor) {
 
     get_state!().close_stream(session_id, sender.clone()).await;
 
-    let address = o_unwrap_or_return!(get_state!().connections.address(session_id).await);
+    let address = o_unwrap_or_return!(lock_read!(get_state!().connections).get(&session_id))
+        .address()
+        .await;
 
-    Box::new(PlaybackStatusPacket::close(Options::none(), session_id)).send(sender, address);
+    Box::new(PlaybackStatusPacket::close(Options::none(), session_id))
+        .send(sender, address)
+        .await;
 }
 
 #[instrument(skip_all)]
@@ -296,7 +302,9 @@ pub async fn send_playback_control_packet(
     response: oneshot::Sender<()>,
     sender: ManagerToProcessor,
 ) {
-    let address = o_unwrap_or_return!(get_state!().connections.address(session_id).await);
+    let address = o_unwrap_or_return!(lock_read!(get_state!().connections).get(&session_id))
+        .address()
+        .await;
 
     let paused = match control {
         PlaybackControlType::Play => Some(false),
@@ -315,7 +323,7 @@ pub async fn send_playback_control_packet(
         .send_modify(|m| m.paused = paused);
     }
 
-    response.send(());
+    _ = response.send(());
 
     Box::new(PlaybackStatusPacket::new(
         Options::construct(&[OptionFlags::RequireAck]),

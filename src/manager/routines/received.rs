@@ -39,13 +39,32 @@ pub async fn received_close_session_packet(packet: Box<CloseSessionPacket>) {
                 ..
             }) => stream.send_modify(|m| m.closed = true),
             ConnectionStates::Established(box EstablishedState { connection, .. }) => {
-                connection.send(ConnectionEvent::ConnectionClosed);
+                _ = connection.send(ConnectionEvent::ConnectionClosed).await;
             }
             ConnectionStates::Handshake { .. } => {}
         }
     }
 
-    get_state!().close_session(packet.session_id);
+    get_state!().close_session(packet.session_id).await;
+}
+
+pub async fn received_retransmit_request(packet: Box<RetransmitPacket>) {
+    if let Some(ConnectionStates::Established(box EstablishedState {
+        state:
+            SessionStates::Streaming(StreamState {
+                streaming:
+                    Streaming::To(StreamingTo {
+                        buffer,
+                        current_batch,
+                        event,
+                    }),
+                ..
+            }),
+        ..
+    })) = lock_read!(get_state!().connections).get(&packet.session_id)
+    {
+        event.update(StreamEvent::Retransmit(packet.payload)).await;
+    }
 }
 
 pub async fn received_keep_alive_packet(packet: Box<KeepAlivePacket>) {
@@ -103,7 +122,7 @@ pub async fn received_handshake_rejected_packet(packet: Box<HandshakeRejection>)
                 } else {
                     String::from_utf8(packet.payload.take()).ok()
                 };
-                handshake
+                _ = handshake
                     .response
                     .send(Err(ConnectionError::PeerRejected(reason)));
             }
@@ -114,7 +133,7 @@ pub async fn received_handshake_rejected_packet(packet: Box<HandshakeRejection>)
                 ..
             }) = lock_write!(get_state!().connections).remove(&packet.session_id)
             {
-                ack_triggered_response.send(Err(ConnectionError::SessionIdCollided));
+                _ = ack_triggered_response.send(Err(ConnectionError::SessionIdCollided));
             }
         }
     }
@@ -200,7 +219,9 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
             )
             .send(
                 outbound_sender,
-                o_unwrap_or_return!(get_state!().connections.address(session_id).await),
+                o_unwrap_or_return!(lock_read!(get_state!().connections).get(&session_id))
+                    .address()
+                    .await,
             )
             .await;
         }

@@ -18,7 +18,7 @@ use crate::{
         packets::{
             BatchID, BytePosition, ByteRange, DataPacket, FECInfo, KeepAlivePacket,
             MAX_PAYLOAD_LENGTH, OptionFlags, Options, Packet, PacketFingerprint,
-            PlaybackStatusPacket, SessionId,
+            PlaybackStatusPacket, RetransmitPacket, SessionId,
         },
         types::{ForeignTimestamp, ManagerToProcessor},
     },
@@ -70,17 +70,6 @@ pub struct LastActivityTable(HashMap<SessionId, ForeignTimestamp>);
 #[derive(Default, Debug, Deref)]
 pub struct ConnectionStatesTable(RwLock<HashMap<SessionId, ConnectionStates>>);
 
-impl ConnectionStatesTable {
-    pub async fn address(&self, session_id: SessionId) -> Option<SocketAddr> {
-        match lock_read!(self.0).get(&session_id)? {
-            ConnectionStates::Handshake { address, .. } => Some(*lock_read!(address)),
-            ConnectionStates::Established(box EstablishedState { address, .. }) => {
-                Some(*lock_read!(address))
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct StreamingTo {
     pub buffer: ReadableBuffer,
@@ -128,7 +117,7 @@ impl StreamState {
                 for _ in 0..=(range.length as usize / MAX_PAYLOAD_LENGTH) {
                     let end = (*range.start as usize + MAX_PAYLOAD_LENGTH).min(buffer.len());
                     let Some(payload) = buffer.read(*range.start as usize..end) else {
-                        return Some(buf);
+                        continue;
                     };
 
                     buf.push((range.start, Box::from(payload)));
@@ -182,6 +171,7 @@ impl Display for SessionStates {
 
 #[derive(Debug)]
 pub struct EstablishedState {
+    pub session_id: SessionId,
     pub last_activity: Mutex<ForeignTimestamp>,
     pub connection: mpsc::Sender<ConnectionEvent>,
     pub state: SessionStates,
@@ -192,6 +182,7 @@ pub struct EstablishedState {
 #[derive(Debug)]
 pub enum ConnectionStates {
     Handshake {
+        session_id: SessionId,
         ack_triggered_response: oneshot::Sender<
             core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
         >,
@@ -369,6 +360,10 @@ impl ConnectionStates {
                 return Ok(false);
             }
 
+            if packet.fec_info.batch_pos == packet.fec_info.batch_size {
+                self.check_for_retransmits(sender).await;
+            }
+
             Ok(fec::received(packet).await)
         } else {
             Err(Error::StateMismatch {
@@ -376,6 +371,53 @@ impl ConnectionStates {
                 found: (&*self).into(),
             })
         }
+    }
+
+    /// Naive implementation of retransmition requests - check for holes in bytes before 75% of head
+    /// and request retransmit for missing
+    async fn check_for_retransmits(&self, sender: ManagerToProcessor) {
+        let buf = match_or_return!(self,
+            ConnectionStates::Established(box EstablishedState {
+                state: SessionStates::Streaming(StreamState {
+                    streaming: Streaming::From(buf), ..
+                }), ..
+            }) => buf);
+
+        #[allow(clippy::cast_possible_truncation)]
+        let mut ranges = buf
+            .find_holes(BytePosition(((buf.head() / 4) * 3) as u32))
+            .into_iter()
+            .map(|e| ByteRange::new(e, MAX_PAYLOAD_LENGTH as u16));
+
+        let mut tmp_range: ByteRange = o_unwrap_or_return!(ranges.next());
+        let mut final_ranges = vec![];
+
+        for range in ranges {
+            if !tmp_range.concat(&range) {
+                final_ranges.push(tmp_range);
+                tmp_range = range;
+            }
+        }
+
+        final_ranges.push(tmp_range);
+
+        let chunks: Vec<_> = final_ranges.chunks(MAX_PAYLOAD_LENGTH / 6).collect();
+
+        for chunk in chunks {
+            Box::new(RetransmitPacket::data(
+                Options::none(),
+                self.session_id(),
+                chunk.to_vec(),
+            ))
+            .send(sender.clone(), self.address().await)
+            .await;
+        }
+    }
+
+    pub async fn address(&self) -> SocketAddr {
+        let (ConnectionStates::Handshake { address, .. }
+        | ConnectionStates::Established(box EstablishedState { address, .. })) = self;
+        *lock_read!(address)
     }
 
     // TODO:
@@ -414,6 +456,12 @@ impl ConnectionStates {
         | ConnectionStates::Handshake { address, .. }) = self;
 
         *lock_write!(address) = new;
+    }
+
+    pub fn session_id(&self) -> SessionId {
+        let (ConnectionStates::Established(box EstablishedState { session_id, .. })
+        | ConnectionStates::Handshake { session_id, .. }) = self;
+        *session_id
     }
 }
 
@@ -455,7 +503,7 @@ impl ProtocolState {
             function was called more than once",
         ));
 
-        handles.join();
+        _ = handles.join().await;
     }
 
     pub fn app_id(&self) -> AppId {
@@ -512,6 +560,7 @@ impl ProtocolState {
         };
 
         entry.insert(ConnectionStates::Established(Box::new(EstablishedState {
+            session_id,
             last_activity: Mutex::default(),
             connection,
             state: SessionStates::Up,
@@ -559,6 +608,7 @@ impl ProtocolState {
         let mut lock = lock_write!(self.connections);
         match o_unwrap_or_return!(lock.remove(&session_id)) {
             ConnectionStates::Handshake {
+                session_id,
                 ack_triggered_response,
                 app_id,
                 address,
@@ -568,6 +618,7 @@ impl ProtocolState {
                 lock.insert(
                     session_id,
                     ConnectionStates::Established(Box::new(EstablishedState {
+                        session_id,
                         last_activity: Mutex::default(),
                         connection: sender,
                         state: SessionStates::Up,
@@ -604,6 +655,7 @@ impl ProtocolState {
         );
 
         entry.insert(ConnectionStates::Handshake {
+            session_id,
             ack_triggered_response: response,
             app_id,
             signal: watch::channel(false).0,
@@ -620,6 +672,7 @@ impl ProtocolState {
         for (session_id, connection) in lock_write!(self.connections).drain() {
             match connection {
                 ConnectionStates::Handshake {
+                    session_id,
                     ack_triggered_response,
                     app_id,
                     address,
@@ -668,7 +721,7 @@ impl ProtocolState {
         let event = {
             let mut lock = lock_write!(get_state!().connections);
             let session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
-                "Invariant broken while trying to send on a session \
+                "Invariant broken in `send_on_session` \
                 with ID {session_id}: session does not exist"
             )));
 
@@ -682,7 +735,7 @@ impl ProtocolState {
                             ..
                         }), ..
                 }) => event,
-                format!("Invariant broken while trying to send on a session \
+                format!("Invariant broken in `send_on_session` \
                     with ID {session_id}: session not in correct state even though stream_to() was just called")
             )
             .clone()
@@ -715,15 +768,18 @@ impl ProtocolState {
                                         ));
                                 }
                             },
+
                             StreamEvent::Done => {
                                 debug!("stream done for session {session_id}");
                                 self.close_stream(session_id, outbound_sender.clone()).await;
                             }
+
                             StreamEvent::Close => {
                                 debug!("Close received for session {session_id}");
                                 close_outgoing_stream_action(session_id).await;
                                 return;
                             }
+
                             StreamEvent::Retransmit(byte_ranges) if playing => {
                                 self
                                     .global_handle_monitor
@@ -733,6 +789,7 @@ impl ProtocolState {
                                         byte_ranges,
                                     ));
                             }
+
                             StreamEvent::Retransmit(byte_ranges) => {
                                 paused_retransmits.extend(byte_ranges);
                             }
@@ -834,7 +891,8 @@ impl ProtocolState {
 
         lock_write!(get_state!().connections)
             .get_mut(&session_id)?
-            .update_address(new);
+            .update_address(new)
+            .await;
 
         Some(new)
     }
@@ -847,14 +905,14 @@ impl ProtocolState {
         loop {
             tokio_sleep(KEEP_ALIVE_INTERVAL).await;
             let addr = o_unwrap_or_return!(
-                get_state!()
-                    .connections
-                    .address(session_id)
-                    .await
+                lock_read!(get_state!().connections)
+                    .get(&session_id)
                     .log_debug(&format!(
                         "session with ID {session_id} closed, stopping keepalive"
                     ))
-            );
+            )
+            .address()
+            .await;
             Box::new(KeepAlivePacket::new(Options::none(), session_id))
                 .send(sender.clone(), addr)
                 .await;
@@ -870,7 +928,7 @@ async fn retransmit_action(
     let action = {
         let mut lock = lock_write!(get_state!().connections);
         let session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
-            "Invariant broken while trying to send on a session \
+            "Invariant broken in `retransmit_action` \
                                 with ID {session_id}: session does not exist"
         )));
         if let ConnectionStates::Established(box EstablishedState {
@@ -910,11 +968,12 @@ async fn retransmit_action(
     }
 }
 
+#[instrument(skip_all)]
 async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToProcessor, n: usize) {
     let action = {
         let mut lock = lock_write!(get_state!().connections);
         let session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
-            "Invariant broken while trying to send on a session \
+            "Invariant broken in `send_stream_action` \
                                 with ID {session_id}: session does not exist"
         )));
         if let ConnectionStates::Established(box EstablishedState {
@@ -940,16 +999,18 @@ async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToPro
                 **current_batch += 1;
                 *current_batch
             } else {
-                debug!("send_stream_action: session {session_id} not Streaming::To after check");
+                debug!("session {session_id} not Streaming::To after check");
                 return;
             };
             debug!(
-                "send_stream_action: session {session_id} batch {current_batch}: {} chunks ",
+                "session {session_id} batch {current_batch}: {} chunks ",
                 chunks.len(),
             );
             Some((chunks, addr, current_batch))
         } else {
-            debug!("send_stream_action: session {session_id} no action");
+            debug!(
+                "state is wrong or buffer has been fully sent for session {session_id} - no action"
+            );
             None
         }
     };

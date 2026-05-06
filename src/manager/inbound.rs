@@ -9,6 +9,7 @@ use crate::{
                 self, received_close_session_packet, received_handshake_ack_packet,
                 received_handshake_rejected_packet, received_keep_alive_packet,
                 received_parity_packet, received_playback_control_packet,
+                received_retransmit_request,
             },
         },
         types::{ManagerFromProcessor, ManagerToApi, ManagerToProcessor},
@@ -87,7 +88,9 @@ async fn handle_message(
             ) => todo!(),
             packets::Packet::AppRejectErrorPacket(_app_reject_error_packet) => todo!(),
             // TODO: future features
-            packets::Packet::RetransmitPacket(_retransmit_packet) => todo!(),
+            packets::Packet::RetransmitPacket(retransmit_packet) => {
+                received_retransmit_request(retransmit_packet).await;
+            }
             packets::Packet::MetadataPacket(_metadata_packet) => todo!(),
             packets::Packet::PlaybackStatusPacket(playback_status_packet) => {
                 received_playback_control_packet(playback_status_packet, outbound_sender.clone())
