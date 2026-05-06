@@ -3,7 +3,10 @@ use std::{
     fmt::{Debug, format},
     net::SocketAddr,
     ops::Deref,
-    sync::{Arc, atomic::AtomicBool},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -120,13 +123,13 @@ impl<T: Send + Sync> Shared<T> {
     pub async fn update(&self, value: T) {
         let mut val = lock_write!(self.value);
         *val = value;
-        self.signal.notify_waiters();
+        self.signal.notify_one();
     }
 
     pub async fn update_with(&self, f: impl Fn(&mut T)) {
         let mut val = lock_write!(self.value);
         f(&mut *val);
-        self.signal.notify_waiters();
+        self.signal.notify_one();
     }
 }
 
@@ -319,21 +322,13 @@ pub trait SendPacket {
 pub struct W<T>(pub T);
 
 pub struct HandleMonitor {
-    handles: Mutex<Vec<JoinHandle<()>>>,
-    destroyed: AtomicBool,
+    running: AtomicUsize,
+    notify: Notify,
 }
 
 impl HandleMonitor {
-    const PRUNE_INTERVAL: u64 = 1000;
-
-    pub async fn size(&self) -> usize {
-        let mut handles = self.handles.lock().await;
-        handles.retain(|h| !h.is_finished());
-        handles.len()
-    }
-
-    pub fn init(self: Arc<Self>) {
-        tokio::spawn(self.prune());
+    pub fn size(&self) -> usize {
+        self.running.load(Ordering::Acquire)
     }
 
     #[inline]
@@ -341,25 +336,22 @@ impl HandleMonitor {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.running.fetch_add(1, Ordering::Relaxed);
         let copy = self.clone();
-        tokio::spawn(async move { copy.handles.lock().await.push(tokio::spawn(future)) });
-    }
-
-    pub async fn prune(self: Arc<Self>) {
-        while !self.destroyed.load(std::sync::atomic::Ordering::Acquire) {
-            tokio::time::sleep(Duration::from_millis(Self::PRUNE_INTERVAL)).await;
-            let mut handles = self.handles.lock().await;
-            handles.retain(|h| !h.is_finished());
-        }
+        tokio::spawn(async move {
+            future.await;
+            if copy.running.fetch_sub(1, Ordering::AcqRel) == 1 {
+                copy.notify.notify_one();
+            }
+        });
     }
 
     pub async fn flush(&self) {
-        self.destroyed
-            .store(true, std::sync::atomic::Ordering::Release);
-
-        let mut handles = self.handles.lock().await;
-        for handle in handles.drain(..) {
-            _ = handle.await;
+        loop {
+            if self.running.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            self.notify.notified().await;
         }
     }
 }
@@ -367,8 +359,8 @@ impl HandleMonitor {
 impl Default for HandleMonitor {
     fn default() -> Self {
         Self {
-            handles: Mutex::new(Vec::with_capacity(32)),
-            destroyed: AtomicBool::new(false),
+            running: AtomicUsize::new(0),
+            notify: Notify::new(),
         }
     }
 }
