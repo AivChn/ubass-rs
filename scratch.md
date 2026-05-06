@@ -250,3 +250,11 @@ write to buffer
 ```
 ```
 ```
+
+
+# What To Do?
+
+1. Hello Packet - send through listening socket instead of port as header
+2. StreamDone packet
+3. Restransmission
+4. key rotation
