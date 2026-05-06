@@ -1,12 +1,12 @@
 use crate::{
     api::{
         self, Api, SendTarget,
-        types::{ReadableBuffer, WriteableBuffer},
+        types::{PlaybackControl, ReadableBuffer, WriteableBuffer},
     },
     error::ConnectionError,
     manager::{
         AppId, endpoints,
-        packets::{MAX_PAYLOAD_LENGTH, PayloadField, SessionId},
+        packets::{MAX_PAYLOAD_LENGTH, PayloadField, PlaybackControlType, SessionId},
     },
     o_unwrap_or_return,
     prelude::{ApiCommand, ApiErrors, ApiMessage, AppResponse},
@@ -189,6 +189,18 @@ impl ApiInner {
         _ = self
             .api_to_manager
             .try_send(ApiCommand::CloseSession(session_id));
+    }
+
+    async fn send_playback_control(
+        &self,
+        session_id: SessionId,
+        control: PlaybackControlType,
+    ) -> ResponseReceiver<()> {
+        let (sender, receiver) = OneShot::new((session_id, control));
+        self.api_to_manager
+            .send(ApiCommand::StreamAction(sender))
+            .await;
+        receiver
     }
 }
 
@@ -522,22 +534,39 @@ impl InputStream {
     }
 }
 
+impl InputStream {
+    async fn send_playback_control(
+        &self,
+        control: PlaybackControlType,
+    ) -> Result<usize, ConnectionError> {
+        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+        // waits for the packet to be sent and the state to be actually updated
+        api.send_playback_control(self.session, control)
+            .await
+            .recv();
+
+        Ok(self.update.borrow().head)
+    }
+}
+
+impl PlaybackControl for InputStream {
+    async fn pause(&self) -> Result<Self::Idx, Self::Error> {
+        self.send_playback_control(PlaybackControlType::Pause).await
+    }
+
+    async fn play(&self) -> Result<Self::Idx, Self::Error> {
+        self.send_playback_control(PlaybackControlType::Play).await
+    }
+
+    async fn seek(&self, position: Self::Idx) -> Result<Self::Idx, Self::Error> {
+        unimplemented!()
+    }
+}
+
 impl api::types::Stream for InputStream {
     type Error = ConnectionError;
     type Idx = usize;
     type Connection = Connection;
-
-    async fn pause(&mut self) -> Result<usize, Self::Error> {
-        todo!()
-    }
-
-    async fn play(&mut self) -> Result<usize, Self::Error> {
-        todo!()
-    }
-
-    async fn seek(&mut self, _position: usize) -> Result<usize, Self::Error> {
-        todo!()
-    }
 
     fn current_position(&self) -> usize {
         self.update.borrow().head
@@ -598,18 +627,6 @@ impl api::types::Stream for OutputStream {
     type Error = ConnectionError;
     type Idx = usize;
     type Connection = Connection;
-
-    async fn pause(&mut self) -> Result<usize, Self::Error> {
-        todo!()
-    }
-
-    async fn play(&mut self) -> Result<usize, Self::Error> {
-        todo!()
-    }
-
-    async fn seek(&mut self, _position: usize) -> Result<usize, Self::Error> {
-        todo!()
-    }
 
     fn current_position(&self) -> usize {
         self.update.borrow().head

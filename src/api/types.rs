@@ -232,14 +232,17 @@ pub trait Stream {
     type Idx: SliceIndex<[u8]>;
     type Connection: Connection;
 
-    async fn pause(&mut self) -> Result<Self::Idx, Self::Error>;
-    async fn play(&mut self) -> Result<Self::Idx, Self::Error>;
-    async fn seek(&mut self, position: Self::Idx) -> Result<Self::Idx, Self::Error>;
     fn current_position(&self) -> Self::Idx;
     fn is_playing(&self) -> bool;
     async fn is_done(&self) -> bool;
     async fn complete(self) -> Result<Self::Connection, Self::Error>;
     async fn close(self) -> Result<Self::Connection, Self::Error>;
+}
+
+pub trait PlaybackControl: Stream {
+    async fn play(&self) -> Result<Self::Idx, Self::Error>;
+    async fn pause(&self) -> Result<Self::Idx, Self::Error>;
+    async fn seek(&self, position: Self::Idx) -> Result<Self::Idx, Self::Error>;
 }
 
 pub trait IncomingConnection: Sized {
