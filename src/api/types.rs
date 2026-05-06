@@ -126,8 +126,6 @@ impl WriteableBuffer {
             return None;
         }
 
-        debug!("{:?}", unsafe { self.buffer.0.as_ref() });
-
         self.occupy(position);
         let position = *position as usize;
         let range = position..position + to_write.len();
