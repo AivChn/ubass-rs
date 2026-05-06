@@ -125,6 +125,7 @@ async fn server(port: u16, reply: Option<Box<[u8]>>) -> Result<(), ()> {
     };
 
     _ = stream.complete().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
     Ok(())
 }
 
@@ -152,16 +153,14 @@ async fn client(port: u16, server_addr: SocketAddr, message: Vec<u8>) -> Result<
     debug!("opened connection with {}", connection.session_id());
     debug!("trying to request stream with {}", connection.session_id());
 
-    let mut buffer = vec![0; message.len()];
+    let buffer = vec![0u8; message.len()];
+    let buffer = Box::into_raw(buffer.into());
     let mut id = message.clone();
     id.truncate(MAX_PAYLOAD_LENGTH);
-    let stream = timeout(
-        Duration::from_secs(2),
-        connection.request(id, buffer.as_mut_slice()),
-    )
-    .await
-    .map_err(|_| println!("request timeout"))?
-    .map_err(|_| println!("request"))?;
+    let stream = timeout(Duration::from_secs(2), connection.request(id, buffer))
+        .await
+        .map_err(|_| println!("request timeout"))?
+        .map_err(|_| println!("request"))?;
 
     debug!("waiting for stream to complete");
     let _connection = timeout(Duration::from_secs(50), stream.complete())
@@ -170,9 +169,11 @@ async fn client(port: u16, server_addr: SocketAddr, message: Vec<u8>) -> Result<
         .unwrap()
         .unwrap();
 
+    let buffer = unsafe { Box::from_raw(buffer).to_vec() };
     assert_eq!(buffer, message.clone());
     let buffer_rep = str::from_utf8(&buffer).unwrap_or("FAILED PARSING");
     let message_rep = str::from_utf8(&buffer).unwrap_or("FAILED PARSING");
     info!("test passed! {buffer_rep} == {message_rep}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
     Ok(())
 }
