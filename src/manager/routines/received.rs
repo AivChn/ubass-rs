@@ -155,7 +155,8 @@ pub async fn received_parity_packet(packet: ParityPacket, outbound_sender: Manag
     if fec::received(packet).await {
         let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id).await);
         _ = o_unwrap_or_return!(lock_write!(get_state!().connections).get_mut(&session_id))
-            .recovered_packet(recovered);
+            .recovered_packet(recovered, outbound_sender)
+            .await;
     }
 }
 
@@ -207,7 +208,8 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
         Ok(b) if b => {
             let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id).await);
             _ = o_unwrap_or_return!(lock_write!(get_state!().connections).get_mut(&session_id))
-                .recovered_packet(recovered);
+                .recovered_packet(recovered, outbound_sender)
+                .await;
         }
         Err(Error::StateMismatch { .. }) => {
             UnexpectedPacketErrorPacket::unexpected(

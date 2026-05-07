@@ -65,7 +65,7 @@ impl WriteableBuffer {
 
     #[must_use]
     pub fn is_done(&self) -> bool {
-        *self.head as usize >= self.len()
+        self.head() >= self.len()
     }
 
     const fn position_to_index(&self, position: BytePosition) -> Option<usize> {
@@ -91,6 +91,7 @@ impl WriteableBuffer {
             "Invariant broken while trying to occupy a chunk at index {i} (position {position}): chunk already occupied"
         );
         self.map[i] = true;
+        debug!("occupied position {i}");
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -117,6 +118,8 @@ impl WriteableBuffer {
         if i == self.map.len() {
             *self.head = self.len() as u32;
         }
+
+        debug!("advanced head to {}", self.head());
     }
 
     pub fn write(

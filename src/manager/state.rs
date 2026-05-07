@@ -7,7 +7,7 @@ use tokio::{
     task::JoinHandle,
     time::{interval, sleep as tokio_sleep},
 };
-use tracing::{debug, instrument, warn};
+use tracing::{debug, field::debug, instrument, warn};
 use x25519_dalek::EphemeralSecret;
 
 use crate::{
@@ -346,17 +346,21 @@ impl ConnectionStates {
 
             stream.send_modify(|m| {
                 m.head = buffer.head();
-                m.closed = buffer.is_done();
             });
 
             if buffer.is_done() {
-                debug!("received_data_packet: buffer complete");
+                debug!("buffer complete");
                 Box::new(PlaybackStatusPacket::done(
                     Options::construct(&[OptionFlags::RequireAck]),
                     packet.session_id,
                 ))
                 .send(sender, *lock_read!(address))
                 .await;
+
+                stream.send_modify(|m| {
+                    m.closed = true;
+                });
+
                 return Ok(false);
             }
 
@@ -422,7 +426,11 @@ impl ConnectionStates {
 
     // TODO:
     /// # Errors
-    pub fn recovered_packet(&mut self, recovered: Recovered) -> ErrResult {
+    pub async fn recovered_packet(
+        &mut self,
+        recovered: Recovered,
+        sender: ManagerToProcessor,
+    ) -> ErrResult {
         if let ConnectionStates::Established(box EstablishedState {
             state:
                 SessionStates::Streaming(StreamState {
@@ -430,6 +438,8 @@ impl ConnectionStates {
                     stream,
                     ..
                 }),
+            address,
+            session_id,
             ..
         }) = self
         {
@@ -439,6 +449,20 @@ impl ConnectionStates {
                 stream.send_modify(|m| {
                     m.head = buffer.head();
                     m.closed = buffer.is_done();
+                });
+            }
+
+            if buffer.is_done() {
+                debug!("buffer complete");
+                Box::new(PlaybackStatusPacket::done(
+                    Options::construct(&[OptionFlags::RequireAck]),
+                    *session_id,
+                ))
+                .send(sender, *lock_read!(address))
+                .await;
+
+                stream.send_modify(|m| {
+                    m.closed = true;
                 });
             }
 
@@ -772,6 +796,7 @@ impl ProtocolState {
                             StreamEvent::Done => {
                                 debug!("stream done for session {session_id}");
                                 self.close_stream(session_id, outbound_sender.clone()).await;
+                                return;
                             }
 
                             StreamEvent::Close => {
