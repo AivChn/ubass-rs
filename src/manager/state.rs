@@ -1,8 +1,8 @@
-use aes_gcm_siv::Aes256GcmSiv;
+use aes_gcm_siv::{Aes256GcmSiv, aead::Buffer};
 use derive_more::{Deref, Display};
 use reed_solomon_simd::engine::tables;
 use tokio::{
-    select,
+    select, stream,
     sync::{Mutex, RwLock, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{interval, sleep as tokio_sleep},
@@ -18,7 +18,7 @@ use crate::{
         packets::{
             BatchID, BytePosition, ByteRange, DataPacket, FECInfo, KeepAlivePacket,
             MAX_PAYLOAD_LENGTH, OptionFlags, Options, Packet, PacketFingerprint,
-            PlaybackStatusPacket, RetransmitPacket, SessionId,
+            PlaybackControlPacket, RetransmitPacket, SessionId,
         },
         types::{ForeignTimestamp, ManagerToProcessor},
     },
@@ -30,20 +30,29 @@ use crate::{
 use core::panic;
 use std::{
     collections::{HashSet, VecDeque, hash_map::Entry},
+    convert::identity,
     fmt::{Display, format},
     mem,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
+    ops::Deref,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
     },
     time::Duration,
 };
 
-const PACKET_DISCARD_TIME_MS: u64 = 7 * 1000;
+const PACKET_DISCARD_TIME_MS: u64 = 500;
 const SEND_INTERVAL: Duration = Duration::from_millis(25);
 pub const PACKET_COUNT_PER_BATCH: usize = 28;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(500);
+/// Number of batch-level events (data batch_ends and FEC recoveries) the
+/// receiver tolerates while in finalize state before re-issuing the
+/// end-of-session retransmit sweep. The server packs each retransmit request
+/// into a single response batch, so a threshold of 1 means "ask again after
+/// every server response that didn't fully complete the buffer" — geometric
+/// convergence under loss.
+const SWEEP_BATCH_THRESHOLD: u32 = 1;
 
 macro_rules! sessions_state_fields {
     ($($name:ident($key:ty => $value:ty)),*) => {
@@ -73,8 +82,26 @@ pub struct ConnectionStatesTable(RwLock<HashMap<SessionId, ConnectionStates>>);
 #[derive(Debug)]
 pub struct StreamingTo {
     pub buffer: ReadableBuffer,
-    pub current_batch: BatchID,
+    /// Monotonically-incrementing batch id source. Stored atomic so the
+    /// "increment-and-return-new" sequence can run without holding an
+    /// exclusive `connections` lock and so concurrent retransmit_action and
+    /// send_stream_action callers can never observe the same value.
+    pub current_batch: AtomicU16,
     pub event: Arc<Shared<StreamEvent>>,
+}
+
+impl StreamingTo {
+    /// Atomically increment the batch counter and return the new `BatchID`.
+    pub fn next_batch_id(&self) -> BatchID {
+        // Start state is 0; the first call returns 1, satisfying
+        // `BatchID::new`'s nonzero invariant. Wrapping back to 0 after
+        // u16::MAX batches will hit that invariant — currently out of scope.
+        let raw = self
+            .current_batch
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1);
+        BatchID::new(raw)
+    }
 }
 
 #[derive(Debug)]
@@ -253,7 +280,8 @@ impl ConnectionStates {
                     streaming: Streaming::To(StreamingTo {
                         buffer,
                         event: Arc::default(),
-                        current_batch: BatchID::new(1),
+                        // First `next_batch_id()` call yields 1.
+                        current_batch: AtomicU16::new(0),
                     }),
                     stream: sender,
                     fec: SessionFecState::default(),
@@ -308,7 +336,9 @@ impl ConnectionStates {
         };
 
         if let Streaming::To(StreamingTo { event, .. }) = &stream_state.streaming {
-            event.update(StreamEvent::Close).await;
+            event
+                .update(StreamEvent::Playback(PlaybackControl::Close))
+                .await;
         }
 
         stream_state.stream.send_modify(|m| m.closed = true);
@@ -323,6 +353,11 @@ impl ConnectionStates {
         packet: DataPacket,
         sender: ManagerToProcessor,
     ) -> Result<bool> {
+        let address_copy: SocketAddr;
+        let declare_done: bool;
+        let just_reached_end: bool;
+        let batch_end: bool;
+        let resweep_due: bool;
         if let ConnectionStates::Established(box EstablishedState {
             state:
                 SessionStates::Streaming(StreamState {
@@ -335,6 +370,7 @@ impl ConnectionStates {
         }) = self
         {
             debug!("received data: {}", packet.byte_range_start);
+            let prev_head_at_end = buffer.head_at_end();
             let payload = packet.payload.clone().take();
             if buffer.write(packet.byte_range_start, payload).is_none() {
                 warn!(
@@ -348,52 +384,120 @@ impl ConnectionStates {
                 m.head = buffer.head();
             });
 
-            if buffer.is_done() {
-                debug!("buffer complete");
-                Box::new(PlaybackStatusPacket::done(
-                    Options::construct(&[OptionFlags::RequireAck]),
-                    packet.session_id,
-                ))
-                .send(sender, *lock_read!(address))
-                .await;
+            let complete_allow_partial = stream.borrow().complete.is_some_and(identity);
+            let head_at_end = buffer.head_at_end();
+            // strict is_done = head reached end AND every chunk is filled.
+            // partial-allow lets the user finish the stream with skipped data, but
+            // we still wait until the head has reached the end of the buffer.
+            declare_done = buffer.is_done() || (complete_allow_partial && head_at_end);
+            just_reached_end = !prev_head_at_end && head_at_end;
+            // batch_pos runs [0, batch_size); the last data packet of a batch has
+            // batch_pos == batch_size - 1. Widen to u16 for the comparison so
+            // batch_pos == u8::MAX (which can occur once retransmit batches grow
+            // past 256 chunks) doesn't panic on the +1.
+            batch_end = u16::from(packet.fec_info.batch_pos) + 1
+                == u16::from(packet.fec_info.batch_size);
 
+            // Stalled-finalize detection: while we're in finalize state and a
+            // batch boundary lands without bringing us to strict-is_done, count
+            // it. After SWEEP_BATCH_THRESHOLD such batches we re-issue the
+            // end-of-session sweep — covers the lost-retransmit-response case
+            // without a wall-clock timer.
+            resweep_due = if head_at_end && batch_end && !buffer.is_done() {
+                let n = buffer.note_batch_end();
+                if n >= SWEEP_BATCH_THRESHOLD {
+                    buffer.reset_sweep_counter();
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            if just_reached_end {
+                buffer.reset_sweep_counter();
+            }
+
+            address_copy = *lock_read!(address);
+        } else {
+            return Err(Error::StateMismatch {
+                expected: FlatState::StreamingFrom,
+                found: (&*self).into(),
+            });
+        }
+
+        if declare_done {
+            debug!("buffer complete");
+            Box::new(PlaybackControlPacket::done(
+                Options::construct(&[OptionFlags::RequireAck]),
+                packet.session_id,
+            ))
+            .send(sender, address_copy)
+            .await;
+            if let ConnectionStates::Established(box EstablishedState {
+                state: SessionStates::Streaming(StreamState { stream, .. }),
+                ..
+            }) = self
+            {
                 stream.send_modify(|m| {
                     m.closed = true;
                 });
-
-                return Ok(false);
             }
-
-            if packet.fec_info.batch_pos == packet.fec_info.batch_size {
-                self.check_for_retransmits(sender).await;
-            }
-
-            Ok(fec::received(packet).await)
-        } else {
-            Err(Error::StateMismatch {
-                expected: FlatState::StreamingFrom,
-                found: (&*self).into(),
-            })
+            return Ok(false);
         }
+
+        // End-of-session sweep: fires once when head first crosses len, and
+        // again every SWEEP_BATCH_THRESHOLD batch-level events while we're
+        // stalled in finalize state. Combined with the existing ack-window
+        // retry on the request packet itself, this covers both lost-request
+        // and lost-response cases without a wall-clock timer.
+        if just_reached_end || resweep_due {
+            let final_holes = self.holes(4).unwrap_or_default();
+            if !final_holes.is_empty() {
+                debug!(
+                    "end-of-session sweep ({}): requesting {} hole ranges",
+                    if just_reached_end { "initial" } else { "stall-resweep" },
+                    final_holes.len()
+                );
+                self.send_retransmit_requests(sender, final_holes).await;
+                return Ok(fec::received(packet).await);
+            }
+        }
+
+        if batch_end {
+            self.check_for_retransmits(sender).await;
+        }
+
+        Ok(fec::received(packet).await)
     }
 
-    /// Naive implementation of retransmition requests - check for holes in bytes before 75% of head
-    /// and request retransmit for missing
-    async fn check_for_retransmits(&self, sender: ManagerToProcessor) {
-        let buf = match_or_return!(self,
-            ConnectionStates::Established(box EstablishedState {
-                state: SessionStates::Streaming(StreamState {
-                    streaming: Streaming::From(buf), ..
-                }), ..
-            }) => buf);
+    // dw until_quadrant is temporary
+    pub fn holes(&self, until_quadrant: usize) -> Option<Vec<ByteRange>> {
+        if until_quadrant > 4 {
+            return None;
+        }
+        let ConnectionStates::Established(box EstablishedState {
+            state:
+                SessionStates::Streaming(StreamState {
+                    streaming: Streaming::From(buf),
+                    ..
+                }),
+            ..
+        }) = self
+        else {
+            return None;
+        };
 
         #[allow(clippy::cast_possible_truncation)]
         let mut ranges = buf
-            .find_holes(BytePosition(((buf.head() / 4) * 3) as u32))
+            .find_holes(BytePosition(((buf.head() / 4) * until_quadrant) as u32))
             .into_iter()
             .map(|e| ByteRange::new(e, MAX_PAYLOAD_LENGTH as u16));
 
-        let mut tmp_range: ByteRange = o_unwrap_or_return!(ranges.next());
+        let Some(mut tmp_range) = ranges.next() else {
+            return Some(vec![]);
+        };
         let mut final_ranges = vec![];
 
         for range in ranges {
@@ -404,10 +508,28 @@ impl ConnectionStates {
         }
 
         final_ranges.push(tmp_range);
+        Some(final_ranges)
+    }
 
-        let chunks: Vec<_> = final_ranges.chunks(MAX_PAYLOAD_LENGTH / 6).collect();
+    /// Naive implementation of retransmition requests - check for holes in bytes before 75% of head
+    /// and request retransmit for missing
+    async fn check_for_retransmits(&self, sender: ManagerToProcessor) {
+        let ranges = o_unwrap_or_return!(self.holes(3));
+        self.send_retransmit_requests(sender, ranges).await;
+    }
 
-        for chunk in chunks {
+    /// Dispatch a `RetransmitPacket` for the given hole ranges, splitting into
+    /// payload-sized chunks if necessary.
+    async fn send_retransmit_requests(
+        &self,
+        sender: ManagerToProcessor,
+        ranges: Vec<ByteRange>,
+    ) {
+        if ranges.is_empty() {
+            return;
+        }
+        let max_per_packet = RetransmitPacket::LOCAL_MAX_PAYLOAD_LENGTH / ByteRange::elem_size();
+        for chunk in ranges.chunks(max_per_packet) {
             Box::new(RetransmitPacket::data(
                 Options::none(),
                 self.session_id(),
@@ -431,6 +553,10 @@ impl ConnectionStates {
         recovered: Recovered,
         sender: ManagerToProcessor,
     ) -> ErrResult {
+        let address_copy: SocketAddr;
+        let session_id_copy: SessionId;
+        let declare_done: bool;
+        let just_reached_end: bool;
         if let ConnectionStates::Established(box EstablishedState {
             state:
                 SessionStates::Streaming(StreamState {
@@ -443,36 +569,67 @@ impl ConnectionStates {
             ..
         }) = self
         {
+            let prev_head_at_end = buffer.head_at_end();
             for packet in recovered.packets {
-                buffer.write(packet.byte_range_start, packet.payload.as_ref());
-
+                buffer.write(packet.byte_range_start, packet.payload);
                 stream.send_modify(|m| {
                     m.head = buffer.head();
-                    m.closed = buffer.is_done();
                 });
             }
+            let complete_allow_partial = stream.borrow().complete.is_some_and(identity);
+            let head_at_end = buffer.head_at_end();
+            declare_done = buffer.is_done() || (complete_allow_partial && head_at_end);
+            just_reached_end = !prev_head_at_end && head_at_end;
 
-            if buffer.is_done() {
-                debug!("buffer complete");
-                Box::new(PlaybackStatusPacket::done(
-                    Options::construct(&[OptionFlags::RequireAck]),
-                    *session_id,
-                ))
-                .send(sender, *lock_read!(address))
-                .await;
+            // Resweep counting lives in `received_data_packet` only — counting
+            // here too would double-fire on the data+recovery pair for the same
+            // batch, generating a redundant sweep that the server dedups.
 
+            if just_reached_end {
+                buffer.reset_sweep_counter();
+            }
+
+            address_copy = *lock_read!(address);
+            session_id_copy = *session_id;
+        } else {
+            return Err(Error::StateMismatch {
+                expected: FlatState::StreamingFrom,
+                found: (&*self).into(),
+            });
+        }
+
+        if declare_done {
+            debug!("buffer complete");
+            Box::new(PlaybackControlPacket::done(
+                Options::construct(&[OptionFlags::RequireAck]),
+                session_id_copy,
+            ))
+            .send(sender, address_copy)
+            .await;
+            if let ConnectionStates::Established(box EstablishedState {
+                state: SessionStates::Streaming(StreamState { stream, .. }),
+                ..
+            }) = self
+            {
                 stream.send_modify(|m| {
                     m.closed = true;
                 });
             }
-
-            Ok(())
-        } else {
-            Err(Error::StateMismatch {
-                expected: FlatState::StreamingFrom,
-                found: (&*self).into(),
-            })
+            return Ok(());
         }
+
+        if just_reached_end {
+            let final_holes = self.holes(4).unwrap_or_default();
+            if !final_holes.is_empty() {
+                debug!(
+                    "end-of-session sweep (initial, recovery path): requesting {} hole ranges",
+                    final_holes.len()
+                );
+                self.send_retransmit_requests(sender, final_holes).await;
+            }
+        }
+
+        Ok(())
     }
 
     pub async fn update_address(&self, new: SocketAddr) {
@@ -497,7 +654,7 @@ pub struct ProtocolState {
     pub global_handle_monitor: Arc<HandleMonitor>,
     pub connections: ConnectionStatesTable,
     pub handshakes: HandshakeStateTable,
-    pub ack: PendingAckWindow,
+    pub ack: Arc<PendingAckWindow>,
     pub encryption: EncryptionTable,
     pub fingerprints: FingerprintWindow,
     pub address_session: AddressSessionIdTable,
@@ -513,7 +670,7 @@ impl ProtocolState {
             global_handle_monitor: Arc::default(),
             connections: ConnectionStatesTable::default(),
             handshakes: HandshakeStateTable::default(),
-            ack: PendingAckWindow::new(sender),
+            ack: Arc::new(PendingAckWindow::new(sender)),
             encryption: EncryptionTable::default(),
             fingerprints: FingerprintWindow::default(),
             address_session: AddressSessionIdTable::default(),
@@ -768,6 +925,8 @@ impl ProtocolState {
         let mut playing = true;
         let mut interval = interval(SEND_INTERVAL);
         let mut paused_retransmits = vec![];
+        let mut seek_holes = vec![];
+        let mut last_sent = BytePosition(0);
 
         loop {
             select! {
@@ -779,8 +938,8 @@ impl ProtocolState {
                         }
                     }) => {
                         match event {
-                            StreamEvent::Pause => playing = false,
-                            StreamEvent::Play => {
+                            StreamEvent::Playback(PlaybackControl::Pause) => playing = false,
+                            StreamEvent::Playback(PlaybackControl::Play) => {
                                 playing = true;
                                 if !paused_retransmits.is_empty() {
                                     self
@@ -793,13 +952,19 @@ impl ProtocolState {
                                 }
                             },
 
-                            StreamEvent::Done => {
+                            StreamEvent::Playback(PlaybackControl::Seek(to)) => {
+                                debug!("got seek request to position {to}");
+                                seek_action(session_id, to).await;
+                                seek_holes.push(to.to_range(last_sent));
+                            }
+
+                            StreamEvent::Playback(PlaybackControl::Done) => {
                                 debug!("stream done for session {session_id}");
                                 self.close_stream(session_id, outbound_sender.clone()).await;
                                 return;
                             }
 
-                            StreamEvent::Close => {
+                            StreamEvent::Playback(PlaybackControl::Close) => {
                                 debug!("Close received for session {session_id}");
                                 close_outgoing_stream_action(session_id).await;
                                 return;
@@ -821,11 +986,12 @@ impl ProtocolState {
                         }
                     }
                 _ = interval.tick(), if playing => {
-                    send_stream_action(
+                    last_sent = send_stream_action(
                         session_id,
                         outbound_sender.clone(),
                         PACKET_COUNT_PER_BATCH,
-                    ).await;
+                        &mut seek_holes,
+                    ).await.unwrap_or(last_sent);
                 }
             }
         }
@@ -874,7 +1040,9 @@ impl ProtocolState {
                     },
                     ..,
                 ) => {
-                    event.update_with(|e| *e = StreamEvent::Close).await;
+                    event
+                        .update_with(|e| *e = StreamEvent::Playback(PlaybackControl::Close))
+                        .await;
                     stream.send_modify(|m| m.closed = true);
                 }
                 SessionStates::Streaming(StreamState { stream, .. }) => {
@@ -945,6 +1113,23 @@ impl ProtocolState {
     }
 }
 
+async fn seek_action(session_id: SessionId, pos: BytePosition) {
+    let mut lock = lock_write!(get_state!().connections);
+    match_or_return!(
+        lock.get_mut(&session_id),
+        Some(ConnectionStates::Established(box EstablishedState {
+            state:
+                SessionStates::Streaming(StreamState {
+                    streaming: Streaming::To(StreamingTo { buffer, .. }),
+                    ..
+                }),
+            ..
+        }))
+    );
+
+    buffer.seek(pos);
+}
+
 async fn retransmit_action(
     session_id: SessionId,
     outbound_sender: ManagerToProcessor,
@@ -971,7 +1156,7 @@ async fn retransmit_action(
         {
             let addr = *lock_read!(address);
             let StreamState {
-                streaming: Streaming::To(StreamingTo { current_batch, .. }),
+                streaming: Streaming::To(streaming_to),
                 ..
             } = stream
             else {
@@ -981,8 +1166,7 @@ async fn retransmit_action(
                 );
                 return;
             };
-            **current_batch += 1;
-            Some((chunks, addr, *current_batch))
+            Some((chunks, addr, streaming_to.next_batch_id()))
         } else {
             None
         }
@@ -994,13 +1178,15 @@ async fn retransmit_action(
 }
 
 #[instrument(skip_all)]
-async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToProcessor, n: usize) {
+async fn send_stream_action(
+    session_id: SessionId,
+    outbound_sender: ManagerToProcessor,
+    n: usize,
+    extras: &mut Vec<ByteRange>,
+) -> Option<BytePosition> {
     let action = {
         let mut lock = lock_write!(get_state!().connections);
-        let session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
-            "Invariant broken in `send_stream_action` \
-                                with ID {session_id}: session does not exist"
-        )));
+        let session = lock.get_mut(&session_id)?;
         if let ConnectionStates::Established(box EstablishedState {
             state:
                 SessionStates::Streaming(
@@ -1014,18 +1200,24 @@ async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToPro
         }) = session
             && let Some(chunks) = stream.get_chunks(n)
         {
+            let chunks = if chunks.is_empty() && !extras.is_empty() {
+                debug!("sending skipped chunks");
+                stream.retransmit(std::mem::take(extras))?
+            } else {
+                chunks
+            };
+
+            if chunks.is_empty() {
+                debug!("buffer complete, nothing to send");
+                return None;
+            }
+
             let addr = *lock_read!(address);
-            let current_batch = if let Streaming::To(StreamingTo {
-                buffer,
-                event,
-                current_batch,
-            }) = &mut stream.streaming
-            {
-                **current_batch += 1;
-                *current_batch
+            let current_batch = if let Streaming::To(streaming_to) = &mut stream.streaming {
+                streaming_to.next_batch_id()
             } else {
                 debug!("session {session_id} not Streaming::To after check");
-                return;
+                return None;
             };
             debug!(
                 "session {session_id} batch {current_batch}: {} chunks ",
@@ -1041,7 +1233,11 @@ async fn send_stream_action(session_id: SessionId, outbound_sender: ManagerToPro
     };
 
     if let Some((chunks, addr, current_batch)) = action {
+        let last = chunks.last()?.0;
         send_data_packets(chunks, &outbound_sender, session_id, addr, current_batch).await;
+        Some(last)
+    } else {
+        None
     }
 }
 
@@ -1585,7 +1781,7 @@ impl FingerprintMonitor {
 
 struct PendingAckQueueEntry {
     timestamp: Timestamp,
-    ptr: FingerprintPtr,
+    fingerprint: PacketFingerprint,
     retries: u8,
 }
 
@@ -1593,10 +1789,10 @@ impl PendingAckQueueEntry {
     const MAX_RETRIES: u8 = 5;
     const PRUNE_INTERVAL: u64 = PACKET_DISCARD_TIME_MS;
 
-    fn new(ptr: &PacketFingerprint) -> Self {
+    fn new(fingerprint: PacketFingerprint) -> Self {
         Self {
             timestamp: Timestamp::now(),
-            ptr: FingerprintPtr::from_ref(ptr),
+            fingerprint,
             retries: 0,
         }
     }
@@ -1621,7 +1817,7 @@ pub struct PendingAckWindow {
 
 impl PendingAckWindow {
     const PRUNE_INTERVAL: u64 = PACKET_DISCARD_TIME_MS;
-    const BUFFERING_TIME: u64 = 2 * 1000;
+    const BUFFERING_TIME: u64 = 100;
 
     #[must_use]
     pub fn new(sender: ManagerToProcessor) -> Self {
@@ -1634,10 +1830,7 @@ impl PendingAckWindow {
     }
 
     pub fn init(self: Arc<Self>) {
-        get_state!()
-            .global_handle_monitor
-            .clone()
-            .dispatch(self.prune());
+        get_state!().global_handle_monitor.dispatch(self.prune());
     }
 
     pub fn add(&'static self, packet: Packet) {
@@ -1661,17 +1854,19 @@ impl PendingAckWindow {
             )
         ));
 
-        let entry = PendingAckQueueEntry::new(&fingerprint);
+        let entry = PendingAckQueueEntry::new(fingerprint.clone());
         lock_write!(self.pending).insert(fingerprint, packet);
         lock!(self.queue).push_back(entry);
     }
 
     pub async fn prune(self: Arc<Self>) {
-        let mut expired = Vec::with_capacity(256);
+        let mut expired: Vec<PacketFingerprint> = Vec::with_capacity(256);
         let mut to_retry = Vec::with_capacity(256);
+        let mut top_timestamp = Self::PRUNE_INTERVAL - Self::BUFFERING_TIME;
 
         while !self.canceled.load(Ordering::Relaxed) {
-            let top_timestamp = {
+            tokio::time::sleep(Duration::from_millis(top_timestamp + Self::BUFFERING_TIME)).await;
+            top_timestamp = {
                 // get expired pending ack packets as well as ones to retry
                 let mut queue = lock!(self.queue);
                 while queue
@@ -1680,7 +1875,7 @@ impl PendingAckWindow {
                 {
                     if let Some(mut value) = queue.pop_front() {
                         if value.retried() {
-                            expired.push(value.ptr);
+                            expired.push(value.fingerprint);
                         } else {
                             value.timestamp.set_again();
                             to_retry.push(value);
@@ -1696,32 +1891,33 @@ impl PendingAckWindow {
             };
 
             // resend pending acks
-            {
-                let pending = lock_read!(self.pending);
-                let mut queue = lock!(self.queue);
-                let lock = lock_read!(get_state!().connections);
-                for entry in to_retry.drain(..) {
-                    let Some(packet) = pending.get(unsafe { &**entry.ptr }) else {
+            for entry in to_retry.drain(..) {
+                let packet = {
+                    let pending = lock_read!(self.pending);
+                    let Some(packet) = pending.get(&entry.fingerprint) else {
                         continue;
                     };
+                    packet.clone()
+                };
 
+                let session_id = o_unwrap_or_return!(packet.session_id().panic_in_debug(&format!(
+                    "A packet that should never be acked has been inserted: {packet:?}"
+                )));
+
+                let addr = {
+                    let lock = lock_read!(get_state!().connections);
                     let Some(ConnectionStates::Established(box EstablishedState {
                         address, ..
-                    })) = lock.get(o_unwrap_or_return!(&packet.session_id().panic_in_debug(
-                        &format!(
-                            "A packet that should never be acked has been inserted: {packet:?}"
-                        )
-                    )))
+                    })) = lock.get(&session_id)
                     else {
                         continue;
                     };
+                    *lock_read!(address)
+                };
 
-                    queue.push_back(entry);
+                lock!(self.queue).push_back(entry);
 
-                    Box::new(packet.clone())
-                        .send(self.sender.clone(), *lock_read!(address))
-                        .await;
-                }
+                Box::new(packet).send(self.sender.clone(), addr).await;
             }
 
             // remove expired acks
@@ -1729,11 +1925,13 @@ impl PendingAckWindow {
                 let mut pending = lock_write!(self.pending);
                 expired
                     .drain(..)
-                    .for_each(|ptr| _ = pending.remove(unsafe { &**ptr }));
+                    .for_each(|fingerprint| _ = pending.remove(&fingerprint));
             }
-
-            tokio::time::sleep(Duration::from_millis(top_timestamp + Self::BUFFERING_TIME)).await;
         }
+    }
+
+    pub fn close(&self) {
+        self.canceled.store(true, Ordering::Release);
     }
 }
 

@@ -35,7 +35,7 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
             && buffer.len() < MAX_PACKET_BUFFER_SIZE
         {
             #[allow(clippy::cast_possible_truncation)]
-            let remaining = BUFFER_TIMEOUT - start_time.elapsed().as_millis() as u64;
+            let remaining = BUFFER_TIMEOUT.saturating_sub(start_time.elapsed().as_millis() as u64);
 
             let data = match timeout(Duration::from_millis(remaining), receiver.recv()).await {
                 // timeout ended
@@ -105,7 +105,7 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
             debug!(
                 "single {} packet being sent: {:?}",
                 buffer[0].packet_type,
-                str::from_utf8(&buffer[0].data).unwrap_or(&format!("RAW: {:?}", &buffer[0].data))
+                str::from_utf8(&buffer[0].data).unwrap_or(&format!("RAW: {:?}", buffer[0].data))
             );
         }
 

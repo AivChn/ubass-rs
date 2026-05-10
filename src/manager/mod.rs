@@ -89,6 +89,8 @@ pub async fn init(
     ));
     _ = PROTOCOL_EPOCH.set(Instant::now());
 
+    get_state!().ack.clone().init();
+
     let (transport_handle, processor_handle) =
         setup_layers(port, processor_to_manager, processor_from_manager)
             .await

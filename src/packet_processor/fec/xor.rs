@@ -140,11 +140,13 @@ impl OutboundBatchData {
     }
 
     /// Adds another packet to the prodcut.
-    /// If the batch is full, returns `true`
+    /// If this packet completes the batch (current_size hits batch_size for the
+    /// first time), returns `true`; on subsequent over-fills returns `false` so
+    /// only a single caller proceeds to remove the batch from the outbound map.
     fn add(&mut self, data: FECData) -> bool {
         self.product ^= data;
         self.current_size += 1;
-        self.batch_size <= self.current_size
+        self.batch_size == self.current_size
     }
 }
 

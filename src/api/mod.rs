@@ -6,8 +6,8 @@ mod uniffi;
 pub use core::{AppEvent, Connection, IncomingConnection, PendingConnection};
 pub use types::{
     Connection as ConnectionTrait, IncomingConnection as IncomingConnectionTrait,
-    PendingConnection as PendingConnectionTrait, ReadableBuffer, Stream as StreamTrait,
-    WriteableBuffer,
+    PendingConnection as PendingConnectionTrait, PlaybackControl, ReadableBuffer,
+    Stream as StreamTrait, WriteableBuffer,
 };
 
 #[cfg(feature = "rust-api")]

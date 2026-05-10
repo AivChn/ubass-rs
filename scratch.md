@@ -258,4 +258,18 @@ write to buffer
 2. StreamDone packet [V]
 3. Restransmition [V]
 4. key rotation
-5. seek
+5. seek [V]
+
+## Seek
+`head`s guarantee shifts from "up to here is safe" to "from here onwards it definitely isn't"
+`head` advances from current head instead of from index 0, easily skipping seeked over data.
+`complete()`` call updates an internal field `complete: Option<boo>`:
+  - `None`: complete has not been called
+  - `Some(require_full)` - complete has been called, wait for `buffer.is_done() || !require_full`
+Buffer being full is an immediate shortcut to done
+
+# Bugs
+2 packet test failed, seemingly just didn't send request or the server did not receive it. 
+But why?
+
+Echo - client panicked, no idea why. Add logs.

@@ -173,8 +173,8 @@ async fn handle_packet(
                 process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await;
             processed!(serialized to addr as Session 3 times)
         }
-        Packet::PlaybackStatusPacket(packet) => {
-            add_ack!(for PlaybackStatusPacket(packet), sent to addr, saved to pending_ack_monitor);
+        Packet::PlaybackControlPacket(packet) => {
+            add_ack!(for PlaybackControlPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
             let serialized =

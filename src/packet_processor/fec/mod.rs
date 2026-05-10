@@ -24,11 +24,15 @@ const FEC_DATA_SIZE: usize = ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH;
 #[repr(align(32))]
 struct FECData(Box<[u8; FEC_DATA_SIZE]>);
 
-impl From<DataPacket> for FECData {
-    fn from(value: DataPacket) -> Self {
+impl From<&DataPacket> for FECData {
+    #[allow(clippy::cast_possible_truncation)]
+    fn from(value: &DataPacket) -> Self {
         let mut buf = Box::new([0; FEC_DATA_SIZE]);
         value.byte_range_start.serialize(&mut buf[..]);
-        value.payload.serialize(&mut buf[4..]);
+        debug_assert!(value.payload.serialize(&mut buf[4..]).is_ok());
+        // payload length goes in the last 2 bytes of FECData, where
+        // `From<FECData> for RecoverdPacket` reads it back after XOR recovery.
+        (value.payload.len() as u16).serialize(&mut buf[FEC_DATA_SIZE - 2..]);
         Self(buf)
     }
 }
@@ -49,7 +53,7 @@ impl Default for FECData {
 #[derive(Debug)]
 pub struct RecoverdPacket {
     pub byte_range_start: BytePosition,
-    pub payload: Box<[u8; MAX_PAYLOAD_LENGTH]>,
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -66,7 +70,7 @@ impl TryFrom<&[u8]> for RecoverdPacket {
                 byte_range_start: BytePosition(
                     <u32>::deserialize(&value[..4]).expect("Exact size"),
                 ),
-                payload: Box::new(
+                payload: Vec::from(
                     <[u8; MAX_PAYLOAD_LENGTH]>::try_from(&value[4..4 + MAX_PAYLOAD_LENGTH])
                         .expect("Exact size"),
                 ),
@@ -79,11 +83,11 @@ impl From<FECData> for RecoverdPacket {
     fn from(value: FECData) -> Self {
         let byte_range_start =
             BytePosition(<u32>::deserialize(&value.0[..4]).expect("Size is exact"));
-        let payload: Box<[u8; MAX_PAYLOAD_LENGTH]> = Box::new(
-            value.0[4..]
-                .try_into()
-                .expect("size is expected to be exactly matching"),
-        );
+        let mut payload: Vec<u8> = Vec::from(&value.0[4..value.0.len() - 2]);
+        debug_assert_eq!(payload.len(), MAX_PAYLOAD_LENGTH);
+
+        let payload_len = u16::deserialize(&value.0[value.0.len() - 2..]).expect("exact size");
+        payload.truncate(payload_len as usize);
 
         RecoverdPacket {
             byte_range_start,
@@ -115,9 +119,7 @@ struct FECPacket {
 
 impl From<DataPacket> for FECPacket {
     fn from(value: DataPacket) -> Self {
-        let mut data = FECData::default();
-        value.byte_range_start.serialize(&mut data.0[..]);
-        value.payload.serialize(&mut data.0[4..]);
+        let data = FECData::from(&value);
         FECPacket {
             is_parity: false,
             session_id: value.session_id,

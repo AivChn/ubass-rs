@@ -2,8 +2,10 @@
 use std::{
     net::SocketAddr,
     os::unix::fs::lchown,
+    ptr::addr_of,
+    range::Range,
     sync::mpsc::{SyncSender, sync_channel},
-    thread::JoinHandle,
+    thread::{JoinHandle, current},
     time::Duration,
 };
 
@@ -13,11 +15,11 @@ use tokio::{
 };
 #[cfg(debug_assertions)]
 use tracing::info;
-use tracing::{debug, instrument, warn};
+use tracing::{debug, error, instrument, warn};
 
 use crate::{
     api::WriteableBuffer,
-    error::{ApiErrors, ConnectionError},
+    error::{ApiErrors, ConnectionError, EmptyResult},
     get_state, lock_read, lock_write,
     manager::{
         self, AppId, STATE, key_exchange,
@@ -30,8 +32,9 @@ use crate::{
     },
     match_or_return, o_unwrap_or_return,
     utils::{
-        ConnectionEvent, Flags, LogFail, OneShot, PanicInDebug, RequestDataRequest,
-        SendDataRequest, SendPacket, SendTarget, StreamEvent, StreamMessage,
+        ConnectionEvent, Flags, LogFail, OneShot, PanicInDebug, PlaybackControl,
+        RequestDataRequest, SendDataRequest, SendPacket, SendTarget, StreamEvent, StreamMessage,
+        not,
     },
 };
 
@@ -194,7 +197,7 @@ async fn resolve_target(
             .ok_or(ApiErrors::NoFreeSession)
             .map(|s| (s, *address)),
     }
-    .log_warn(&format!("could not resolve target {:?}", &target))
+    .log_warn(&format!("could not resolve target {target:?}"))
 }
 
 #[instrument(skip_all)]
@@ -290,46 +293,149 @@ pub async fn close_stream(session_id: SessionId, sender: ManagerToProcessor) {
         .address()
         .await;
 
-    Box::new(PlaybackStatusPacket::close(Options::none(), session_id))
+    Box::new(PlaybackControlPacket::close(Options::none(), session_id))
         .send(sender, address)
         .await;
+}
+
+pub async fn set_complete_stream(session_id: SessionId, allow_partial: bool) {
+    let lock = lock_read!(get_state!().connections);
+    match_or_return!(
+        lock.get(&session_id),
+        Some(ConnectionStates::Established(box EstablishedState {
+            state: SessionStates::Streaming(StreamState { stream, .. }),
+            ..
+        }))
+    );
+    stream.send_modify(|m| _ = m.complete.replace(allow_partial));
 }
 
 #[instrument(skip_all)]
 pub async fn send_playback_control_packet(
     session_id: SessionId,
-    control: PlaybackControlType,
-    response: oneshot::Sender<()>,
+    control: PlaybackControl,
+    response: oneshot::Sender<EmptyResult>,
     sender: ManagerToProcessor,
 ) {
-    let address = o_unwrap_or_return!(lock_read!(get_state!().connections).get(&session_id))
-        .address()
-        .await;
+    let address = if let Some(session) = lock_read!(get_state!().connections).get(&session_id)
+        && let ConnectionStates::Established(box EstablishedState { address, .. }) = session
+    {
+        *lock_read!(address)
+    } else {
+        debug!("playback action taken on a nonexistant session");
+        _ = response.send(Err(()));
+        return;
+    };
 
-    let paused = match control {
-        PlaybackControlType::Play => Some(false),
-        PlaybackControlType::Pause => Some(true),
+    let changed = match control {
+        PlaybackControl::Play => update_paused(session_id, false).await,
+        PlaybackControl::Pause => update_paused(session_id, true).await,
         _ => None,
     };
 
-    if let Some(paused) = paused {
-        match_or_return!(
-            lock_read!(get_state!().connections).get(&session_id),
-            Some(ConnectionStates::Established(box EstablishedState {
-                state: SessionStates::Streaming(StreamState { stream, ..}),
-                ..
-            })) => stream
-        )
-        .send_modify(|m| m.paused = paused);
+    if changed.is_some_and(not) {
+        _ = response.send(Ok(()));
+        return;
     }
 
-    _ = response.send(());
+    let (control, seek_pos) = match control {
+        PlaybackControl::Play => (PlaybackControlType::Play, None),
+        PlaybackControl::Pause => (PlaybackControlType::Pause, None),
+        PlaybackControl::Close => (PlaybackControlType::Close, None),
+        PlaybackControl::Done => (PlaybackControlType::Done, None),
+        PlaybackControl::Seek(byte_position) => {
+            if let Some(moved_forward) = seek(session_id, byte_position).await
+                && moved_forward
+            {
+                (PlaybackControlType::Seek, Some(byte_position))
+            } else {
+                _ = response.send(Ok(()));
+                return;
+            }
+        }
+    };
 
-    Box::new(PlaybackStatusPacket::new(
+    #[cfg(debug_assertions)]
+    match control {
+        PlaybackControlType::Play
+        | PlaybackControlType::Pause
+        | PlaybackControlType::Close
+        | PlaybackControlType::Done => {
+            debug!("sending playback control {control} on session {session_id}");
+        }
+        PlaybackControlType::Seek => {
+            debug!("sending seek control packet to {seek_pos:?} on session {session_id}");
+        }
+    }
+
+    _ = response.send(Ok(()));
+
+    Box::new(PlaybackControlPacket::new(
         Options::construct(&[OptionFlags::RequireAck]),
         session_id,
         control,
+        seek_pos,
     ))
     .send(sender, address)
     .await;
+}
+
+async fn update_paused(session_id: SessionId, paused: bool) -> Option<bool> {
+    if let Some(ConnectionStates::Established(box EstablishedState {
+        state: SessionStates::Streaming(StreamState { stream, .. }),
+        ..
+    })) = lock_read!(get_state!().connections).get(&session_id)
+    {
+        if paused == stream.borrow().paused {
+            return Some(false);
+        }
+
+        let current = stream.borrow().paused;
+        stream.send_modify(|m| m.paused = paused);
+        Some(true)
+    } else {
+        None
+    }
+}
+
+async fn seek(session_id: SessionId, pos: BytePosition) -> Option<bool> {
+    let mut lock = lock_write!(get_state!().connections);
+    let Some(ConnectionStates::Established(box EstablishedState {
+        state:
+            SessionStates::Streaming(StreamState {
+                streaming: Streaming::From(buf),
+                ..
+            }),
+        ..
+    })) = lock.get_mut(&session_id)
+    else {
+        return None;
+    };
+
+    buf.seek_head(pos)
+}
+
+pub async fn find_holes(
+    session_id: SessionId,
+    response: oneshot::Sender<Option<Vec<Range<usize>>>>,
+) {
+    let to_send = {
+        if let Some(session) = lock_read!(get_state!().connections).get(&session_id)
+            && let Some(holes) = session.holes(4)
+        {
+            Some(
+                holes
+                    .into_iter()
+                    .map(|range| Range {
+                        start: *range.start as usize,
+                        end: (*range.start as usize) + range.length as usize,
+                    })
+                    .collect(),
+            )
+        } else {
+            None
+        }
+    };
+
+    _ = response.send(to_send);
 }

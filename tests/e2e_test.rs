@@ -1,22 +1,32 @@
 #![allow(clippy::unwrap_used)]
-use std::{
-    net::{Ipv4Addr, SocketAddrV4},
-    thread,
-    time::{Duration, Instant},
-};
+#![warn(unused_must_use)]
+use std::time::{Duration, Instant};
 
-use ubass::api::{AppEvent, IncomingConnectionTrait, PendingConnectionTrait};
+use derive_more::{Deref, DerefMut};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
-//comment
-
-const LOREM_IPSUM: &str = "Lorem ipsum dolor sit amet, consectetur adipiscing elit, \
-    sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, \
-    quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute \
-    irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. \
-    Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum";
+const LONG_TIMEOUT: Duration = Duration::from_mins(2);
 
 const BIN_PATH: &str = "/home/aiv/dev/ubass-rs/integration/target/debug/integration";
+
+/// Wrap `std::process::Child` so any test that panics or returns early kills
+/// (and reaps) the child instead of leaking it as an orphan with our stdout
+/// fds still open.
+#[derive(Deref, DerefMut)]
+struct KillOnDrop(std::process::Child);
+
+impl KillOnDrop {
+    fn spawn(cmd: &mut std::process::Command, what: &str) -> Self {
+        Self(cmd.spawn().unwrap_or_else(|e| panic!("failed to spawn {what}: {e}")))
+    }
+}
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
 
 /// Bind to port 0 to get a free UDP port from the OS.
 fn free_port() -> u16 {
@@ -44,81 +54,58 @@ fn wait_timeout(
     }
 }
 
-fn prep_client_args<'a>(
-    port: &'a str,
-    name: &'a str,
-    message: &'a str,
-    is_path: bool,
-    address: &'a str,
-) -> Vec<&'a str> {
-    let mut v = vec!["--port", port, "--name", name, "--message", message];
-
-    if is_path {
-        v.push("--path");
-    }
-    v.extend(&["client", "--server-address", address]);
-
-    v
+fn prep_client_args<'a>(port: &'a str, test: &'a str, server_addr: &'a str) -> Vec<&'a str> {
+    vec![
+        "--side",
+        "client",
+        "--test",
+        test,
+        "--port",
+        port,
+        "--server-address",
+        server_addr,
+    ]
 }
 
-fn prep_server_args<'a>(
-    port: &'a str,
-    name: &'a str,
-    message: &'a str,
-    is_path: bool,
-    is_echo: bool,
-) -> Vec<&'a str> {
-    let mut v = vec!["--port", port, "--name", name, "--message", message];
-    if is_path {
-        v.push("--path");
-    }
-    v.push("server");
-    if is_echo {
-        v.push("--echo");
-    }
-    v
+fn prep_server_args<'a>(test: &'a str, port: &'a str) -> Vec<&'a str> {
+    vec!["--side", "server", "--test", test, "--port", port]
 }
 
 #[test]
 fn connection_refused() {
     let server_port = free_port();
+    let server_address = format!("127.0.0.1:{server_port}");
     let client_port = free_port();
 
-    let server = thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.spawn(async move {
-            let api = ubass::open("server_connection_refused", Some(server_port))
-                .await
-                .unwrap();
+    let mut server = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_server_args(
+            "connection-refused",
+            &server_port.to_string(),
+        ))
+        , "server");
 
-            eprintln!("listening on {server_port}");
-            let AppEvent::IncomingConnection(incoming) = api.listen().await.unwrap() else {
-                panic!("expected IncomingConnection");
-            };
+    // give the server time to bind and start listening
+    std::thread::sleep(Duration::from_millis(100));
 
-            assert!(incoming.reject("420").await.is_ok());
-        });
-    });
+    let mut client = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_client_args(
+            &client_port.to_string(),
+            "connection-refused",
+            &server_address,
+        ))
+        , "client");
 
-    std::thread::sleep(Duration::from_millis(200));
+    let client_status = wait_timeout(&mut client, TIMEOUT).expect("client timed out");
+    let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
 
-    let client = thread::spawn(move || {
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.spawn(async move {
-            let api = ubass::open("client_connection_refused", Some(client_port))
-                .await
-                .unwrap();
-
-            let pending = api
-                .connect(SocketAddrV4::new(Ipv4Addr::LOCALHOST, server_port).into())
-                .await
-                .unwrap();
-
-            assert!(pending.ready().await.is_err());
-        })
-    });
-    server.join().unwrap();
-    client.join().unwrap();
+    assert!(
+        client_status.success(),
+        "client exited with: {client_status}"
+    );
+    assert!(
+        server_status.success(),
+        "server exited with: {server_status}"
+    );
 }
 
 #[test]
@@ -127,38 +114,28 @@ fn e2e_echo() {
     let server_address = format!("127.0.0.1:{server_port}");
     let client_port = free_port();
 
-    let mut server = std::process::Command::new(BIN_PATH)
-        .args(prep_server_args(
-            &server_port.to_string(),
-            "echo",
-            "",
-            false,
-            true,
-        ))
-        .spawn()
-        .expect("failed to spawn server");
+    let mut server = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_server_args("echo", &server_port.to_string()))
+        , "server");
 
     // give the server time to bind and start listening
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(100));
 
-    let mut client = std::process::Command::new(BIN_PATH)
+    let mut client = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
         .args(prep_client_args(
             &client_port.to_string(),
             "echo",
-            LOREM_IPSUM,
-            false,
             &server_address,
         ))
-        .spawn()
-        .expect("failed to spawn client");
+        , "client");
 
     let client_status = wait_timeout(&mut client, TIMEOUT).expect("client timed out");
+    let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
+
     assert!(
         client_status.success(),
         "client exited with: {client_status}"
     );
-
-    let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
     assert!(
         server_status.success(),
         "server exited with: {server_status}"
@@ -170,40 +147,29 @@ fn test_data_bigger_than_packet() {
     let server_port = free_port();
     let server_address = format!("127.0.0.1:{server_port}");
     let client_port = free_port();
-    let message = LOREM_IPSUM.repeat((1500 / LOREM_IPSUM.len()) * 2);
 
-    let mut server = std::process::Command::new(BIN_PATH)
-        .args(prep_server_args(
-            &server_port.to_string(),
-            "bigger",
-            &message,
-            false,
-            false,
-        ))
-        .spawn()
-        .expect("failed to spawn server");
+    let mut server = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_server_args("two-packets", &server_port.to_string()))
+        , "server");
 
     // give the server time to bind and start listening
     std::thread::sleep(Duration::from_millis(200));
 
-    let mut client = std::process::Command::new(BIN_PATH)
+    let mut client = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
         .args(prep_client_args(
             &client_port.to_string(),
-            "bigger",
-            &message,
-            false,
+            "two-packets",
             &server_address,
         ))
-        .spawn()
-        .expect("failed to spawn client");
+        , "client");
 
     let client_status = wait_timeout(&mut client, TIMEOUT).expect("client timed out");
+    let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
+
     assert!(
         client_status.success(),
         "client exited with: {client_status}"
     );
-
-    let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
     assert!(
         server_status.success(),
         "server exited with: {server_status}"
@@ -215,40 +181,29 @@ fn very_big_data() {
     let server_port = free_port();
     let server_address = format!("127.0.0.1:{server_port}");
     let client_port = free_port();
-    let message_path = "/home/aiv/dev/ubass-rs/tests/very_big_data.txt";
 
-    let mut server = std::process::Command::new(BIN_PATH)
-        .args(prep_server_args(
-            &server_port.to_string(),
-            "very big",
-            message_path,
-            true,
-            false,
-        ))
-        .spawn()
-        .expect("failed to spawn server");
+    let mut server = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_server_args("big-buffer", &server_port.to_string()))
+        , "server");
 
     // give the server time to bind and start listening
     std::thread::sleep(Duration::from_millis(200));
 
-    let mut client = std::process::Command::new(BIN_PATH)
+    let mut client = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
         .args(prep_client_args(
             &client_port.to_string(),
-            "very big",
-            message_path,
-            true,
+            "big-buffer",
             &server_address,
         ))
-        .spawn()
-        .expect("failed to spawn client");
+        , "client");
 
     let client_status = wait_timeout(&mut client, TIMEOUT).expect("client timed out");
+    let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
+
     assert!(
         client_status.success(),
         "client exited with: {client_status}"
     );
-
-    let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
     assert!(
         server_status.success(),
         "server exited with: {server_status}"
@@ -261,42 +216,135 @@ fn audio_data() {
     let server_port = free_port();
     let server_address = format!("127.0.0.1:{server_port}");
     let client_port = free_port();
-    let message_path = "/home/aiv/dev/ubass-rs/tests/song.flac";
 
-    let mut server = std::process::Command::new(BIN_PATH)
-        .args(prep_server_args(
-            &server_port.to_string(),
-            "song",
-            message_path,
-            true,
-            false,
-        ))
-        .spawn()
-        .expect("failed to spawn server");
+    let mut server = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_server_args("audio-data", &server_port.to_string()))
+        , "server");
 
     // give the server time to bind and start listening
     std::thread::sleep(Duration::from_millis(200));
 
-    let mut client = std::process::Command::new(BIN_PATH)
+    let mut client = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
         .args(prep_client_args(
             &client_port.to_string(),
-            "song",
-            message_path,
-            true,
+            "audio-data",
             &server_address,
         ))
-        .spawn()
-        .expect("failed to spawn client");
+        , "client");
 
-    let client_status =
-        wait_timeout(&mut client, Duration::from_secs(120)).expect("client timed out");
+    let client_status = wait_timeout(&mut client, LONG_TIMEOUT).expect("client timed out");
+    let server_status = wait_timeout(&mut server, LONG_TIMEOUT).expect("server timed out");
+
     assert!(
         client_status.success(),
         "client exited with: {client_status}"
     );
+    assert!(
+        server_status.success(),
+        "server exited with: {server_status}"
+    );
+}
 
-    let server_status =
-        wait_timeout(&mut server, Duration::from_secs(120)).expect("server timed out");
+#[test]
+#[ignore = "takes over 20 seconds"]
+fn audio_data_with_playback_control() {
+    let client_port = free_port();
+    let server_port = free_port();
+    let server_address = format!("127.0.0.1:{server_port}");
+
+    let mut server = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_server_args(
+            "audio-data-playback",
+            &server_port.to_string(),
+        ))
+        , "server");
+
+    // give the server time to bind and start listening
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut client = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_client_args(
+            &client_port.to_string(),
+            "audio-data-playback",
+            &server_address,
+        ))
+        , "client");
+
+    let client_status = wait_timeout(&mut client, LONG_TIMEOUT).expect("client timed out");
+    let server_status = wait_timeout(&mut server, LONG_TIMEOUT).expect("server timed out");
+
+    assert!(
+        client_status.success(),
+        "client exited with: {client_status}"
+    );
+    assert!(
+        server_status.success(),
+        "server exited with: {server_status}"
+    );
+}
+
+#[test]
+fn test_with_seek() {
+    let client_port = free_port();
+    let server_port = free_port();
+    let server_address = format!("127.0.0.1:{server_port}");
+
+    let mut server = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_server_args("seek", &server_port.to_string()))
+        , "server");
+
+    // give the server time to bind and start listening
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut client = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_client_args(
+            &client_port.to_string(),
+            "seek",
+            &server_address,
+        ))
+        , "client");
+
+    let client_status = wait_timeout(&mut client, TIMEOUT).expect("client timed out");
+    let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
+
+    assert!(
+        client_status.success(),
+        "client exited with: {client_status}"
+    );
+    assert!(
+        server_status.success(),
+        "server exited with: {server_status}"
+    );
+}
+
+#[test]
+fn pause_play() {
+    let client_port = free_port();
+    let server_port = free_port();
+    let server_address = format!("127.0.0.1:{server_port}");
+
+    let mut server = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_server_args("pause-play", &server_port.to_string()))
+        , "server");
+
+    // give the server time to bind and start listening
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut client = KillOnDrop::spawn(std::process::Command::new(BIN_PATH)
+        .args(prep_client_args(
+            &client_port.to_string(),
+            "pause-play",
+            &server_address,
+        ))
+        , "client");
+
+    let client_status = wait_timeout(&mut client, TIMEOUT).expect("client timed out");
+    let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
+
+    assert!(
+        client_status.success(),
+        "client exited with: {client_status}"
+    );
     assert!(
         server_status.success(),
         "server exited with: {server_status}"

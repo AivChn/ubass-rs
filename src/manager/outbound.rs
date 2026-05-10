@@ -31,6 +31,7 @@ pub async fn init(
             }
             Some(ApiCommand::Close) => {
                 monitor.flush().await;
+                get_state!().ack.close();
                 get_state!().global_handle_monitor.flush().await;
                 _ = manager_to_processor
                     .send(PacketProcessingMessage::Close)
@@ -66,6 +67,16 @@ pub async fn init(
                     response,
                     manager_to_processor.clone(),
                 ));
+            }
+            Some(ApiCommand::SetStreamComplete(session_id, allow_partial)) => {
+                monitor.dispatch(endpoints::set_complete_stream(session_id, allow_partial));
+            }
+
+            Some(ApiCommand::FindHoles(OneShot {
+                data: session_id,
+                response,
+            })) => {
+                monitor.dispatch(endpoints::find_holes(session_id, response));
             }
         }
     }

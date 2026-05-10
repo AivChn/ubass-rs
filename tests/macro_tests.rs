@@ -147,7 +147,7 @@ mod serialization {
         let w = TestWrapper(13);
         let mut buf = [0u8; 4];
         assert!(w.serialize(&mut buf).is_ok());
-        assert_eq!(buf, 13u32.to_be_bytes())
+        assert_eq!(buf, 13u32.to_be_bytes());
     }
 
     #[test]
@@ -172,7 +172,7 @@ mod serialization {
         let w = TestWrapper(13);
         let mut buf = [0u8; 7];
         assert!(w.serialize(&mut buf).is_ok());
-        assert_eq!(buf[..4], 13u32.to_be_bytes()[..])
+        assert_eq!(buf[..4], 13u32.to_be_bytes()[..]);
     }
 
     #[test]
@@ -202,7 +202,7 @@ mod serialization {
         let v = TestEnum::One;
         let mut buf = [0u8; 1];
         assert!(v.serialize(&mut buf).is_ok());
-        assert_eq!(buf[0], TestEnum::One as u8)
+        assert_eq!(buf[0], TestEnum::One as u8);
     }
 
     #[test]

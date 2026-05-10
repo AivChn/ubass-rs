@@ -1,9 +1,12 @@
 use std::default;
+use std::range::Range;
 use std::{fmt::Display, net::SocketAddr};
 
 use crate::api::{ReadableBuffer, WriteableBuffer};
 use crate::error::ApiErrors;
-use crate::manager::packets::{ByteRange, PlaybackControlType};
+use crate::manager::packets::{
+    BytePosition, ByteRange, Options, PlaybackControlPacket, PlaybackControlType,
+};
 
 use derive_more::{Display, derive};
 use tokio::sync::mpsc::Receiver;
@@ -92,30 +95,50 @@ pub enum ConnectionEvent {
     ConnectionClosed,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone, Copy)]
 pub struct StreamMessage {
     pub head: usize,
     pub paused: bool,
     pub closed: bool,
+    pub complete: Option<bool>,
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub enum StreamEvent {
+    Playback(PlaybackControl),
+    Retransmit(Vec<ByteRange>),
+}
+
+impl Default for StreamEvent {
+    fn default() -> Self {
+        StreamEvent::Playback(PlaybackControl::Play)
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub enum PlaybackControl {
     #[default]
     Play,
     Pause,
     Close,
     Done,
-    Retransmit(Vec<ByteRange>),
+    Seek(BytePosition),
 }
 
-impl From<PlaybackControlType> for StreamEvent {
-    fn from(value: PlaybackControlType) -> Self {
-        match value {
-            PlaybackControlType::Play => Self::Play,
-            PlaybackControlType::Pause => Self::Pause,
-            PlaybackControlType::Close => Self::Close,
-            PlaybackControlType::Done => Self::Done,
+impl From<PlaybackControlPacket> for StreamEvent {
+    fn from(value: PlaybackControlPacket) -> Self {
+        StreamEvent::Playback(value.into())
+    }
+}
+
+impl From<PlaybackControlPacket> for PlaybackControl {
+    fn from(value: PlaybackControlPacket) -> Self {
+        match value.control_type {
+            PlaybackControlType::Play => PlaybackControl::Play,
+            PlaybackControlType::Pause => PlaybackControl::Pause,
+            PlaybackControlType::Close => PlaybackControl::Close,
+            PlaybackControlType::Done => PlaybackControl::Done,
+            PlaybackControlType::Seek => PlaybackControl::Seek(value.seek_position),
         }
     }
 }
@@ -150,7 +173,9 @@ pub enum ApiCommand {
     // DiscardConnection()
     CloseSession(SessionId),
     CloseStream(SessionId),
-    StreamAction(OneShot<(SessionId, PlaybackControlType), ()>),
+    SetStreamComplete(SessionId, bool),
+    FindHoles(OneShot<SessionId, Option<Vec<Range<usize>>>>),
+    StreamAction(OneShot<(SessionId, PlaybackControl), EmptyResult>),
     RequestData(OneShot<RequestDataRequest, core::result::Result<SessionId, ApiErrors>>),
     SendData(OneShot<SendDataRequest, core::result::Result<SessionId, ApiErrors>>),
     Close,

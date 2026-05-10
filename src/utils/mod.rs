@@ -37,11 +37,10 @@ macro_rules! debug_match_or_return {
 
 #[macro_export]
 macro_rules! match_or_return {
-    ($value:expr, $p:pat => $i:ident) => {
-        match $value {
-            $p => $i,
-            _ => return,
-        }
+    ($value:expr, $p:pat) => {
+        let $p = $value else {
+            return;
+        };
     };
 }
 
@@ -320,6 +319,11 @@ pub trait SendPacket {
 }
 
 pub struct W<T>(pub T);
+
+#[must_use]
+pub fn not(b: bool) -> bool {
+    !b
+}
 
 pub struct HandleMonitor {
     running: AtomicUsize,

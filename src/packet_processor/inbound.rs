@@ -208,8 +208,8 @@ async fn deserialize_and_auth_control_packet(
 
             //session
             ControlType::Session(SessionControlType::Retransmit) => {
+                authenticate(&mut data, session_id, encryption_monitor).await?;
                 let packet = Box::new(RetransmitPacket::deserialize(&data)?);
-                authenticate(&mut packet.headers(), session_id, encryption_monitor).await?;
                 let packet = dedup_with_payload(packet, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
@@ -238,7 +238,7 @@ async fn deserialize_and_auth_control_packet(
                 let data = dedup_no_payload(data, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
-                Packet::PlaybackStatusPacket(Box::new(PlaybackStatusPacket::deserialize(&data)?))
+                Packet::PlaybackControlPacket(Box::new(PlaybackControlPacket::deserialize(&data)?))
             }
         },
     )

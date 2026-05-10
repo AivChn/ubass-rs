@@ -35,6 +35,23 @@ pub struct WriteableBuffer {
     buffer: Buffer,
     head: BytePosition,
     map: Vec<bool>,
+    /// Number of batch-level events (data `batch_end`s, FEC recoveries) since
+    /// the last end-of-session retransmit sweep. Used by the receiver to
+    /// re-issue the sweep when the session has stalled, without relying on a
+    /// wall-clock timer.
+    batches_since_sweep: u32,
+}
+
+impl From<&[u8]> for WriteableBuffer {
+    fn from(value: &[u8]) -> Self {
+        Self {
+            // yes i dislike this too
+            buffer: Buffer::new(std::ptr::from_ref(value).cast_mut()),
+            head: BytePosition(0),
+            map: vec![false; value.len() / MAX_PAYLOAD_LENGTH + 1],
+            batches_since_sweep: 0,
+        }
+    }
 }
 
 impl<T> From<*mut T> for WriteableBuffer
@@ -48,6 +65,7 @@ where
             buffer: Buffer::new(value),
             head: BytePosition(0),
             map: vec![false; value.len() / MAX_PAYLOAD_LENGTH + 1],
+            batches_since_sweep: 0,
         }
     }
 }
@@ -63,9 +81,69 @@ impl WriteableBuffer {
         *self.head as usize
     }
 
+    /// True when the buffer is fully filled — head reached the end AND no chunk
+    /// is still missing. Callers that are willing to declare done with holes
+    /// (e.g. `complete_allow_partial`) should additionally check `head_at_end`.
     #[must_use]
     pub fn is_done(&self) -> bool {
+        self.head_at_end() && self.map.iter().all(|&filled| filled)
+    }
+
+    /// True when `head` has reached the end of the buffer. May still have unfilled
+    /// chunks below `head` if the stream involved seeks or losses.
+    #[must_use]
+    pub fn head_at_end(&self) -> bool {
         self.head() >= self.len()
+    }
+
+    /// Increment the "batches seen since last sweep" counter and return the
+    /// new value. Called once per batch-level event (data `batch_end`, FEC
+    /// recovery) while the receiver is in finalize state.
+    pub fn note_batch_end(&mut self) -> u32 {
+        self.batches_since_sweep = self.batches_since_sweep.saturating_add(1);
+        self.batches_since_sweep
+    }
+
+    /// Reset the resweep counter. Called whenever a fresh end-of-session
+    /// retransmit sweep is issued.
+    pub fn reset_sweep_counter(&mut self) {
+        self.batches_since_sweep = 0;
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn seek_head(&mut self, pos: BytePosition) -> Option<bool> {
+        let prev = self.head;
+        // sanity-check pos is in range
+        self.position_to_index(pos)?;
+        if pos > prev {
+            // forward seek: jump head to pos so [prev, pos] becomes a detectable
+            // hole region (find_holes only looks at [0, head]).
+            // Align down to a chunk boundary so advance_head walks aligned positions —
+            // server's ReadableBuffer::seek also floors to MAX_PAYLOAD_LENGTH, so this
+            // keeps both sides in lockstep.
+            let aligned = (*pos / MAX_PAYLOAD_LENGTH as u32) * MAX_PAYLOAD_LENGTH as u32;
+            self.head = BytePosition(aligned);
+            self.advance_head();
+            Some(true)
+        } else {
+            // backward seek: don't retreat head — that would shrink the hole-detection
+            // window and lose track of previously-requested gaps. Just signal "no forward
+            // progress" so the caller skips sending a seek packet.
+            Some(false)
+        }
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    #[must_use]
+    pub fn last_occupied_pos(&self, from: BytePosition) -> Option<BytePosition> {
+        let mut i = self.position_to_index(from)?;
+        while let Some(prev) = i.checked_sub(1)
+            && !self.map[prev]
+        {
+            i = prev;
+        }
+
+        Some(BytePosition((i * MAX_PAYLOAD_LENGTH) as u32))
     }
 
     const fn position_to_index(&self, position: BytePosition) -> Option<usize> {
@@ -99,9 +177,16 @@ impl WriteableBuffer {
     // TODO:
     /// # Panics
     pub fn find_holes(&self, until: BytePosition) -> Vec<BytePosition> {
-        (0..self
-            .position_to_index(until.min(self.head))
-            .expect("head is always a valid position"))
+        // When the caller is asking up to or past end-of-buffer we want the full
+        // map (including the trailing partial-chunk index). Otherwise stay below
+        // head so we don't surface chunks the stream hasn't reached yet.
+        let end_idx = if (*until as usize) >= self.len() {
+            self.map.len()
+        } else {
+            self.position_to_index(until.min(self.head))
+                .expect("head is always a valid position")
+        };
+        (0..end_idx)
             .filter_map(|i| (!self.map[i]).then_some(BytePosition((i * MAX_PAYLOAD_LENGTH) as u32)))
             .collect()
     }
@@ -190,6 +275,7 @@ impl ReadableBuffer {
     pub fn into_vec(self) -> Vec<u8> {
         self.buffer.into()
     }
+
     #[must_use]
     pub const fn len(&self) -> usize {
         self.buffer.len()
@@ -198,6 +284,14 @@ impl ReadableBuffer {
     #[must_use]
     pub const fn current_position(&self) -> usize {
         self.head
+    }
+
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn seek(&mut self, pos: BytePosition) -> BytePosition {
+        let exact = (*pos as usize).min(self.len());
+        let prev = self.head;
+        self.head = exact - (exact % MAX_PAYLOAD_LENGTH);
+        BytePosition(prev as u32)
     }
 
     #[must_use]

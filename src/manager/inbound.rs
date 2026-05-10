@@ -92,7 +92,7 @@ async fn handle_message(
                 received_retransmit_request(retransmit_packet).await;
             }
             packets::Packet::MetadataPacket(_metadata_packet) => todo!(),
-            packets::Packet::PlaybackStatusPacket(playback_status_packet) => {
+            packets::Packet::PlaybackControlPacket(playback_status_packet) => {
                 received_playback_control_packet(playback_status_packet, outbound_sender.clone())
                     .await;
             }

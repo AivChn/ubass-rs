@@ -1,8 +1,9 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, ops::Deref, time::Duration};
 
 use crate::{
     error::ConnectionError,
     lock,
+    manager::messages::PlaybackControl,
     manager::state::{
         ConnectionStates, EstablishedState, SessionStates, StreamState, Streaming, StreamingTo,
     },
@@ -443,13 +444,14 @@ async fn session_id_collided(
 }
 
 pub async fn received_playback_control_packet(
-    packet: Box<PlaybackStatusPacket>,
+    packet: Box<PlaybackControlPacket>,
     outbound_sender: ManagerToProcessor,
 ) {
     match packet.control_type {
         new_event @ (PlaybackControlType::Done
         | PlaybackControlType::Pause
-        | PlaybackControlType::Play) => {
+        | PlaybackControlType::Play
+        | PlaybackControlType::Seek) => {
             if let Some(ConnectionStates::Established(box EstablishedState {
                 state:
                     SessionStates::Streaming(StreamState {
@@ -459,7 +461,7 @@ pub async fn received_playback_control_packet(
                 ..
             })) = lock_read!(get_state!().connections).get(&packet.session_id)
             {
-                event.update(new_event.into()).await;
+                event.update((*packet).into()).await;
             }
         }
         PlaybackControlType::Close => {
@@ -479,10 +481,14 @@ pub async fn received_packet_that_requires_ack(
     fingerprint: impl Into<PacketFingerprint>,
     sender: ManagerToProcessor,
 ) {
-    let address = *lock_read!(match_or_return!(
-        o_unwrap_or_return!(lock_read!(get_state!().connections).get(&session_id)),
-        ConnectionStates::Established (box EstablishedState{ address, .. }) => address
-    ));
+    let address = {
+        let lock = lock_read!(get_state!().connections);
+        match_or_return!(
+            lock.get(&session_id),
+            Some(ConnectionStates::Established(box EstablishedState { address, .. }))
+        );
+        *lock_read!(address)
+    };
 
     let fingerprint = fingerprint.into();
 

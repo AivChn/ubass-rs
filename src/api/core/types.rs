@@ -1,24 +1,25 @@
 use crate::{
     api::{
         self, Api, SendTarget,
-        types::{PlaybackControl, ReadableBuffer, WriteableBuffer},
+        types::{ReadableBuffer, WriteableBuffer},
     },
-    error::ConnectionError,
+    error::{ConnectionError, EmptyResult},
     manager::{
         AppId, endpoints,
-        packets::{MAX_PAYLOAD_LENGTH, PayloadField, PlaybackControlType, SessionId},
+        packets::{BytePosition, MAX_PAYLOAD_LENGTH, PayloadField, PlaybackControlType, SessionId},
     },
     o_unwrap_or_return,
     prelude::{ApiCommand, ApiErrors, ApiMessage, AppResponse},
     utils::{
-        ConnectionEvent, OneShot, PanicInDebug, RequestDataRequest, ResponseReceiver,
-        SendDataRequest, StreamMessage,
+        ConnectionEvent, OneShot, PanicInDebug, PlaybackControl, RequestDataRequest,
+        ResponseReceiver, SendDataRequest, StreamMessage,
     },
 };
 use core::result::Result;
 use std::{
     marker::PhantomData,
     net::SocketAddr,
+    range::Range,
     sync::{Arc, Weak, atomic::AtomicBool},
     thread::JoinHandle,
 };
@@ -192,11 +193,30 @@ impl ApiInner {
             .try_send(ApiCommand::CloseSession(session_id));
     }
 
+    async fn complete_stream(&self, session_id: SessionId, allow_partial: bool) {
+        _ = self
+            .api_to_manager
+            .send(ApiCommand::SetStreamComplete(session_id, allow_partial))
+            .await;
+    }
+
+    async fn find_holes(
+        &self,
+        session_id: SessionId,
+    ) -> ResponseReceiver<Option<Vec<Range<usize>>>> {
+        let (request, response) = OneShot::new(session_id);
+        _ = self
+            .api_to_manager
+            .send(ApiCommand::FindHoles(request))
+            .await;
+        response
+    }
+
     async fn send_playback_control(
         &self,
         session_id: SessionId,
-        control: PlaybackControlType,
-    ) -> ResponseReceiver<()> {
+        control: PlaybackControl,
+    ) -> ResponseReceiver<EmptyResult> {
         let (sender, receiver) = OneShot::new((session_id, control));
         _ = self
             .api_to_manager
@@ -515,6 +535,7 @@ pub struct InputStream {
     session: SessionId,
     stream_size: usize,
     connection: Connection,
+    allow_partial: bool,
     update: watch::Receiver<StreamMessage>,
 }
 
@@ -531,6 +552,7 @@ impl InputStream {
             session: session_id,
             stream_size,
             connection,
+            allow_partial: false,
             update: receiver,
         }
     }
@@ -539,30 +561,48 @@ impl InputStream {
 impl InputStream {
     async fn send_playback_control(
         &self,
-        control: PlaybackControlType,
+        control: PlaybackControl,
     ) -> Result<usize, ConnectionError> {
         let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
         // waits for the packet to be sent and the state to be actually updated
-        _ = api
+        match api
             .send_playback_control(self.session, control)
             .await
-            .recv();
+            .recv()
+            .await
+        {
+            Ok(Err(())) | Err(_) => Err(ConnectionError::ProtocolClosed),
+            _ => Ok(self.update.borrow().head),
+        }
+    }
 
-        Ok(self.update.borrow().head)
+    pub fn allow_partial_receive(&mut self, allow: bool) {
+        self.allow_partial = allow;
+    }
+
+    pub async fn buffer_holes(&self) -> Result<Vec<Range<usize>>, ConnectionError> {
+        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+        let response = api.find_holes(self.session).await;
+        response
+            .recv()
+            .await
+            .map_err(|_| ConnectionError::ProtocolClosed)?
+            .ok_or(ConnectionError::ProtocolClosed)
     }
 }
 
-impl PlaybackControl for InputStream {
-    async fn pause(&self) -> Result<Self::Idx, Self::Error> {
-        self.send_playback_control(PlaybackControlType::Pause).await
+impl api::types::PlaybackControl for InputStream {
+    async fn pause(&self) -> Result<usize, Self::Error> {
+        self.send_playback_control(PlaybackControl::Pause).await
     }
 
-    async fn play(&self) -> Result<Self::Idx, Self::Error> {
-        self.send_playback_control(PlaybackControlType::Play).await
+    async fn play(&self) -> Result<usize, Self::Error> {
+        self.send_playback_control(PlaybackControl::Play).await
     }
 
-    async fn seek(&self, position: Self::Idx) -> Result<Self::Idx, Self::Error> {
-        unimplemented!()
+    async fn seek(&self, position: usize) -> Result<usize, Self::Error> {
+        self.send_playback_control(PlaybackControl::Seek(position.into()))
+            .await
     }
 }
 
@@ -584,6 +624,9 @@ impl api::types::Stream for InputStream {
     }
 
     async fn complete(mut self) -> Result<Self::Connection, Self::Error> {
+        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+        api.complete_stream(self.session, self.allow_partial).await;
+
         self.update
             .wait_for(|message| message.closed)
             .await

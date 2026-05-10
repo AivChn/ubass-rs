@@ -42,7 +42,7 @@ pub enum Packet {
     KeepAlivePacket(Box<KeepAlivePacket>),
     HandshakeAckPacket(Box<HandshakeAckPacket>),
     RetransmitPacket(Box<RetransmitPacket>),
-    PlaybackStatusPacket(Box<PlaybackStatusPacket>),
+    PlaybackControlPacket(Box<PlaybackControlPacket>),
     IncompatibleVersionPacket(Box<IncompatibleVersionPacket>),
     SessionDoesNotExistErrorPacket(Box<SessionDoesNotExistErrorPacket>),
     UnexpectedPacketErrorPacket(Box<UnexpectedPacketErrorPacket>),
@@ -67,7 +67,7 @@ impl Packet {
             Packet::ParityPacket(packet) => Some(packet.session_id),
             Packet::AckPacket(packet) => Some(packet.session_id),
             Packet::RetransmitPacket(packet) => Some(packet.session_id),
-            Packet::PlaybackStatusPacket(packet) => Some(packet.session_id),
+            Packet::PlaybackControlPacket(packet) => Some(packet.session_id),
             Packet::SessionDoesNotExistErrorPacket(packet) => Some(packet.session_id),
             Packet::UnexpectedPacketErrorPacket(packet) => Some(packet.session_id),
             Packet::AppRejectErrorPacket(packet) => Some(packet.session_id),
@@ -113,7 +113,7 @@ impl SendPacket for Packet {
             Packet::AckPacket(packet) => packet.send(sender, address),
             Packet::KeepAlivePacket(packet) => packet.send(sender, address),
             Packet::RetransmitPacket(packet) => packet.send(sender, address),
-            Packet::PlaybackStatusPacket(packet) => packet.send(sender, address),
+            Packet::PlaybackControlPacket(packet) => packet.send(sender, address),
             Packet::IncompatibleVersionPacket(packet) => packet.send(sender, address),
             Packet::SessionDoesNotExistErrorPacket(packet) => packet.send(sender, address),
             Packet::UnexpectedPacketErrorPacket(packet) => packet.send(sender, address),
@@ -136,7 +136,7 @@ impl TryFrom<&Packet> for PacketFingerprint {
             Packet::MetadataPacket(packet) => packet.as_ref().into(),
             Packet::ParityPacket(packet) => packet.as_ref().into(),
             Packet::RetransmitPacket(packet) => packet.as_ref().into(),
-            Packet::PlaybackStatusPacket(packet) => packet.as_ref().into(),
+            Packet::PlaybackControlPacket(packet) => packet.as_ref().into(),
             Packet::UnexpectedPacketErrorPacket(packet) => packet.as_ref().into(),
             Packet::AppRejectErrorPacket(packet) => packet.as_ref().into(),
             Packet::CloseSessionPacket(packet) => packet.as_ref().into(),
@@ -397,7 +397,8 @@ pub struct ParityPacket {
 }
 
 impl ParityPacket {
-    pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH + size_of::<BytePosition>();
+    pub const LOCAL_MAX_PAYLOAD_LENGTH: usize =
+        MAX_PAYLOAD_LENGTH + size_of::<BytePosition>() + size_of::<u16>();
     pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<PayloadField>();
     pub const MIN_SIZE: usize = Self::HEADER_SIZE + size_of::<BytePosition>() + 1;
 
@@ -430,7 +431,7 @@ impl ParityPacket {
 }
 
 #[derive(Debug, SendPacket, Clone, Serialize, Headers)]
-pub struct PlaybackStatusPacket {
+pub struct PlaybackControlPacket {
     pub version: Version,
     pub opts: Options,
     pub packet_type: PacketType,
@@ -438,12 +439,18 @@ pub struct PlaybackStatusPacket {
     pub reserved: Reserved<2>,
     pub session_id: SessionId,
     pub timestamp: Timestamp,
+    pub seek_position: BytePosition,
 }
 
-impl PlaybackStatusPacket {
+impl PlaybackControlPacket {
     #[inline]
     #[must_use]
-    pub fn new(opts: Options, session_id: SessionId, playback_type: PlaybackControlType) -> Self {
+    pub fn new(
+        opts: Options,
+        session_id: SessionId,
+        playback_type: PlaybackControlType,
+        seek_pos: Option<BytePosition>,
+    ) -> Self {
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
         #[cfg(debug_assertions)]
@@ -452,6 +459,7 @@ impl PlaybackStatusPacket {
         let control_type = playback_type;
         let reserved = Reserved;
         let timestamp = Timestamp::now();
+        let seek_position = seek_pos.unwrap_or(BytePosition(0));
 
         Self {
             version,
@@ -461,31 +469,38 @@ impl PlaybackStatusPacket {
             reserved,
             session_id,
             timestamp,
+            seek_position,
         }
     }
 
     #[inline]
     #[must_use]
     pub fn play(opts: Options, session_id: SessionId) -> Self {
-        Self::new(opts, session_id, PlaybackControlType::Play)
+        Self::new(opts, session_id, PlaybackControlType::Play, None)
     }
 
     #[inline]
     #[must_use]
     pub fn pause(opts: Options, session_id: SessionId) -> Self {
-        Self::new(opts, session_id, PlaybackControlType::Pause)
+        Self::new(opts, session_id, PlaybackControlType::Pause, None)
     }
 
     #[inline]
     #[must_use]
     pub fn close(opts: Options, session_id: SessionId) -> Self {
-        Self::new(opts, session_id, PlaybackControlType::Close)
+        Self::new(opts, session_id, PlaybackControlType::Close, None)
     }
 
     #[inline]
     #[must_use]
     pub fn done(opts: Options, session_id: SessionId) -> Self {
-        Self::new(opts, session_id, PlaybackControlType::Done)
+        Self::new(opts, session_id, PlaybackControlType::Done, None)
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn seek(opts: Options, session_id: SessionId, seek_pos: BytePosition) -> Self {
+        Self::new(opts, session_id, PlaybackControlType::Done, Some(seek_pos))
     }
 }
 
@@ -635,18 +650,18 @@ pub struct RetransmitPacket {
 
 impl RetransmitPacket {
     // closest I can get to `MAX_PAYLOAD_LENGTH` while aligning to 6 bytes
-    const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH - (MAX_PAYLOAD_LENGTH % 6);
+    pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH - (MAX_PAYLOAD_LENGTH % 6);
     const HEADER_SIZE: usize = size_of::<Self>() - Self::LOCAL_MAX_PAYLOAD_LENGTH;
 
     #[must_use]
     pub fn data(opts: Options, session_id: SessionId, payload: Vec<ByteRange>) -> Self {
         debug_assert!(
-            payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
+            payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / ByteRange::elem_size()),
             "Invariant broken while constructing a `RetransmitPacket`:\
                 payload bigger than allowed max size: {} `ByteRange`s ({} bytes) > {} `ByteRange`s ({} bytes)",
             payload.len(),
-            (payload.len() * size_of::<ByteRange>()),
-            (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
+            (payload.len() * ByteRange::elem_size()),
+            (Self::LOCAL_MAX_PAYLOAD_LENGTH / ByteRange::elem_size()),
             Self::LOCAL_MAX_PAYLOAD_LENGTH
         );
 
@@ -679,12 +694,12 @@ impl RetransmitPacket {
         payload: Vec<ByteRange>,
     ) -> Box<Self> {
         debug_assert!(
-            payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
+            payload.len() <= (Self::LOCAL_MAX_PAYLOAD_LENGTH / ByteRange::elem_size()),
             "Invariant broken while constructing a `RetransmitPacket`:\
                 payload bigger than allowed max size: {} `ByteRange`s ({} bytes) > {} `ByteRange`s ({} bytes)",
             payload.len(),
-            (payload.len() * size_of::<ByteRange>()),
-            (Self::LOCAL_MAX_PAYLOAD_LENGTH / size_of::<ByteRange>()),
+            (payload.len() * ByteRange::elem_size()),
+            (Self::LOCAL_MAX_PAYLOAD_LENGTH / ByteRange::elem_size()),
             Self::LOCAL_MAX_PAYLOAD_LENGTH
         );
 
@@ -1229,6 +1244,23 @@ impl Deref for PublicKey {
 #[repr(transparent)]
 pub struct BytePosition(pub u32);
 
+impl BytePosition {
+    #[allow(clippy::cast_possible_truncation)]
+    #[must_use]
+    pub fn to_range(self, other: BytePosition) -> ByteRange {
+        let start = if self.0 > other.0 { other } else { self };
+        let length = (self.0 as i64 - other.0 as i64).unsigned_abs() as u16;
+        ByteRange { start, length }
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+impl From<usize> for BytePosition {
+    fn from(value: usize) -> Self {
+        BytePosition(value as u32)
+    }
+}
+
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub struct Reserved<const N: usize>;
 
@@ -1378,7 +1410,7 @@ impl From<SessionControlType> for ControlType {
     }
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq)]
+#[derive(Debug, Display, Serialize, Clone, Copy, PartialEq)]
 #[repr(u8)]
 #[variants_array]
 pub enum PlaybackControlType {
@@ -1386,6 +1418,7 @@ pub enum PlaybackControlType {
     Pause = 102,
     Close = 103,
     Done = 104,
+    Seek = 105,
 }
 
 impl From<PlaybackControlType> for ControlType {
@@ -1510,13 +1543,21 @@ pub struct ByteRange {
 
 impl ByteRange {
     #[must_use]
-    pub fn new(start: BytePosition, length: u16) -> Self {
+    pub const fn new(start: BytePosition, length: u16) -> Self {
         debug_assert!(
             length as usize <= MAX_PAYLOAD_LENGTH,
             "Invariant broken while constructing a `ByteRange`:\
-            `length` is too big ({length}). To combine multiple continous ranges, use `Self::concat()`"
+            `length` is too big. To combine multiple continous ranges, use `Self::concat()`"
         );
         Self { start, length }
+    }
+
+    /// On-wire size of a single `ByteRange` (independent of the in-memory
+    /// `size_of::<ByteRange>()`, which includes alignment padding).
+    #[inline]
+    #[must_use]
+    pub fn elem_size() -> usize {
+        Self::new(BytePosition(0), 0).sized()
     }
 
     pub fn concat(&mut self, other: &ByteRange) -> bool {
@@ -1544,36 +1585,33 @@ impl ByteRange {
 
 impl Serialize for Vec<ByteRange> {
     fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
-        if buf.len() < self.len() * size_of::<ByteRange>() {
+        let stride = ByteRange::elem_size();
+        if buf.len() < self.len() * stride {
             Err(())
         } else {
             for (i, e) in self.iter().enumerate() {
-                e.serialize(&mut buf[i * size_of::<ByteRange>()..])?;
+                e.serialize(&mut buf[i * stride..])?;
             }
             Ok(())
         }
     }
 
     fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
-        const SIZE: usize = size_of::<ByteRange>();
-        if bytes.len() < SIZE {
-            Err(())
-        } else {
-            let mut buf = vec![];
-            let mut result = vec![];
-            for byte in bytes {
-                if buf.len() >= SIZE {
-                    result.push(ByteRange::deserialize(&buf)?);
-                    buf.clear();
-                }
-                buf.push(*byte);
-            }
-
-            Ok(result)
+        let stride = ByteRange::elem_size();
+        if bytes.len() < stride {
+            return Err(());
         }
+        // Deserialize fixed-stride chunks. A single pass over `bytes.chunks(stride)`
+        // covers every range including the last one — the previous "push, then
+        // flush when buf >= stride" loop dropped the trailing chunk.
+        bytes
+            .chunks(stride)
+            .filter(|c| c.len() == stride)
+            .map(ByteRange::deserialize)
+            .collect()
     }
 
     fn sized(&self) -> usize {
-        self.len() * size_of::<ByteRange>()
+        self.len() * ByteRange::elem_size()
     }
 }
