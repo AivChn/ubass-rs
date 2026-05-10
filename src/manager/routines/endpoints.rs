@@ -403,7 +403,7 @@ async fn seek(session_id: SessionId, pos: BytePosition) -> Option<bool> {
     let Some(ConnectionStates::Established(box EstablishedState {
         state:
             SessionStates::Streaming(StreamState {
-                streaming: Streaming::From(buf),
+                streaming: Streaming::From(streaming_from),
                 ..
             }),
         ..
@@ -412,7 +412,7 @@ async fn seek(session_id: SessionId, pos: BytePosition) -> Option<bool> {
         return None;
     };
 
-    buf.seek_head(pos)
+    streaming_from.buffer.seek_head(pos)
 }
 
 pub async fn find_holes(
@@ -420,15 +420,23 @@ pub async fn find_holes(
     response: oneshot::Sender<Option<Vec<Range<usize>>>>,
 ) {
     let to_send = {
-        if let Some(session) = lock_read!(get_state!().connections).get(&session_id)
-            && let Some(holes) = session.holes(4)
+        let lock = lock_read!(get_state!().connections);
+        if let Some(ConnectionStates::Established(box EstablishedState {
+            state:
+                SessionStates::Streaming(StreamState {
+                    streaming: Streaming::From(streaming_from),
+                    ..
+                }),
+            ..
+        })) = lock.get(&session_id)
         {
+            let buf = &streaming_from.buffer;
             Some(
-                holes
+                buf.find_holes(BytePosition::from(buf.len()))
                     .into_iter()
-                    .map(|range| Range {
-                        start: *range.start as usize,
-                        end: (*range.start as usize) + range.length as usize,
+                    .map(|pos| Range {
+                        start: *pos as usize,
+                        end: (*pos as usize) + MAX_PAYLOAD_LENGTH,
                     })
                     .collect(),
             )

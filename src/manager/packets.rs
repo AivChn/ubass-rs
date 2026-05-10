@@ -1239,20 +1239,23 @@ impl Deref for PublicKey {
 }
 
 #[derive(
-    Eq, PartialOrd, Ord, Deref, DerefMut, PartialEq, Debug, Serialize, Clone, Copy, Display,
+    Eq, Ord, PartialOrd, Deref, DerefMut, PartialEq, Debug, Serialize, Clone, Copy, Display,
 )]
 #[repr(transparent)]
 pub struct BytePosition(pub u32);
 
-impl BytePosition {
-    #[allow(clippy::cast_possible_truncation)]
-    #[must_use]
-    pub fn to_range(self, other: BytePosition) -> ByteRange {
-        let start = if self.0 > other.0 { other } else { self };
-        let length = (self.0 as i64 - other.0 as i64).unsigned_abs() as u16;
-        ByteRange { start, length }
+impl PartialEq<usize> for BytePosition {
+    fn eq(&self, other: &usize) -> bool {
+        (**self as usize) == *other
     }
 }
+
+impl PartialOrd<usize> for BytePosition {
+    fn partial_cmp(&self, other: &usize) -> Option<std::cmp::Ordering> {
+        Some((**self as usize).cmp(other))
+    }
+}
+
 
 #[allow(clippy::cast_possible_truncation)]
 impl From<usize> for BytePosition {

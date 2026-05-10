@@ -14,7 +14,7 @@ use crate::{
 };
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
 use tokio::sync::mpsc::{self, Receiver};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::{
     DEFAULT_PORT, get_state, lock_read, lock_write,
@@ -49,7 +49,29 @@ pub async fn received_close_session_packet(packet: Box<CloseSessionPacket>) {
     get_state!().close_session(packet.session_id).await;
 }
 
-pub async fn received_retransmit_request(packet: Box<RetransmitPacket>) {
+pub async fn received_retransmit_request(
+    packet: Box<RetransmitPacket>,
+    outbound_sender: ManagerToProcessor,
+) {
+    debug!(
+        "received retransmit request for session {} ({} ranges)",
+        packet.session_id,
+        packet.payload.len()
+    );
+
+    // Auto-ack mirrors the data-packet path. Without this, every
+    // RetransmitPacket the receiver sends sits unacked in its
+    // PendingAckWindow and gets retried up to MAX_RETRIES times,
+    // amplifying the outbound rate every TTL window.
+    if packet.opts.contains(OptionFlags::RequireAck) {
+        received_packet_that_requires_ack(
+            packet.session_id,
+            packet.as_ref(),
+            outbound_sender,
+        )
+        .await;
+    }
+
     if let Some(ConnectionStates::Established(box EstablishedState {
         state:
             SessionStates::Streaming(StreamState {

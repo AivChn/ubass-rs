@@ -89,7 +89,7 @@ async fn handle_message(
             packets::Packet::AppRejectErrorPacket(_app_reject_error_packet) => todo!(),
             // TODO: future features
             packets::Packet::RetransmitPacket(retransmit_packet) => {
-                received_retransmit_request(retransmit_packet).await;
+                received_retransmit_request(retransmit_packet, outbound_sender.clone()).await;
             }
             packets::Packet::MetadataPacket(_metadata_packet) => todo!(),
             packets::Packet::PlaybackControlPacket(playback_status_packet) => {

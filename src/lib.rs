@@ -6,7 +6,7 @@
 #![allow(clippy::cast_lossless)]
 #![warn(clippy::must_use_candidate)]
 #![deny(clippy::async_yields_async)]
-// #![deny(clippy::todo)]
+#![warn(clippy::todo)]
 
 pub mod api;
 pub mod error;

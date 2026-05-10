@@ -34,7 +34,7 @@ use std::{
     fmt::{Display, format},
     mem,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
-    ops::Deref,
+    ops::{Deref, Range},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
@@ -46,13 +46,6 @@ const PACKET_DISCARD_TIME_MS: u64 = 500;
 const SEND_INTERVAL: Duration = Duration::from_millis(25);
 pub const PACKET_COUNT_PER_BATCH: usize = 28;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(500);
-/// Number of batch-level events (data batch_ends and FEC recoveries) the
-/// receiver tolerates while in finalize state before re-issuing the
-/// end-of-session retransmit sweep. The server packs each retransmit request
-/// into a single response batch, so a threshold of 1 means "ask again after
-/// every server response that didn't fully complete the buffer" — geometric
-/// convergence under loss.
-const SWEEP_BATCH_THRESHOLD: u32 = 1;
 
 macro_rules! sessions_state_fields {
     ($($name:ident($key:ty => $value:ty)),*) => {
@@ -105,9 +98,114 @@ impl StreamingTo {
 }
 
 #[derive(Debug)]
+pub struct StreamingFrom {
+    pub buffer: WriteableBuffer,
+    /// Chunks for which we have an in-flight retransmit request. Acts as the
+    /// dedup ground for any retransmission decision maker (FEC TTL prune,
+    /// score policy). Inserted by `reserve_for_request`, cleared when data
+    /// arrives via `clear_pending`, expired by `sweep_pending` after the TTL
+    /// in case the response was lost.
+    pub pending: HashMap<usize, Timestamp>,
+}
+
+impl StreamingFrom {
+    /// How long a pending retransmit request stays in the dedup map before
+    /// being assumed lost and cleared, freeing the chunk to be re-requested.
+    pub const PENDING_TTL_MS: u64 = PACKET_DISCARD_TIME_MS;
+
+    #[must_use]
+    pub fn new(buffer: WriteableBuffer) -> Self {
+        Self {
+            buffer,
+            pending: HashMap::default(),
+        }
+    }
+
+    /// Filter `positions` down to those that should actually be requested:
+    /// drop chunks already filled and chunks already pending. Mark the
+    /// accepted ones as pending so subsequent calls (from the same or another
+    /// decider) skip them. Sweeps stale pending markers first so a lost
+    /// response from a previous round doesn't permanently block a chunk.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn reserve_for_request(&mut self, positions: Vec<BytePosition>) -> Vec<BytePosition> {
+        self.pending
+            .retain(|_, ts| !ts.been_longer_than(Self::PENDING_TTL_MS));
+        let now = Timestamp::now();
+        positions
+            .into_iter()
+            .filter(|pos| {
+                let idx = (*pos.deref() as usize) / MAX_PAYLOAD_LENGTH;
+                if self.buffer.position_occupied(*pos).unwrap_or(true) {
+                    return false;
+                }
+                if self.pending.contains_key(&idx) {
+                    return false;
+                }
+                self.pending.insert(idx, now);
+                true
+            })
+            .collect()
+    }
+
+    /// Clear the pending marker for a chunk that just arrived. No-op if not pending.
+    pub fn clear_pending(&mut self, position: BytePosition) {
+        let idx = (*position as usize) / MAX_PAYLOAD_LENGTH;
+        self.pending.remove(&idx);
+    }
+
+    /// Run the chunk-level score policy: pick the highest-scoring holes that
+    /// clear the threshold (`WriteableBuffer::requestable_areas`), drop any
+    /// chunk whose byte position falls inside an active FEC batch (still
+    /// expected via the primary path), then filter through the pending dedup.
+    /// Returns ready-to-send `ByteRange`s; empty means nothing to request.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn score_policy_pick(&mut self, fec_active: &[Range<usize>]) -> Vec<ByteRange> {
+        let positions: Vec<BytePosition> = self
+            .buffer
+            .requestable_areas()
+            .iter()
+            .flat_map(|area| {
+                let r = area.range();
+                (r.start..r.end).map(|i| BytePosition((i * MAX_PAYLOAD_LENGTH) as u32))
+            })
+            .filter(|pos| {
+                let p = *pos.deref() as usize;
+                !fec_active.iter().any(|r| r.contains(&p))
+            })
+            .collect();
+        let accepted = self.reserve_for_request(positions);
+        coalesce_byte_positions(accepted)
+    }
+
+    /// End-of-stream variant of `score_policy_pick`: take **every** invalid
+    /// area regardless of score, filter through FEC-active and pending
+    /// dedup. Once `head` reaches `len`, every remaining hole is confirmed
+    /// loss; the score-policy threshold no longer makes sense and would
+    /// orphan small isolated holes.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn finalize_sweep_pick(&mut self, fec_active: &[Range<usize>]) -> Vec<ByteRange> {
+        let positions: Vec<BytePosition> = self
+            .buffer
+            .all_invalid_areas()
+            .iter()
+            .flat_map(|area| {
+                let r = area.range();
+                (r.start..r.end).map(|i| BytePosition((i * MAX_PAYLOAD_LENGTH) as u32))
+            })
+            .filter(|pos| {
+                let p = *pos.deref() as usize;
+                !fec_active.iter().any(|r| r.contains(&p))
+            })
+            .collect();
+        let accepted = self.reserve_for_request(positions);
+        coalesce_byte_positions(accepted)
+    }
+}
+
+#[derive(Debug)]
 pub enum Streaming {
     To(StreamingTo),
-    From(WriteableBuffer),
+    From(StreamingFrom),
 }
 
 #[derive(Debug)]
@@ -133,6 +231,10 @@ impl StreamState {
         }
     }
 
+    /// Read the payload for each requested range. Each `ByteRange` here is
+    /// expected to be chunk-sized (length ≤ `MAX_PAYLOAD_LENGTH`); the queue
+    /// upstream splits multi-chunk requests via `split_range_into_chunks`.
+    /// Oversized ranges are clamped to one chunk for safety.
     #[allow(clippy::cast_possible_truncation)]
     pub fn retransmit(&mut self, ranges: Vec<ByteRange>) -> Option<Vec<(BytePosition, Box<[u8]>)>> {
         if let Streaming::To(StreamingTo { buffer, .. }) = &mut self.streaming
@@ -140,16 +242,12 @@ impl StreamState {
             && !self.stream.borrow().closed
         {
             let mut buf = vec![];
-            for mut range in ranges {
-                for _ in 0..=(range.length as usize / MAX_PAYLOAD_LENGTH) {
-                    let end = (*range.start as usize + MAX_PAYLOAD_LENGTH).min(buffer.len());
-                    let Some(payload) = buffer.read(*range.start as usize..end) else {
-                        continue;
-                    };
-
+            for range in ranges {
+                let start = *range.start as usize;
+                let len = (range.length as usize).min(MAX_PAYLOAD_LENGTH);
+                let end = (start + len).min(buffer.len());
+                if let Some(payload) = buffer.read(start..end) {
                     buf.push((range.start, Box::from(payload)));
-
-                    *range.start += MAX_PAYLOAD_LENGTH as u32;
                 }
             }
             Some(buf)
@@ -233,7 +331,7 @@ impl ConnectionStates {
                 ..
             }) => {
                 *state = SessionStates::Streaming(StreamState {
-                    streaming: Streaming::From(buffer),
+                    streaming: Streaming::From(StreamingFrom::new(buffer)),
                     stream: sender,
                     fec: SessionFecState::default(),
                 });
@@ -355,69 +453,76 @@ impl ConnectionStates {
     ) -> Result<bool> {
         let address_copy: SocketAddr;
         let declare_done: bool;
-        let just_reached_end: bool;
-        let batch_end: bool;
-        let resweep_due: bool;
+        let score_ranges: Vec<ByteRange>;
         if let ConnectionStates::Established(box EstablishedState {
             state:
                 SessionStates::Streaming(StreamState {
-                    streaming: Streaming::From(buffer),
+                    streaming: Streaming::From(streaming_from),
                     stream,
-                    ..
+                    fec,
                 }),
             address,
             ..
         }) = self
         {
             debug!("received data: {}", packet.byte_range_start);
-            let prev_head_at_end = buffer.head_at_end();
+            // Track this batch in the manager-side mirror (built purely from
+            // DataPacket info — no state bled across the FEC module boundary).
+            fec.add_data(packet.batch_id, packet.fec_info, packet.byte_range_start);
+
             let payload = packet.payload.clone().take();
-            if buffer.write(packet.byte_range_start, payload).is_none() {
+            if streaming_from
+                .buffer
+                .write(packet.byte_range_start, payload)
+                .is_none()
+            {
                 warn!(
                     "received_data_packet: write failed at {}",
                     packet.byte_range_start
                 );
                 return Err(Error::IrrelevantError);
             }
+            // Data arrived for this chunk — drop any pending retransmit marker.
+            streaming_from.clear_pending(packet.byte_range_start);
 
             stream.send_modify(|m| {
-                m.head = buffer.head();
+                m.head = streaming_from.buffer.head();
             });
 
             let complete_allow_partial = stream.borrow().complete.is_some_and(identity);
-            let head_at_end = buffer.head_at_end();
+            let head_at_end = streaming_from.buffer.head_at_end();
             // strict is_done = head reached end AND every chunk is filled.
             // partial-allow lets the user finish the stream with skipped data, but
             // we still wait until the head has reached the end of the buffer.
-            declare_done = buffer.is_done() || (complete_allow_partial && head_at_end);
-            just_reached_end = !prev_head_at_end && head_at_end;
-            // batch_pos runs [0, batch_size); the last data packet of a batch has
-            // batch_pos == batch_size - 1. Widen to u16 for the comparison so
-            // batch_pos == u8::MAX (which can occur once retransmit batches grow
-            // past 256 chunks) doesn't panic on the +1.
-            batch_end = u16::from(packet.fec_info.batch_pos) + 1
+            declare_done = streaming_from.buffer.is_done()
+                || (complete_allow_partial && head_at_end);
+
+            // batch_pos runs [0, batch_size); the last data packet of a batch
+            // has batch_pos == batch_size - 1. Widen to u16 so the +1 doesn't
+            // panic when batch_pos == u8::MAX (retransmit batches > 256 chunks).
+            let batch_end = u16::from(packet.fec_info.batch_pos) + 1
                 == u16::from(packet.fec_info.batch_size);
 
-            // Stalled-finalize detection: while we're in finalize state and a
-            // batch boundary lands without bringing us to strict-is_done, count
-            // it. After SWEEP_BATCH_THRESHOLD such batches we re-issue the
-            // end-of-session sweep — covers the lost-retransmit-response case
-            // without a wall-clock timer.
-            resweep_due = if head_at_end && batch_end && !buffer.is_done() {
-                let n = buffer.note_batch_end();
-                if n >= SWEEP_BATCH_THRESHOLD {
-                    buffer.reset_sweep_counter();
-                    true
+            // Retransmit policy. Two modes:
+            //  - `head_at_end`: every remaining hole is confirmed loss,
+            //    fire the finalize sweep (no threshold, no per-tick cap).
+            //    Pending dedup + sender-side per-tick pacing keep it sane.
+            //  - mid-stream batch_end: score policy picks the
+            //    highest-scoring holes that clear `SCORE_THRESHOLD`.
+            // FEC TTL prune still runs in parallel and handles partial
+            // FEC-tracked batches.
+            score_ranges = if !declare_done {
+                let fec_active = fec.active_byte_ranges();
+                if head_at_end {
+                    streaming_from.finalize_sweep_pick(&fec_active)
+                } else if batch_end {
+                    streaming_from.score_policy_pick(&fec_active)
                 } else {
-                    false
+                    vec![]
                 }
             } else {
-                false
+                vec![]
             };
-
-            if just_reached_end {
-                buffer.reset_sweep_counter();
-            }
 
             address_copy = *lock_read!(address);
         } else {
@@ -447,97 +552,9 @@ impl ConnectionStates {
             return Ok(false);
         }
 
-        // End-of-session sweep: fires once when head first crosses len, and
-        // again every SWEEP_BATCH_THRESHOLD batch-level events while we're
-        // stalled in finalize state. Combined with the existing ack-window
-        // retry on the request packet itself, this covers both lost-request
-        // and lost-response cases without a wall-clock timer.
-        if just_reached_end || resweep_due {
-            let final_holes = self.holes(4).unwrap_or_default();
-            if !final_holes.is_empty() {
-                debug!(
-                    "end-of-session sweep ({}): requesting {} hole ranges",
-                    if just_reached_end { "initial" } else { "stall-resweep" },
-                    final_holes.len()
-                );
-                self.send_retransmit_requests(sender, final_holes).await;
-                return Ok(fec::received(packet).await);
-            }
-        }
-
-        if batch_end {
-            self.check_for_retransmits(sender).await;
-        }
+        dispatch_retransmit_request(&sender, packet.session_id, address_copy, score_ranges).await;
 
         Ok(fec::received(packet).await)
-    }
-
-    // dw until_quadrant is temporary
-    pub fn holes(&self, until_quadrant: usize) -> Option<Vec<ByteRange>> {
-        if until_quadrant > 4 {
-            return None;
-        }
-        let ConnectionStates::Established(box EstablishedState {
-            state:
-                SessionStates::Streaming(StreamState {
-                    streaming: Streaming::From(buf),
-                    ..
-                }),
-            ..
-        }) = self
-        else {
-            return None;
-        };
-
-        #[allow(clippy::cast_possible_truncation)]
-        let mut ranges = buf
-            .find_holes(BytePosition(((buf.head() / 4) * until_quadrant) as u32))
-            .into_iter()
-            .map(|e| ByteRange::new(e, MAX_PAYLOAD_LENGTH as u16));
-
-        let Some(mut tmp_range) = ranges.next() else {
-            return Some(vec![]);
-        };
-        let mut final_ranges = vec![];
-
-        for range in ranges {
-            if !tmp_range.concat(&range) {
-                final_ranges.push(tmp_range);
-                tmp_range = range;
-            }
-        }
-
-        final_ranges.push(tmp_range);
-        Some(final_ranges)
-    }
-
-    /// Naive implementation of retransmition requests - check for holes in bytes before 75% of head
-    /// and request retransmit for missing
-    async fn check_for_retransmits(&self, sender: ManagerToProcessor) {
-        let ranges = o_unwrap_or_return!(self.holes(3));
-        self.send_retransmit_requests(sender, ranges).await;
-    }
-
-    /// Dispatch a `RetransmitPacket` for the given hole ranges, splitting into
-    /// payload-sized chunks if necessary.
-    async fn send_retransmit_requests(
-        &self,
-        sender: ManagerToProcessor,
-        ranges: Vec<ByteRange>,
-    ) {
-        if ranges.is_empty() {
-            return;
-        }
-        let max_per_packet = RetransmitPacket::LOCAL_MAX_PAYLOAD_LENGTH / ByteRange::elem_size();
-        for chunk in ranges.chunks(max_per_packet) {
-            Box::new(RetransmitPacket::data(
-                Options::none(),
-                self.session_id(),
-                chunk.to_vec(),
-            ))
-            .send(sender.clone(), self.address().await)
-            .await;
-        }
     }
 
     pub async fn address(&self) -> SocketAddr {
@@ -556,38 +573,48 @@ impl ConnectionStates {
         let address_copy: SocketAddr;
         let session_id_copy: SessionId;
         let declare_done: bool;
-        let just_reached_end: bool;
+        let score_ranges: Vec<ByteRange>;
         if let ConnectionStates::Established(box EstablishedState {
             state:
                 SessionStates::Streaming(StreamState {
-                    streaming: Streaming::From(buffer),
+                    streaming: Streaming::From(streaming_from),
                     stream,
-                    ..
+                    fec,
                 }),
             address,
             session_id,
             ..
         }) = self
         {
-            let prev_head_at_end = buffer.head_at_end();
+            // Batch is settled — drop the manager-side mirror entry.
+            fec.evict(recovered.batch_id);
+
             for packet in recovered.packets {
-                buffer.write(packet.byte_range_start, packet.payload);
+                let pos = packet.byte_range_start;
+                streaming_from.buffer.write(pos, packet.payload);
+                streaming_from.clear_pending(pos);
                 stream.send_modify(|m| {
-                    m.head = buffer.head();
+                    m.head = streaming_from.buffer.head();
                 });
             }
             let complete_allow_partial = stream.borrow().complete.is_some_and(identity);
-            let head_at_end = buffer.head_at_end();
-            declare_done = buffer.is_done() || (complete_allow_partial && head_at_end);
-            just_reached_end = !prev_head_at_end && head_at_end;
+            let head_at_end = streaming_from.buffer.head_at_end();
+            declare_done = streaming_from.buffer.is_done()
+                || (complete_allow_partial && head_at_end);
 
-            // Resweep counting lives in `received_data_packet` only — counting
-            // here too would double-fire on the data+recovery pair for the same
-            // batch, generating a redundant sweep that the server dedups.
-
-            if just_reached_end {
-                buffer.reset_sweep_counter();
-            }
+            // Recovery completing a batch is just as good a trigger as a
+            // data batch_end. Same two-mode policy as `received_data_packet`:
+            // finalize-sweep when head_at_end, score-policy otherwise.
+            score_ranges = if !declare_done {
+                let fec_active = fec.active_byte_ranges();
+                if head_at_end {
+                    streaming_from.finalize_sweep_pick(&fec_active)
+                } else {
+                    streaming_from.score_policy_pick(&fec_active)
+                }
+            } else {
+                vec![]
+            };
 
             address_copy = *lock_read!(address);
             session_id_copy = *session_id;
@@ -618,16 +645,7 @@ impl ConnectionStates {
             return Ok(());
         }
 
-        if just_reached_end {
-            let final_holes = self.holes(4).unwrap_or_default();
-            if !final_holes.is_empty() {
-                debug!(
-                    "end-of-session sweep (initial, recovery path): requesting {} hole ranges",
-                    final_holes.len()
-                );
-                self.send_retransmit_requests(sender, final_holes).await;
-            }
-        }
+        dispatch_retransmit_request(&sender, session_id_copy, address_copy, score_ranges).await;
 
         Ok(())
     }
@@ -658,6 +676,7 @@ pub struct ProtocolState {
     pub encryption: EncryptionTable,
     pub fingerprints: FingerprintWindow,
     pub address_session: AddressSessionIdTable,
+    pub fec_prune: Arc<FecPruneTask>,
 }
 
 impl ProtocolState {
@@ -670,10 +689,11 @@ impl ProtocolState {
             global_handle_monitor: Arc::default(),
             connections: ConnectionStatesTable::default(),
             handshakes: HandshakeStateTable::default(),
-            ack: Arc::new(PendingAckWindow::new(sender)),
+            ack: Arc::new(PendingAckWindow::new(sender.clone())),
             encryption: EncryptionTable::default(),
             fingerprints: FingerprintWindow::default(),
             address_session: AddressSessionIdTable::default(),
+            fec_prune: Arc::new(FecPruneTask::new(sender)),
         }
     }
 
@@ -924,8 +944,19 @@ impl ProtocolState {
 
         let mut playing = true;
         let mut interval = interval(SEND_INTERVAL);
-        let mut paused_retransmits = vec![];
-        let mut seek_holes = vec![];
+        // Unified queue of chunks still owed to the receiver — seek-skipped
+        // bytes the sender wants to fill in, and retransmit requests from
+        // the receiver. Drained by the interval-paced `send_stream_action`
+        // only when fresh data is exhausted, so head-sends always win.
+        //
+        // Stored as a `BTreeSet` of chunk indices for two reasons:
+        //  - dedup: receiver re-requests every `PENDING_TTL_MS` while a
+        //    response is still in flight; without dedup the queue grows
+        //    linearly with backlog time and the server keeps sending
+        //    chunks the receiver already has.
+        //  - ordered draining: chunks go out in chunk-index order, which
+        //    matches the receiver's natural fill-from-head expectation.
+        let mut extras: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
         let mut last_sent = BytePosition(0);
 
         loop {
@@ -941,21 +972,15 @@ impl ProtocolState {
                             StreamEvent::Playback(PlaybackControl::Pause) => playing = false,
                             StreamEvent::Playback(PlaybackControl::Play) => {
                                 playing = true;
-                                if !paused_retransmits.is_empty() {
-                                    self
-                                        .global_handle_monitor
-                                        .dispatch(retransmit_action(
-                                            session_id,
-                                            outbound_sender.clone(),
-                                            mem::take(&mut paused_retransmits),
-                                        ));
-                                }
+                                // No special handling: anything queued in
+                                // `extras` while paused drains naturally on
+                                // the next tick now that `playing` is true.
                             },
 
                             StreamEvent::Playback(PlaybackControl::Seek(to)) => {
                                 debug!("got seek request to position {to}");
                                 seek_action(session_id, to).await;
-                                seek_holes.push(to.to_range(last_sent));
+                                add_seek_hole_indices(&mut extras, last_sent, to);
                             }
 
                             StreamEvent::Playback(PlaybackControl::Done) => {
@@ -970,18 +995,15 @@ impl ProtocolState {
                                 return;
                             }
 
-                            StreamEvent::Retransmit(byte_ranges) if playing => {
-                                self
-                                    .global_handle_monitor
-                                    .dispatch(retransmit_action(
-                                        session_id,
-                                        outbound_sender.clone(),
-                                        byte_ranges,
-                                    ));
-                            }
-
                             StreamEvent::Retransmit(byte_ranges) => {
-                                paused_retransmits.extend(byte_ranges);
+                                // Split each requested range into chunk indices
+                                // and insert into the dedup set. Duplicate
+                                // requests for the same chunk are absorbed.
+                                for r in byte_ranges.into_iter()
+                                    .flat_map(split_range_into_chunks)
+                                {
+                                    extras.insert((*r.start as usize) / MAX_PAYLOAD_LENGTH);
+                                }
                             }
                         }
                     }
@@ -990,7 +1012,7 @@ impl ProtocolState {
                         session_id,
                         outbound_sender.clone(),
                         PACKET_COUNT_PER_BATCH,
-                        &mut seek_holes,
+                        &mut extras,
                     ).await.unwrap_or(last_sent);
                 }
             }
@@ -1130,59 +1152,12 @@ async fn seek_action(session_id: SessionId, pos: BytePosition) {
     buffer.seek(pos);
 }
 
-async fn retransmit_action(
-    session_id: SessionId,
-    outbound_sender: ManagerToProcessor,
-    ranges: Vec<ByteRange>,
-) {
-    let action = {
-        let mut lock = lock_write!(get_state!().connections);
-        let session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
-            "Invariant broken in `retransmit_action` \
-                                with ID {session_id}: session does not exist"
-        )));
-        if let ConnectionStates::Established(box EstablishedState {
-            state:
-                SessionStates::Streaming(
-                    stream @ StreamState {
-                        streaming: Streaming::To(_),
-                        ..
-                    },
-                ),
-            address,
-            ..
-        }) = session
-            && let Some(chunks) = stream.retransmit(ranges)
-        {
-            let addr = *lock_read!(address);
-            let StreamState {
-                streaming: Streaming::To(streaming_to),
-                ..
-            } = stream
-            else {
-                debug_assert!(
-                    false,
-                    "state diverged changed while holding exclusive reference"
-                );
-                return;
-            };
-            Some((chunks, addr, streaming_to.next_batch_id()))
-        } else {
-            None
-        }
-    };
-
-    if let Some((chunks, addr, current_batch)) = action {
-        send_data_packets(chunks, &outbound_sender, session_id, addr, current_batch).await;
-    }
-}
-
 #[instrument(skip_all)]
 async fn send_stream_action(
     session_id: SessionId,
     outbound_sender: ManagerToProcessor,
     n: usize,
-    extras: &mut Vec<ByteRange>,
+    extras: &mut std::collections::BTreeSet<usize>,
 ) -> Option<BytePosition> {
     let action = {
         let mut lock = lock_write!(get_state!().connections);
@@ -1200,9 +1175,27 @@ async fn send_stream_action(
         }) = session
             && let Some(chunks) = stream.get_chunks(n)
         {
+            // Head sends always win the tick budget. Only fall through to
+            // extras (seek-skipped + retransmit-requested chunk indices)
+            // when fresh data is fully exhausted, and even then drain at
+            // most `n` chunks so retransmits inherit the same pacing.
             let chunks = if chunks.is_empty() && !extras.is_empty() {
-                debug!("sending skipped chunks");
-                stream.retransmit(std::mem::take(extras))?
+                debug!("draining {} extras (budget {})", extras.len().min(n), n);
+                let take_idxs: Vec<usize> = extras.iter().take(n).copied().collect();
+                for i in &take_idxs {
+                    extras.remove(i);
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let to_send: Vec<ByteRange> = take_idxs
+                    .into_iter()
+                    .map(|i| {
+                        ByteRange::new(
+                            BytePosition((i * MAX_PAYLOAD_LENGTH) as u32),
+                            MAX_PAYLOAD_LENGTH as u16,
+                        )
+                    })
+                    .collect();
+                stream.retransmit(to_send)?
             } else {
                 chunks
             };
@@ -1613,40 +1606,75 @@ impl SessionAddressTable {
     }
 }
 
+/// Manager-side mirror of which batches are currently in flight for a single
+/// session. Built from the `DataPacket`s the manager already receives — no
+/// state is bled across the FEC module boundary. The score policy uses this
+/// to skip chunks still actively being received via FEC's primary path.
+///
+/// No internal lock: always accessed via `&mut StreamState` under the outer
+/// connections write lock.
 #[derive(Default, Debug)]
 pub struct SessionFecState {
-    table: RwLock<HashMap<BatchID, FecBatchWindow>>,
+    table: HashMap<BatchID, FecBatchWindow>,
 }
 
 impl SessionFecState {
-    pub async fn add_data(
-        &self,
+    /// Time a batch can sit in the manager-side mirror before being assumed
+    /// stale and evicted on next read. Same as the FEC-internal TTL — these
+    /// two clocks are in lockstep semantically.
+    pub const ENTRY_TTL_MS: u64 = PACKET_DISCARD_TIME_MS;
+
+    pub fn add_data(
+        &mut self,
         batch_id: BatchID,
-        FECInfo {
+        fec_info: FECInfo,
+        byte_range_start: BytePosition,
+    ) {
+        let FECInfo {
             batch_size,
             batch_pos,
             recovery_count,
-        }: FECInfo,
-    ) {
-        let mut lock = lock_write!(self.table);
-        lock.entry(batch_id)
-            .or_insert(FecBatchWindow::new(batch_size, recovery_count))
-            .add_data(batch_pos as usize);
+        } = fec_info;
+        self.table
+            .entry(batch_id)
+            .or_insert_with(|| FecBatchWindow::new(batch_size, recovery_count))
+            .add_data(batch_pos as usize, byte_range_start);
     }
 
-    pub async fn add_parity(
-        &self,
-        batch_id: BatchID,
-        FECInfo {
+    pub fn add_parity(&mut self, batch_id: BatchID, fec_info: FECInfo) {
+        let FECInfo {
             batch_size,
             recovery_count,
             ..
-        }: FECInfo,
-    ) {
-        let mut lock = lock_write!(self.table);
-        lock.entry(batch_id)
-            .or_insert(FecBatchWindow::new(batch_size, recovery_count))
-            .add_parity();
+        } = fec_info;
+        let entry = self
+            .table
+            .entry(batch_id)
+            .or_insert_with(|| FecBatchWindow::new(batch_size, recovery_count));
+        #[cfg(feature = "fec_xor")]
+        entry.add_parity();
+        #[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
+        entry.add_parity(fec_info.batch_pos as usize);
+    }
+
+    /// Drop the manager's mirror entry for `batch_id`. Called when the
+    /// receiver knows the batch is settled (e.g. successful recovery).
+    pub fn evict(&mut self, batch_id: BatchID) {
+        self.table.remove(&batch_id);
+    }
+
+    /// Byte ranges currently held in active batches — chunks the score
+    /// policy should not request, since they're still expected via the
+    /// primary path. Sweeps stale entries (older than `ENTRY_TTL_MS`)
+    /// before computing.
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn active_byte_ranges(&mut self) -> Vec<Range<usize>> {
+        self.table
+            .retain(|_, batch| !batch.created_at.been_longer_than(Self::ENTRY_TTL_MS));
+        self.table
+            .values()
+            .filter_map(FecBatchWindow::contiguous_byte_range)
+            .collect()
     }
 }
 
@@ -1656,6 +1684,15 @@ struct FecBatchWindow {
     recovery_count: u8,
     data_arrived: FecArrivedBitMap,
     recovery_arrived: FecArrivedBitMap,
+    created_at: Timestamp,
+    /// First chunk's byte position, derived as
+    /// `byte_range_start - batch_pos * MAX_PAYLOAD_LENGTH` on the first
+    /// data packet to land. `None` if only parity has arrived so far.
+    base_byte_pos: Option<BytePosition>,
+    /// True when every data packet's position matches `base + batch_pos * MPL`.
+    /// Retransmit batches break this; non-contiguous batches don't contribute
+    /// an active byte range.
+    is_contiguous: bool,
 }
 
 impl FecBatchWindow {
@@ -1665,6 +1702,9 @@ impl FecBatchWindow {
             recovery_count,
             data_arrived: FecArrivedBitMap::default(),
             recovery_arrived: FecArrivedBitMap::default(),
+            created_at: Timestamp::now(),
+            base_byte_pos: None,
+            is_contiguous: true,
         }
     }
 
@@ -1672,8 +1712,21 @@ impl FecBatchWindow {
         self.data_arrived.count_set() + self.recovery_arrived.count_set() >= self.batch_size
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     #[inline]
-    fn add_data(&mut self, index: usize) {
+    fn add_data(&mut self, index: usize, byte_range_start: BytePosition) {
+        let derived_base = BytePosition(
+            byte_range_start
+                .0
+                .saturating_sub((index as u32) * MAX_PAYLOAD_LENGTH as u32),
+        );
+        match self.base_byte_pos {
+            None => self.base_byte_pos = Some(derived_base),
+            Some(existing) if existing.0 != derived_base.0 => {
+                self.is_contiguous = false;
+            }
+            _ => {}
+        }
         self.data_arrived.set_bit(index);
     }
 
@@ -1687,6 +1740,18 @@ impl FecBatchWindow {
     #[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
     fn add_parity(&mut self, index: usize) {
         self.recovery_arrived.set_bit(index);
+    }
+
+    /// `[base, base + batch_size * MAX_PAYLOAD_LENGTH)` for contiguous batches
+    /// where at least one data packet has set the base. Non-contiguous /
+    /// parity-only batches return `None`.
+    #[allow(clippy::cast_possible_truncation)]
+    fn contiguous_byte_range(&self) -> Option<Range<usize>> {
+        if !self.is_contiguous {
+            return None;
+        }
+        let base = self.base_byte_pos?.0 as usize;
+        Some(base..base + (self.batch_size as usize) * MAX_PAYLOAD_LENGTH)
     }
 }
 
@@ -2009,6 +2074,178 @@ impl FingerprintWindow {
             tokio::time::sleep(Duration::from_millis(top_timestamp + Self::BUFFERING_TIME)).await;
         }
     }
+}
+
+/// Long-running task that periodically asks FEC to prune inbound batches
+/// that have aged out without becoming recoverable, and emits retransmit
+/// requests for each pruned batch's missing chunks.
+pub struct FecPruneTask {
+    sender: ManagerToProcessor,
+    canceled: AtomicBool,
+}
+
+impl FecPruneTask {
+    /// A batch can sit in FEC inbound state this long before it's declared stuck.
+    const TTL_MS: u64 = PACKET_DISCARD_TIME_MS;
+    /// Sleep between sweeps. Smaller than TTL so a stuck batch is caught
+    /// within ~SLEEP_MS of crossing the threshold.
+    const SLEEP: Duration = Duration::from_millis(100);
+
+    #[must_use]
+    pub fn new(sender: ManagerToProcessor) -> Self {
+        Self {
+            sender,
+            canceled: AtomicBool::new(false),
+        }
+    }
+
+    pub fn init(self: Arc<Self>) {
+        get_state!().global_handle_monitor.dispatch(self.prune());
+    }
+
+    pub fn close(&self) {
+        self.canceled.store(true, Ordering::Release);
+    }
+
+    pub async fn prune(self: Arc<Self>) {
+        while !self.canceled.load(Ordering::Relaxed) {
+            tokio::time::sleep(Self::SLEEP).await;
+
+            let expired = fec::prune(Self::TTL_MS).await;
+
+            // Group by session so the connections write lock is acquired
+            // once per session, regardless of how many batches expired for it.
+            let mut by_session: HashMap<SessionId, Vec<BytePosition>> = HashMap::default();
+            for (session_id, _batch_id, positions) in expired {
+                if positions.is_empty() {
+                    continue;
+                }
+                by_session
+                    .entry(session_id)
+                    .or_default()
+                    .extend(positions);
+            }
+
+            for (session_id, positions) in by_session {
+                // Resolve session address + dedup the positions through the
+                // session's StreamingFrom.pending. Skip if the session is
+                // gone or no positions survive the dedup filter.
+                let dispatch = {
+                    let mut lock = lock_write!(get_state!().connections);
+                    let Some(state) = lock.get_mut(&session_id) else {
+                        continue;
+                    };
+                    if let ConnectionStates::Established(box EstablishedState {
+                        state:
+                            SessionStates::Streaming(StreamState {
+                                streaming: Streaming::From(streaming_from),
+                                ..
+                            }),
+                        address,
+                        ..
+                    }) = state
+                    {
+                        let accepted = streaming_from.reserve_for_request(positions);
+                        if accepted.is_empty() {
+                            None
+                        } else {
+                            Some((accepted, *lock_read!(address)))
+                        }
+                    } else {
+                        None
+                    }
+                };
+                let Some((accepted, addr)) = dispatch else { continue };
+
+                let ranges = coalesce_byte_positions(accepted);
+                dispatch_retransmit_request(&self.sender, session_id, addr, ranges).await;
+            }
+        }
+    }
+}
+
+/// Insert chunk indices covering `[low, high)` into `extras`. Duplicate
+/// indices are absorbed by the set.
+#[allow(clippy::cast_possible_truncation)]
+fn add_seek_hole_indices(
+    extras: &mut std::collections::BTreeSet<usize>,
+    last_sent: BytePosition,
+    to: BytePosition,
+) {
+    let (lo, hi) = if to.0 > last_sent.0 {
+        (last_sent.0 as usize, to.0 as usize)
+    } else {
+        (to.0 as usize, last_sent.0 as usize)
+    };
+    let start_chunk = lo / MAX_PAYLOAD_LENGTH;
+    let end_chunk = hi.div_ceil(MAX_PAYLOAD_LENGTH);
+    for i in start_chunk..end_chunk {
+        extras.insert(i);
+    }
+}
+
+/// Break a (possibly large) `ByteRange` into chunk-sized `ByteRange`s of
+/// length `MAX_PAYLOAD_LENGTH` (last one possibly shorter). Used so the
+/// run-streaming loop can keep a flat per-chunk queue and the per-tick budget
+/// is just a `drain(..n)`.
+#[allow(clippy::cast_possible_truncation)]
+fn split_range_into_chunks(range: ByteRange) -> impl Iterator<Item = ByteRange> {
+    let start = range.start.0;
+    let end = start + range.length as u32;
+    let mut pos = start;
+    std::iter::from_fn(move || {
+        if pos >= end {
+            return None;
+        }
+        let len = (end - pos).min(MAX_PAYLOAD_LENGTH as u32) as u16;
+        let r = ByteRange::new(BytePosition(pos), len);
+        pos += len as u32;
+        Some(r)
+    })
+}
+
+/// Send `RetransmitPacket`s carrying the given ranges, splitting into multiple
+/// packets when the payload exceeds `RetransmitPacket::LOCAL_MAX_PAYLOAD_LENGTH`.
+async fn dispatch_retransmit_request(
+    sender: &ManagerToProcessor,
+    session_id: SessionId,
+    addr: SocketAddr,
+    ranges: Vec<ByteRange>,
+) {
+    if ranges.is_empty() {
+        return;
+    }
+    let max_per_packet = RetransmitPacket::LOCAL_MAX_PAYLOAD_LENGTH / ByteRange::elem_size();
+    for chunk in ranges.chunks(max_per_packet) {
+        Box::new(RetransmitPacket::data(
+            Options::none(),
+            session_id,
+            chunk.to_vec(),
+        ))
+        .send(sender.clone(), addr)
+        .await;
+    }
+}
+
+/// Merge a sorted list of single-chunk byte positions into the smallest set
+/// of `ByteRange`s that covers them, coalescing contiguous runs.
+#[allow(clippy::cast_possible_truncation)]
+fn coalesce_byte_positions(positions: Vec<BytePosition>) -> Vec<ByteRange> {
+    let mut iter = positions
+        .into_iter()
+        .map(|p| ByteRange::new(p, MAX_PAYLOAD_LENGTH as u16));
+    let Some(mut current) = iter.next() else {
+        return vec![];
+    };
+    let mut out = vec![];
+    for next in iter {
+        if !current.concat(&next) {
+            out.push(current);
+            current = next;
+        }
+    }
+    out.push(current);
+    out
 }
 
 pub struct EncryptionWindow {

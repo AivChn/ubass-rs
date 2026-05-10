@@ -32,6 +32,7 @@ pub async fn init(
             Some(ApiCommand::Close) => {
                 monitor.flush().await;
                 get_state!().ack.close();
+                get_state!().fec_prune.close();
                 get_state!().global_handle_monitor.flush().await;
                 _ = manager_to_processor
                     .send(PacketProcessingMessage::Close)
