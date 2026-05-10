@@ -176,3 +176,7 @@ pub async fn recover(batch_id: BatchID, session_id: SessionId) -> Option<Recover
         packets,
     })
 }
+
+pub async fn prune(ttl_ms: u64) -> Vec<(SessionId, BatchID, Vec<BytePosition>)> {
+    FEC.prune(ttl_ms).await
+}

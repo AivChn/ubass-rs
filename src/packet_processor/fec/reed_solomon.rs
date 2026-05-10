@@ -1,13 +1,16 @@
 use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::Mutex;
-use tokio::time::Instant;
 
 use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 
 use crate::{
-    manager::packets::{BatchID, FECInfo, Options, PacketType, ParityPacket, SessionId, Version},
+    manager::packets::{
+        BatchID, BytePosition, FECInfo, MAX_PAYLOAD_LENGTH, Options, PacketType, ParityPacket,
+        SessionId, Version,
+    },
     packet_processor::fec::FECPacket,
+    packet_processor::serialize::Serialize,
     prelude::*,
 };
 
@@ -18,6 +21,12 @@ struct InboundBatchData {
     batch_size: u8,
     recovery_count: u8,
     received_count: u8,
+    // Bitmask of received data batch_pos values (analogous to xor.rs). Used to
+    // enumerate missing positions when the batch is pruned.
+    batch_mask: [u128; 2],
+    created_at: Timestamp,
+    base_byte_pos: Option<BytePosition>,
+    is_contiguous: bool,
 }
 
 impl From<&FECPacket> for Arc<Mutex<InboundBatchData>> {
@@ -34,7 +43,27 @@ impl From<&FECPacket> for Arc<Mutex<InboundBatchData>> {
             batch_size,
             recovery_count,
             received_count: 0,
+            batch_mask: [0; 2],
+            created_at: Timestamp::now(),
+            base_byte_pos: None,
+            is_contiguous: true,
         }))
+    }
+}
+
+impl InboundBatchData {
+    #[allow(clippy::cast_possible_truncation)]
+    fn missing_positions(&self) -> Vec<BytePosition> {
+        let Some(base) = self.base_byte_pos else {
+            return vec![];
+        };
+        if !self.is_contiguous {
+            return vec![];
+        }
+        (0..self.batch_size)
+            .filter(|i| (self.batch_mask[(i / 128) as usize] >> (i % 128)) & 1 == 0)
+            .map(|i| BytePosition(base.0 + u32::from(i) * MAX_PAYLOAD_LENGTH as u32))
+            .collect()
     }
 }
 
@@ -156,6 +185,26 @@ impl RS {
             }
             batch.recovery_count += 1;
         } else {
+            // Capture base + contiguity from byte_range_start (FECData[0..4])
+            // before handing the shard to the decoder. Mirrors xor.rs.
+            let pkt_byte_pos =
+                BytePosition(<u32>::deserialize(&packet.data.0[..4]).expect("Exact size"));
+            #[allow(clippy::cast_possible_truncation)]
+            let derived_base = BytePosition(
+                pkt_byte_pos.0.saturating_sub(
+                    u32::from(packet.fec_info.batch_pos) * MAX_PAYLOAD_LENGTH as u32,
+                ),
+            );
+            match batch.base_byte_pos {
+                None => batch.base_byte_pos = Some(derived_base),
+                Some(existing) if existing.0 != derived_base.0 => {
+                    batch.is_contiguous = false;
+                }
+                _ => {}
+            }
+            batch.batch_mask[(packet.fec_info.batch_pos / 128) as usize] |=
+                1 << (packet.fec_info.batch_pos % 128);
+
             if let Err(reed_solomon_simd::Error::DuplicateOriginalShardIndex { index: _ }) = batch
                 .decoder
                 .add_original_shard(packet.fec_info.batch_pos as usize, *packet.data.0)
@@ -166,6 +215,39 @@ impl RS {
         }
 
         true
+    }
+
+    /// Sweep inbound batches whose age exceeds `ttl_ms`. Removes them from
+    /// the map and returns `(session_id, batch_id, missing_positions)` for each.
+    /// Outer `inbound` mutex held only briefly twice — see xor.rs for rationale.
+    pub async fn prune(&self, ttl_ms: u64) -> Vec<(SessionId, BatchID, Vec<BytePosition>)> {
+        let snapshot: Vec<(MapKey, InboundBatch)> = {
+            let guard = self.inbound.lock().await;
+            guard.iter().map(|(k, v)| (*k, v.clone())).collect()
+        };
+
+        let mut expired_keys = Vec::new();
+        for (key, entry) in &snapshot {
+            let batch = entry.lock().await;
+            if batch.created_at.been_longer_than(ttl_ms) {
+                expired_keys.push(*key);
+            }
+        }
+
+        let removed: Vec<(MapKey, InboundBatch)> = {
+            let mut guard = self.inbound.lock().await;
+            expired_keys
+                .into_iter()
+                .filter_map(|k| guard.remove(&k).map(|e| (k, e)))
+                .collect()
+        };
+
+        let mut out = Vec::with_capacity(removed.len());
+        for (key, entry) in removed {
+            let batch = entry.lock().await;
+            out.push((key.1, key.0, batch.missing_positions()));
+        }
+        out
     }
 
     pub async fn recover(
