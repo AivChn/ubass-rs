@@ -273,3 +273,41 @@ Buffer being full is an immediate shortcut to done
 But why?
 
 Echo - client panicked, no idea why. Add logs.
+
+# Retransmission
+  - Divide buffer into areas
+  - Store invalid areas in a struct
+  - score each invalid area for a priority (current idea - use size of invalid area right after head / total valid chunks after head as part of the assessment)
+  - request Retransmission for the two highest priority areas above threshold
+
+when is it missing vs in flight?
+big valid area - missing, small gap adds to the likelihood
+small valid area - not missing, small gap adds to the likelihood
+
+priority: right after head is always highest priority, priority of later invalid areas are calculated in relation to the priority of the first
+areas before head get their priority scaled to be max 90% of after head priority
+
+before head:
+  invalid area size^2 / num of invalid areas before head
+
+after head:
+  valid area size^2 * f(gap size)
+  for i consecutive invalid areas:
+    prev...
+  
+
+f(gap size): 
+
+what do I actually want to measure
+priority + confidence
+
+priority - can be constant based on the known parameters:
+  - before head gets priority based on size
+  - after head gets priority based on location from head
+  - first two areas after head always get priority 1, 2
+  - after that all invalid areas get ranked based on size
+
+confidence is then used to skew the priorities
+
+before head: priority / number of areas before head
+after head: priority / the distance of the area start from head

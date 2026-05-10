@@ -145,3 +145,129 @@ The earlier `Vec<ByteRange>` change to use `ByteRange::elem_size()` (= 6) for st
 ## Open issue: lossy retransmit, residual flakiness
 
 `test_with_seek` passes ~30% of the time and times out the rest of the time. With all the above fixes, the failure mode is still localhost UDP loss exceeding what the placeholder retransmit machinery can recover from before the test's 10 s timeout — *not* corruption. Per the user, the retransmit layer is being redesigned and shouldn't be hardened further now.
+
+---
+
+# Retransmit redesign (subsequent session)
+
+This section covers the retransmit-policy rewrite that replaced the placeholder machinery referenced above. **Final state: 23/23 lib + 6/6 e2e in parallel, ~3 s.**
+
+## Score-based receiver policy on `WriteableBuffer`
+
+Built on top of an `Area(Range<usize>)` newtype tracking contiguous invalid chunk runs. `WriteableBuffer.invalid_areas: Vec<Area>` mirrors `!map`, maintained incrementally in `occupy()`.
+
+Per-area score = **urgency × confidence_lost**:
+
+- **Urgency** — `1 / (1 + distance_from_head_in_chunks / URGENCY_DECAY_CHUNKS)` for after-head holes; `min(BEFORE_HEAD_URGENCY_CAP, size / BEFORE_HEAD_SIZE_DENOM)` for before-head (seek-leftover) holes. Head-adjacent peaks at 1; before-head capped strictly below 1 so live progress always wins on urgency alone.
+- **Confidence-lost** — `valid_past / (valid_past + CONFIDENCE_HALF_SAT_CHUNKS)` where `valid_past = total_chunks - area.end - sum_of_later_invalid`. Proxy for "this hole has been overtaken by enough later arrivals to be confidently real loss vs. still in flight."
+
+Tunables (`SCORE_THRESHOLD = 0.3`, `MAX_REQUESTS_PER_TICK = 2`) on `WriteableBuffer`. `requestable_areas()` is the policy output: filter by threshold, sort descending by score, truncate.
+
+9 tests in `src/api/types.rs::tests` cover urgency monotonicity, confidence shape, before-head cap, and the threshold + per-tick selection cap.
+
+## FEC inbound batch lifecycle (TTL + missing-chunks emission)
+
+Was the user's flagged leak: full-data batches with no parity sat in FEC's inbound HashMap forever (only `recover` removes entries, and `recover` only fires when the batch is recoverable).
+
+- `InboundBatchData` (both XOR and RS) gained `created_at: Timestamp`, `base_byte_pos: Option<BytePosition>`, `is_contiguous: bool`. Captured on first data packet from `byte_range_start - batch_pos × MPL`.
+- `Xor::prune(ttl_ms)` / `RS::prune(ttl_ms)`: snapshot `(key, Arc<Mutex<batch>>)` under brief outer lock, check timestamps without holding outer, re-acquire briefly to remove expired entries, compute `missing_positions` from the snapshot. Outer mutex hold time is two short windows instead of "duration of full iteration", so concurrent `received` / `recover` doesn't block.
+- Module-level `fec::prune(ttl_ms)`.
+
+## Manager-side mirror (`SessionFecState`)
+
+Per user direction "minimum state bleed": the manager builds its own per-session view of in-flight batches purely from `DataPacket` data, no API into FEC's internal state.
+
+- `SessionFecState` (already a field on `StreamState`) was dormant; activated.
+- Refactored to plain `HashMap<BatchID, FecBatchWindow>` (no internal `RwLock` — always accessed under outer connections lock now).
+- `FecBatchWindow` extended with `created_at`, `base_byte_pos`, `is_contiguous` (same triple as the FEC-internal `InboundBatchData`).
+- `add_data` wired into `received_data_packet`; `evict` called on `recovered_packet`.
+- `active_byte_ranges()` does TTL eviction lazily on read (retain stale-out, then yield contiguous-batch byte ranges). Score policy filters its candidates against this list — chunks still actively being received via the primary path are skipped.
+
+## Pending dedup: `StreamingFrom`
+
+To prevent the score policy and the FEC TTL prune from stepping on each other (each can independently want to request the same chunks), `Streaming::From(WriteableBuffer)` was promoted to `Streaming::From(StreamingFrom)` carrying:
+
+```rust
+pub struct StreamingFrom {
+    pub buffer: WriteableBuffer,
+    pub pending: HashMap<usize, Timestamp>,  // FxHashMap via prelude alias
+}
+```
+
+`reserve_for_request(positions) -> Vec<BytePosition>` is the single dedup gate: drops chunks already filled or already pending, marks accepted ones, opportunistically sweeps stale (older than `PENDING_TTL_MS = PACKET_DISCARD_TIME_MS`) before checking. `clear_pending(pos)` fires from `received_data_packet` and `recovered_packet` whenever data arrives. Lazy sweep avoids the global write-lock contention that an earlier per-tick global sweep caused (broke `test_data_bigger_than_packet`).
+
+## FEC TTL prune task in the manager
+
+Mirrors `PendingAckWindow` shape. `FecPruneTask::prune` runs every 100 ms:
+1. `fec::prune(TTL_MS)` evicts stale batches and returns `(session_id, batch_id, missing_positions)`.
+2. Group results by `session_id` (saves N-1 connections-write-lock acquisitions per session per tick).
+3. Per session: take the connections lock once, route the union of missing positions through `streaming_from.reserve_for_request(...)` for dedup, dispatch the accepted subset.
+
+Added `fec_prune.close()` to the `outbound::init`'s `ApiCommand::Close` handler — without it, `global_handle_monitor.flush().await` waits forever on the prune loop and `Api::drop` hangs forever on `manager_handle.join()`. (That was the original "shutdown-broken" symptom.)
+
+## Auto-ack on `RetransmitPacket` (the seek-test fix)
+
+`received_retransmit_request` (`routines/received.rs:52`) didn't call `received_packet_that_requires_ack`, even though every `RetransmitPacket` has `RequireAck` set. Result: every retransmit-request the receiver sent sat unacked in its `PendingAckWindow` and got retried up to `MAX_RETRIES = 5` times every 500 ms. Stacked with new requests from the score policy + FEC TTL prune, the ack-window backlog grew monotonically and exploded the outbound rate (the "2 → 172 batches/sec" ramp under seek). The server appeared to stop responding because its UDP inbound queue was firehosed.
+
+Fix: mirror the `received_data_packet` ack call. One-liner.
+
+## Unified send path (kills retransmit-action burst dispatch)
+
+The remaining seek-test failure (which still showed up under parallel-test contention) was that **retransmit responses bypassed the `send_stream_action` interval pacing entirely**. `retransmit_action` was a separate dispatch firing on `StreamEvent::Retransmit` that read all requested chunks at once and sent them in one burst — 1,500 packets in <100 ms for a typical seek-skipped region. UDP socket buffers (~140 packets at default Linux settings) couldn't keep up; the receiver dropped most of them.
+
+Refactor:
+- Dropped `retransmit_action`. Dropped `paused_retransmits`. Dropped `seek_holes`.
+- Single per-session `extras: Vec<ByteRange>` queue in the run-streaming loop. Holds chunk-sized `ByteRange`s (split via new `split_range_into_chunks`).
+- `StreamEvent::Retransmit(ranges)` extends `extras` with the chunk-split versions. No ad-hoc dispatch.
+- `send_stream_action`: when `get_chunks` is empty AND `extras` is non-empty, drains at most `n = PACKET_COUNT_PER_BATCH` from `extras` per tick. Head sends always win — extras are only touched once fresh data is exhausted.
+- `StreamState::retransmit` simplified, off-by-one bug killed (the `for _ in 0..=(length / MPL)` was sending one extra chunk per range).
+- `BytePosition::to_range` removed (silently truncated to `u16` length for seeks > 65,535 bytes — a separate bug surfaced during diagnosis). Replaced with chunk-aligned `push_seek_hole_chunks` at the call site.
+
+Net: retransmits inherit the same rate ceiling as fresh data. No more bursts. The ramp is gone.
+
+## Locking review
+
+After the prune task landed, granularity-tuned in two places:
+
+- `FecPruneTask::prune`: group expired batches by `session_id` before processing, so the connections write lock is acquired once per session instead of once per batch.
+- `Xor::prune` / `RS::prune`: snapshot `(key, Arc<Mutex<batch>>)` under brief outer lock, drop, then iterate the snapshot for timestamp checks. Outer `inbound` mutex hold time goes from "full iteration" to "two short windows."
+
+## `SEND_INTERVAL` sweep
+
+After the unified send path landed, swept the interval to characterize the design space. 3 runs each at stable values, 8 runs at the unstable ones.
+
+| `SEND_INTERVAL` | Pass rate | Wall time | Notes |
+|---|---|---|---|
+| 5 ms  | 3/3        | 1.30 s | Fastest. Aggressive on syscalls. |
+| 10 ms | 7/8 (1 flake on `test_data_bigger_than_packet`) | 1.85 s | Edge of stability. |
+| 15 ms | 3/3        | 2.10 s | **Sweet spot — fast and stable.** |
+| 25 ms | 3/3        | 3.0–3.4 s | Current default. Comfortable margin. |
+| 50 ms | 3/3        | 5.56 s | Stable, throughput-bound. |
+| 100 ms | 2/3 (1 flake on a slow handshake) | 10 s | Test budget too tight. |
+
+Below ~15 ms the protocol pushes packets faster than handshake-ack timing can give other tests headroom — flakes appear in non-seek tests. Above ~50 ms, throughput-bound; 100 ms hits the test framework's 10 s wall-clock with no margin. 25 ms current default is fine; 15 ms would be a free ~30% speedup at a small flakiness cost.
+
+The seek test specifically: passes consistently across **all** stable intervals because the retransmit response is bounded to `n` chunks per tick now, regardless of how big the seek-skipped region is.
+
+## Files changed (this round)
+
+| File | What |
+|---|---|
+| `src/api/types.rs` | `Area` newtype with associated-const tunables and `urgency`/`confidence_lost` methods; `WriteableBuffer.invalid_areas` + maintenance in `occupy`; `score_areas` / `requestable_areas`; tests; removed dead `note_batch_end`/`reset_sweep_counter`. |
+| `src/manager/state.rs` | `StreamingFrom` struct (replaces `Streaming::From(WriteableBuffer)`) with pending-marker dedup; `score_policy_pick` with FEC-active filter; `FecPruneTask`; unified `extras` queue in run-streaming loop; per-tick budget on extras drain; `push_seek_hole_chunks` + `split_range_into_chunks`; `dispatch_retransmit_request`; locking-granularity tuning. Removed: `retransmit_action`, `holes`, `send_retransmit_requests`, `SWEEP_BATCH_THRESHOLD`, sweep-counter machinery. |
+| `src/manager/routines/received.rs` | `received_retransmit_request` takes `outbound_sender` and auto-acks on `RequireAck`; diagnostic log. |
+| `src/manager/routines/endpoints.rs` | `find_holes` API endpoint switches to raw `WriteableBuffer::find_holes` (no policy coupling). |
+| `src/manager/inbound.rs` | Pass `outbound_sender` through to `received_retransmit_request`. |
+| `src/manager/outbound.rs` | `Close` handler also closes `fec_prune` task — fixes `Api::drop` hang. |
+| `src/manager/mod.rs` | Spawn the FEC prune task at startup. |
+| `src/manager/packets.rs` | Removed `BytePosition::to_range` (silently `u16`-truncating); added `BytePosition`↔`usize` `PartialEq`/`PartialOrd`. |
+| `src/packet_processor/fec/{mod.rs, xor.rs, reed_solomon.rs}` | `InboundBatchData` extended with timestamp + base + contiguity; `prune(ttl_ms)`; `missing_positions`; module-level `fec::prune`. |
+
+No dependencies added.
+
+## Final test state
+
+- `cargo test --lib`: **23/23**.
+- `cargo test --test e2e_test` (parallel): **6/6** in ~3 s.
+- `cargo test --test e2e_test -- --test-threads=1`: 6/6.
+- 2 e2e tests (`audio_data*`) remain `#[ignore]`'d as before.
