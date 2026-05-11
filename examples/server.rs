@@ -2,8 +2,8 @@
 use ubass::{
     Api,
     api::{
-        AppEvent, ApprovalStatus, ConnectionTrait, IncomingConnectionTrait, RequestedStreamTrait,
-        StreamTrait,
+        AppEvent, ApprovalStatus, ConnectionEvent, ConnectionTrait, IncomingConnectionTrait,
+        RequestedStreamTrait, StreamTrait,
     },
 };
 
@@ -12,7 +12,7 @@ pub async fn main() {
     let port = Some(ubass::DEFAULT_PORT);
     let app_id = "example server";
 
-    let api = Api::open(app_id, port).await.unwrap();
+    let api = Api::open(app_id, port).unwrap();
 
     let event = api.listen().await.unwrap();
     let incoming_connection = match event {
@@ -32,9 +32,8 @@ pub async fn main() {
 
     let event = connection.listen().await.unwrap();
     let requested_stream = match event {
-        ubass::api::ConnectionEvent::TrackRequested(requested_stream) => requested_stream,
-        ubass::api::ConnectionEvent::ConnectionClosed => return,
-        ubass::api::ConnectionEvent::ProtocolClosed => return,
+        ConnectionEvent::TrackRequested(requested_stream) => requested_stream,
+        ConnectionEvent::ConnectionClosed | ConnectionEvent::ProtocolClosed => return,
     };
 
     let mut data = b"So long, and thanks for all the fish!".to_vec();
@@ -46,15 +45,15 @@ pub async fn main() {
     let stream = match approval_status {
         ApprovalStatus::Approved(result) => match result {
             Ok(stream) => stream,
-            Err((error, connection)) => {
+            Err((_error, _connection)) => {
                 println!("failed to connect!");
                 return;
             }
         },
         ApprovalStatus::Rejected(result) => {
             match result {
-                Ok(connection) => println!("Rejected successfuly"),
-                Err(error) => println!("error!"),
+                Ok(_connection) => println!("Rejected successfuly"),
+                Err(_error) => println!("error!"),
             }
             return;
         }

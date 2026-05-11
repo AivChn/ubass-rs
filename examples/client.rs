@@ -8,7 +8,7 @@ pub async fn main() {
     let app_id = "example client";
     let server_address = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12020);
 
-    let api = Api::open(app_id, port).await.unwrap();
+    let api = Api::open(app_id, port).unwrap();
 
     let pending_connection = api.connect(server_address).await.unwrap();
     let connection = pending_connection.ready().await.unwrap();
@@ -22,5 +22,5 @@ pub async fn main() {
         .unwrap();
     let stream = pending_stream.ready().await.unwrap();
 
-    let connection = stream.complete().await.unwrap();
+    let _connection = stream.complete().await.unwrap();
 }
