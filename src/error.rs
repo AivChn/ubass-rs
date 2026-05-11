@@ -41,8 +41,23 @@ pub enum ApiErrors {
     BufferTooLarge,
     #[error("Internal protocol error")]
     Internal,
+    #[error("receive buffer was closed unexpectedly")]
+    BufferClosedUnexpectedly,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum BufferError {
+    #[error("position occupied")]
+    Occupied,
+    #[error("position not valid")]
+    NotValid,
+    #[error(
+        "wrong size - either too big for the buffer or smaller than a payload but no the last packet"
+    )]
+    WrongSize,
+    #[error("failed to dereference the buffer")]
+    FailedToDeref,
+}
 // this is a comment
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectionError {
@@ -62,6 +77,8 @@ pub enum ConnectionError {
     PeerRejected(Option<String>),
     #[error("Congrats! the universe is gone and you got 2 u64 collisions (1 in 2^65 chance)")]
     SessionIdCollided,
+    #[error("failed to dereference the buffer")]
+    BufferClosedUnexpectedly,
 }
 
 impl ConnectionError {
@@ -111,6 +128,8 @@ pub enum Error {
     },
     #[error("Error used when the only thing that matters is that it happened")]
     IrrelevantError,
+    #[error("failed to dereference the buffer")]
+    FailedToDeref,
 }
 
 #[derive(Debug, Display)]

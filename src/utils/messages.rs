@@ -87,6 +87,7 @@ pub struct StreamMessage {
     pub closed: bool,
     pub complete: Option<bool>,
     pub approved: Option<bool>,
+    pub buffer_closed: bool,
 }
 
 #[derive(Debug, Clone)]

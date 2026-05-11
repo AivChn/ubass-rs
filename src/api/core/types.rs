@@ -114,17 +114,8 @@ impl ApiInner {
 
     pub async fn listen(&self) -> Result<InnerAppEvent, ApiErrors> {
         match self.api_from_manager.lock().await.recv().await {
-            // Channel sender dropped — clean shutdown.
             None => Ok(InnerAppEvent::Closed),
 
-            // Manager surfaced an internal error. Two buckets:
-            //   - Channel/Task/Transport: fatal infrastructure failures the
-            //     app should be told about explicitly so it can decide what
-            //     to do (retry, surface to its own user, etc.).
-            //   - Anything else (peer-scoped PacketProcessor errors,
-            //     manager-internal StateMismatch / IrrelevantError that
-            //     leaked here): not protocol-wide; collapse to Closed so
-            //     the app sees the same shape as a clean shutdown.
             Some(Err(error)) => {
                 let event = match error {
                     ProtoError::Channel(_)
@@ -141,6 +132,9 @@ impl ApiInner {
                     ))
                     | ProtoError::StateMismatch { .. }
                     | ProtoError::IrrelevantError => InnerAppEvent::Closed,
+                    ProtoError::FailedToDeref => {
+                        InnerAppEvent::ProtocolFailed(ApiErrors::BufferClosedUnexpectedly)
+                    }
                 };
                 Ok(event)
             }
@@ -664,6 +658,9 @@ impl Stream<api::types::Input> {
             .recv()
             .await
         {
+            Err(ApiErrors::BufferClosedUnexpectedly) => {
+                Err(ConnectionError::BufferClosedUnexpectedly)
+            }
             Ok(Err(())) | Err(_) => Err(ConnectionError::ProtocolClosed),
             _ => Ok(self.update.borrow().head),
         }
@@ -720,11 +717,18 @@ impl api::types::Stream for Stream<api::types::Input> {
         let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
         api.complete_stream(self.session, self.allow_partial).await;
 
-        self.update
+        if self
+            .update
             .wait_for(|message| message.closed)
             .await
-            .map_err(|_| ConnectionError::ProtocolClosed)?;
-        Ok(self.connection)
+            .map_err(|_| ConnectionError::ProtocolClosed)?
+            .buffer_closed
+        {
+            // TODO: in the future just close stream
+            Err(ConnectionError::BufferClosedUnexpectedly)
+        } else {
+            Ok(self.connection)
+        }
     }
 
     async fn close(self) -> Result<Self::Connection, (Self::Error, Self::Connection)> {

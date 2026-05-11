@@ -241,14 +241,40 @@ pub async fn received_parity_packet(packet: ParityPacket, outbound_sender: Manag
         .global_handle_monitor
         .dispatch(update_last_activity(packet.session_id, packet.timestamp));
 
-    // TODO: handle state mismatch
     let session_id = packet.session_id;
+
     let batch_id = packet.batch_id;
+    let fingerprint = PacketFingerprint::from(&packet);
+
     if fec::received(packet).await {
-        let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id).await);
-        _ = o_unwrap_or_return!(lock_write!(get_state!().connections).get_mut(&session_id))
-            .recovered_packet(recovered, outbound_sender)
-            .await;
+        let recovered_result = {
+            let mut lock = lock_write!(get_state!().connections);
+            let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id).await);
+            o_unwrap_or_return!(lock.get_mut(&session_id))
+                .recovered_packet(recovered, outbound_sender.clone())
+                .await
+        };
+
+        match recovered_result {
+            Err(Error::FailedToDeref) => failed_to_deref_buffer(session_id).await,
+            Err(Error::StateMismatch { .. }) => {
+                UnexpectedPacketErrorPacket::unexpected(
+                    Options::none(),
+                    session_id,
+                    PacketType::Data,
+                    SecondaryType::none(),
+                    fingerprint,
+                )
+                .send(
+                    outbound_sender,
+                    o_unwrap_or_return!(lock_read!(get_state!().connections).get(&session_id))
+                        .address()
+                        .await,
+                )
+                .await;
+            }
+            Ok(()) | Err(_) => {}
+        }
     }
 }
 
@@ -292,9 +318,14 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
     match result {
         Ok(b) if b => {
             let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id).await);
-            _ = o_unwrap_or_return!(lock_write!(get_state!().connections).get_mut(&session_id))
+            let mut lock = lock_write!(get_state!().connections);
+            if let Err(Error::FailedToDeref) = o_unwrap_or_return!(lock.get_mut(&session_id))
                 .recovered_packet(recovered, outbound_sender)
-                .await;
+                .await
+            {
+                drop(lock);
+                failed_to_deref_buffer(session_id).await;
+            }
         }
         Err(Error::StateMismatch { .. }) => {
             UnexpectedPacketErrorPacket::unexpected(
@@ -312,11 +343,32 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
             )
             .await;
         }
+        Err(Error::FailedToDeref) => {
+            failed_to_deref_buffer(session_id).await;
+        }
         Err(e) => {
             warn!("received_data_packet: unexpected error for session {session_id}: {e:?}");
         }
         _ => {}
     }
+}
+
+async fn failed_to_deref_buffer(session_id: SessionId) {
+    {
+        let lock = lock_write!(get_state!().connections);
+        let session = o_unwrap_or_return!(lock.get(&session_id));
+
+        if let ConnectionStates::Established(box EstablishedState {
+            state: SessionStates::Streaming(StreamState { stream, .. }),
+            ..
+        }) = session
+        {
+            stream.send_modify(|m| m.buffer_closed = true);
+        }
+    }
+
+    // TODO: in the future just close stream
+    get_state!().close_session(session_id).await;
 }
 
 /// Routine to handle the case of receiving any [`HelloPacket`].

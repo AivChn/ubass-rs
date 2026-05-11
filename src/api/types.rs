@@ -2,9 +2,10 @@
 #![allow(clippy::len_without_is_empty)]
 use std::{cmp::Ordering, fmt::Debug, ops::Range, slice::SliceIndex};
 
-use tracing::debug;
+use tracing::{debug, instrument};
 
 use crate::{
+    error::BufferError,
     manager::packets::{BytePosition, MAX_PAYLOAD_LENGTH},
     o_unwrap_or_return,
     utils::{LogFail, PanicInDebug},
@@ -317,33 +318,41 @@ impl WriteableBuffer {
         debug!("advanced head to {}", self.head());
     }
 
+    // TODO:
+    /// # Errors
+    #[instrument(skip_all)]
     pub fn write(
         &mut self,
         position: BytePosition,
         to_write: impl AsRef<[u8]>,
-    ) -> Option<Range<usize>> {
+    ) -> Result<Range<usize>, BufferError> {
         let to_write = to_write.as_ref();
         if self
             .position_occupied(position)
-            .log_warn("position not valid")?
+            .log_warn("position not valid")
+            .ok_or(BufferError::NotValid)?
             .log_warn("position occupied")
-            || (to_write.len() != MAX_PAYLOAD_LENGTH
-                && self.position_to_index(position)? != self.map.len() - 1)
-                .log_warn("position isnt last but size isnt max")
-            || (*position as usize + to_write.len() > self.buffer.len())
-                .log_warn("buffer doesnt fit")
         {
-            return None;
+            return Err(BufferError::Occupied);
+        }
+
+        if (to_write.len() != MAX_PAYLOAD_LENGTH
+            && self
+                .position_to_index(position)
+                .ok_or(BufferError::NotValid)?
+                != self.map.len() - 1)
+            || (*position as usize + to_write.len() > self.buffer.len())
+        {
+            return Err(BufferError::WrongSize);
         }
 
         self.occupy(position);
         let position = *position as usize;
         let range = position..position + to_write.len();
-        // TODO: make this error explicitly
-        let buf = unsafe { self.buffer.as_mut()? };
+        let buf = unsafe { self.buffer.as_mut().ok_or(BufferError::FailedToDeref)? };
         buf[range.clone()].copy_from_slice(to_write);
         self.advance_head();
-        Some(range)
+        Ok(range)
     }
 }
 

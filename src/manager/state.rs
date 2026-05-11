@@ -6,7 +6,7 @@ use tokio::{
     task::JoinHandle,
     time::{interval, sleep as tokio_sleep},
 };
-use tracing::{debug, instrument, warn};
+use tracing::{debug, error, instrument};
 use x25519_dalek::EphemeralSecret;
 
 use crate::{
@@ -463,17 +463,20 @@ impl ConnectionStates {
             fec.add_data(packet.batch_id, packet.fec_info, packet.byte_range_start);
 
             let payload = packet.payload.clone().take();
-            if streaming_from
+            match streaming_from
                 .buffer
                 .write(packet.byte_range_start, payload)
-                .is_none()
             {
-                warn!(
-                    "received_data_packet: write failed at {}",
-                    packet.byte_range_start
-                );
-                return Err(Error::IrrelevantError);
+                Ok(_) => {}
+                Err(e @ BufferError::FailedToDeref) => {
+                    error!("FATAL: {e}");
+                    return Err(Error::FailedToDeref);
+                }
+                Err(_) => {
+                    return Err(Error::IrrelevantError);
+                }
             }
+
             // Data arrived for this chunk — drop any pending retransmit marker.
             streaming_from.clear_pending(packet.byte_range_start);
 
@@ -484,26 +487,12 @@ impl ConnectionStates {
 
             let complete_allow_partial = stream.borrow().complete.is_some_and(identity);
             let head_at_end = streaming_from.buffer.head_at_end();
-            // strict is_done = head reached end AND every chunk is filled.
-            // partial-allow lets the user finish the stream with skipped data, but
-            // we still wait until the head has reached the end of the buffer.
             declare_done =
                 streaming_from.buffer.is_done() || (complete_allow_partial && head_at_end);
 
-            // batch_pos runs [0, batch_size); the last data packet of a batch
-            // has batch_pos == batch_size - 1. Widen to u16 so the +1 doesn't
-            // panic when batch_pos == u8::MAX (retransmit batches > 256 chunks).
             let batch_end =
                 u16::from(packet.fec_info.batch_pos) + 1 == u16::from(packet.fec_info.batch_size);
 
-            // Retransmit policy. Two modes:
-            //  - `head_at_end`: every remaining hole is confirmed loss,
-            //    fire the finalize sweep (no threshold, no per-tick cap).
-            //    Pending dedup + sender-side per-tick pacing keep it sane.
-            //  - mid-stream batch_end: score policy picks the
-            //    highest-scoring holes that clear `SCORE_THRESHOLD`.
-            // FEC TTL prune still runs in parallel and handles partial
-            // FEC-tracked batches.
             score_ranges = if declare_done {
                 vec![]
             } else {
@@ -526,6 +515,7 @@ impl ConnectionStates {
         }
 
         if declare_done {
+            // TODO: key rotation
             debug!("buffer complete");
             Box::new(PlaybackControlPacket::done(
                 Options::construct(&[OptionFlags::RequireAck]),
@@ -586,7 +576,16 @@ impl ConnectionStates {
 
             for packet in recovered.packets {
                 let pos = packet.byte_range_start;
-                streaming_from.buffer.write(pos, packet.payload);
+                streaming_from
+                    .buffer
+                    .write(pos, packet.payload)
+                    .map_err(|e| {
+                        if matches!(e, BufferError::FailedToDeref) {
+                            Error::FailedToDeref
+                        } else {
+                            Error::IrrelevantError
+                        }
+                    })?;
                 streaming_from.clear_pending(pos);
                 stream.send_modify(|m| {
                     m.head = streaming_from.buffer.head();
@@ -1811,6 +1810,9 @@ impl PendingAckWindow {
     }
 
     pub fn add(&'static self, packet: Packet) {
+        if self.canceled.load(Ordering::Relaxed) {
+            return;
+        }
         get_state!()
             .global_handle_monitor
             .clone()
@@ -1818,6 +1820,9 @@ impl PendingAckWindow {
     }
 
     pub async fn acknowledge(&self, fingerprint: impl Into<PacketFingerprint>) {
+        if self.canceled.load(Ordering::Relaxed) {
+            return;
+        }
         let fingerprint = fingerprint.into();
         lock_write!(self.pending).remove(&fingerprint);
     }
