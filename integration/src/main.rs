@@ -9,13 +9,15 @@ use tokio::time::timeout;
 use tracing::debug;
 use tracing::info;
 use ubass::api::Connection;
+use ubass::api::ConnectionEvent;
 use ubass::api::ConnectionTrait;
 use ubass::api::IncomingConnectionTrait;
 use ubass::api::PendingConnectionTrait;
+use ubass::api::PendingStreamTrait;
+use ubass::api::RequestedStreamTrait;
 use ubass::api::StreamTrait;
 use ubass::api::open;
 use ubass::prelude::packets::MAX_PAYLOAD_LENGTH;
-use ubass::utils::ConnectionEvent;
 
 mod connection_refused;
 use connection_refused::*;
@@ -215,8 +217,8 @@ async fn exec_server_test(test: Test, port: u16, app_id: String) {
 }
 
 async fn general_send_server(port: u16, app_id: String, reply: Option<Box<[u8]>>) {
-    let exec = async move |mut connection: Connection| {
-        let ConnectionEvent::TrackRequest(id) =
+    let exec = async move |connection: Connection| {
+        let ConnectionEvent::TrackRequested(requested) =
             tokio::time::timeout(Duration::from_secs(10), connection.listen())
                 .await
                 .unwrap()
@@ -225,10 +227,16 @@ async fn general_send_server(port: u16, app_id: String, reply: Option<Box<[u8]>>
             panic!("wrong event");
         };
 
-        let stream = match reply {
-            Some(reply) => connection.send(reply).await.unwrap(),
-            None => connection.send(id).await.unwrap(),
+        let buffer: Box<[u8]> = match reply {
+            Some(reply) => reply,
+            None => requested.track_id().to_vec().into_boxed_slice(),
         };
+
+        let stream = requested
+            .approve_and_ready(buffer.into())
+            .await
+            .map_err(|(e, _)| e)
+            .unwrap();
 
         _ = stream.complete().await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -245,10 +253,11 @@ async fn general_send_client(port: u16, app_id: String, server_addr: SocketAddr,
         let buffer = Box::into_raw(buffer.into());
         let mut id = message.clone();
         id.truncate(MAX_PAYLOAD_LENGTH);
-        let stream = timeout(Duration::from_secs(2), connection.request(id, buffer))
+        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer))
             .await
             .unwrap()
             .unwrap();
+        let stream = pending.ready().await.map_err(|(e, _)| e).unwrap();
 
         debug!("waiting for stream to complete");
         let _connection = timeout(Duration::from_secs(50), stream.complete())
@@ -307,6 +316,9 @@ async fn server(port: u16, app_id: String, f: impl AsyncFnOnce(Connection)) {
         ubass::api::AppEvent::IncomingConnection(incoming_connection) => incoming_connection,
         ubass::api::AppEvent::Closed => {
             panic!("closed");
+        }
+        ubass::api::AppEvent::ProtocolFailed(reason) => {
+            panic!("protocol failed: {reason}");
         }
     };
 

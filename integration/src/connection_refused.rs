@@ -43,6 +43,9 @@ pub async fn connection_refused_server(port: u16, app_id: String) {
         ubass::api::AppEvent::Closed => {
             panic!("closed");
         }
+        ubass::api::AppEvent::ProtocolFailed(reason) => {
+            panic!("protocol failed: {reason}");
+        }
     };
 
     assert!(incoming.reject("420").await.is_ok());

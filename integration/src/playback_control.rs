@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info};
 use ubass::{
-    api::{Connection, ConnectionTrait, PlaybackControl, StreamTrait},
+    api::{Connection, ConnectionTrait, PendingStreamTrait, PlaybackControl, StreamTrait},
     prelude::packets::MAX_PAYLOAD_LENGTH,
 };
 
@@ -15,10 +15,11 @@ pub fn playback_seek_client(message: Vec<u8>) -> impl AsyncFnOnce(Connection) {
         let buffer = Box::into_raw(buffer.into());
         let mut id = message.clone();
         id.truncate(MAX_PAYLOAD_LENGTH);
-        let stream = timeout(Duration::from_secs(2), connection.request(id, buffer))
+        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer))
             .await
             .unwrap()
             .unwrap();
+        let stream = pending.ready().await.map_err(|(e, _)| e).unwrap();
 
         tokio::time::sleep(Duration::from_millis(5)).await;
         assert!(stream.seek(message.len() / 2).await.is_ok());
@@ -50,10 +51,11 @@ pub fn pause_play_test(message: Vec<u8>) -> impl AsyncFnOnce(Connection) {
         let buffer = Box::into_raw(buffer.into());
         let mut id = message.clone();
         id.truncate(MAX_PAYLOAD_LENGTH);
-        let stream = timeout(Duration::from_secs(2), connection.request(id, buffer))
+        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer))
             .await
             .unwrap()
             .unwrap();
+        let stream = pending.ready().await.map_err(|(e, _)| e).unwrap();
 
         assert!(stream.pause().await.is_ok());
         assert!(stream.pause().await.is_ok());
@@ -83,10 +85,11 @@ pub fn audio_data_test(message: Vec<u8>) -> impl AsyncFnOnce(Connection) {
         let buffer = Box::into_raw(buffer.into());
         let mut id = message.clone();
         id.truncate(MAX_PAYLOAD_LENGTH);
-        let stream = timeout(Duration::from_millis(900), connection.request(id, buffer))
+        let pending = timeout(Duration::from_millis(900), connection.request(id, buffer))
             .await
             .unwrap()
             .unwrap();
+        let stream = pending.ready().await.map_err(|(e, _)| e).unwrap();
 
         let first_seek = buffer.len() / 2;
         let second_seek = first_seek / 2;
