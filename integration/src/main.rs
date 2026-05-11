@@ -8,6 +8,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::debug;
 use tracing::info;
+use ubass::Api;
 use ubass::api::Connection;
 use ubass::api::ConnectionEvent;
 use ubass::api::ConnectionTrait;
@@ -16,7 +17,6 @@ use ubass::api::PendingConnectionTrait;
 use ubass::api::PendingStreamTrait;
 use ubass::api::RequestedStreamTrait;
 use ubass::api::StreamTrait;
-use ubass::api::open;
 use ubass::prelude::packets::MAX_PAYLOAD_LENGTH;
 
 mod connection_refused;
@@ -233,7 +233,7 @@ async fn general_send_server(port: u16, app_id: String, reply: Option<Box<[u8]>>
         };
 
         let stream = requested
-            .approve_and_ready(buffer.into())
+            .approve_and_ready(buffer)
             .await
             .map_err(|(e, _)| e)
             .unwrap();
@@ -282,7 +282,7 @@ async fn client(
     server_addr: SocketAddr,
     f: impl AsyncFnOnce(Connection),
 ) {
-    let api = open(app_id, Some(port)).await.unwrap();
+    let api = Api::open(app_id, Some(port)).unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -304,7 +304,7 @@ async fn client(
 }
 
 async fn server(port: u16, app_id: String, f: impl AsyncFnOnce(Connection)) {
-    let api = open(app_id, Some(port)).await.unwrap();
+    let api = Api::open(app_id, Some(port)).unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 

@@ -3,12 +3,12 @@ use std::{net::SocketAddr, time::Duration};
 use tokio::time::timeout;
 use tracing::debug;
 use ubass::{
+    Api,
     api::{IncomingConnectionTrait, PendingConnectionTrait},
-    open,
 };
 
 pub async fn connection_refused_client(port: u16, app_id: String, server_addr: SocketAddr) {
-    let api = open(app_id, Some(port)).await.unwrap();
+    let api = Api::open(app_id, Some(port)).unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -30,7 +30,7 @@ pub async fn connection_refused_client(port: u16, app_id: String, server_addr: S
 }
 
 pub async fn connection_refused_server(port: u16, app_id: String) {
-    let api = open(app_id, Some(port)).await.unwrap();
+    let api = Api::open(app_id, Some(port)).unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
