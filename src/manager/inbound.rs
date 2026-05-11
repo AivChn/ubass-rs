@@ -86,7 +86,6 @@ async fn handle_message(
             packets::Packet::TrackRejectionPacket(packet) => {
                 received_track_reject_packet(packet).await;
             }
-            // TODO: future features
             packets::Packet::RetransmitPacket(retransmit_packet) => {
                 received_retransmit_request(retransmit_packet, outbound_sender.clone()).await;
             }

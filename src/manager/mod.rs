@@ -115,7 +115,6 @@ pub async fn init(
         manager_to_processor.clone(),
     ));
 
-    // TODO: flush pending acks before closing
     tokio::select! {
         res = &mut inbound_handle => {
             // no way to signal outbound — API holds the sender side
