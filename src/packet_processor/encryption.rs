@@ -1,7 +1,7 @@
 use super::fingerprint::{Headers, Payload};
 use crate::manager::EncryptionMonitor;
 use crate::manager::packets::{
-    AppRejectErrorPacket, DataPacket, ParityPacket, SessionId, TrackRequestPacket,
+    DataPacket, ParityPacket, SessionId, TrackRejectionPacket, TrackRequestPacket,
 };
 use crate::prelude::*;
 
@@ -12,7 +12,7 @@ pub trait Encryptable: Payload + Headers {}
 impl Encryptable for DataPacket {}
 impl Encryptable for ParityPacket {}
 impl Encryptable for TrackRequestPacket {}
-impl Encryptable for AppRejectErrorPacket {}
+impl Encryptable for TrackRejectionPacket {}
 
 fn get_nonce(session_id: SessionId, counter: [u8; 8]) -> [u8; 12] {
     let mut result = [0u8; 12];

@@ -1,2 +1,2 @@
-pub use super::core::{Api, open};
+pub use super::core::Api;
 pub use crate::utils::SendTarget;
