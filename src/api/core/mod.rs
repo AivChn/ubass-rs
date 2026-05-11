@@ -2,7 +2,10 @@ mod inbound;
 mod outbound;
 mod types;
 
-pub use types::{AppEvent, Connection, IncomingConnection, PendingConnection};
+pub use types::{
+    AppEvent, Connection, ConnectionEvent, IncomingConnection, PendingConnection, PendingStream,
+    RequestedStream,
+};
 
 use crate::{
     api::{
@@ -22,29 +25,28 @@ use crate::utils::SendTarget;
 pub struct Api {
     inner: Arc<ApiInner>,
 }
+impl Api {
+    /// Opens the protocol, returning the Api singleton or an error if its already open.
+    ///
+    /// # Errors
+    /// - `InvalidAppId` if the app ID is longer than [`MAX_PAYLOAD_LENGTH`] or not valid ASCII
+    /// - `InvalidPort` if the port is 1024 or lower
+    /// - `AlreadyOpen` if the protocol is already open
+    pub async fn open(app_id: impl Into<String>, port: Option<u16>) -> Result<Self, ApiErrors> {
+        let app_id = app_id.into();
+        let port = match port {
+            Some(0..=1024) => return Err(ApiErrors::InvalidPort),
+            Some(port) => port,
+            None => DEFAULT_PORT,
+        };
 
-/// Opens the protocol, returning the Api singleton or an error if its already open.
-///
-/// # Errors
-/// - `InvalidAppId` if the app ID is longer than [`MAX_PAYLOAD_LENGTH`] or not valid ASCII
-/// - `InvalidPort` if the port is 1024 or lower
-/// - `AlreadyOpen` if the protocol is already open
-pub async fn open(app_id: impl Into<String>, port: Option<u16>) -> Result<Api, ApiErrors> {
-    let app_id = app_id.into();
-    let port = match port {
-        Some(0..=1024) => return Err(ApiErrors::InvalidPort),
-        Some(port) => port,
-        None => DEFAULT_PORT,
-    };
+        if !verify_app_id(&app_id) {
+            return Err(ApiErrors::InvalidAppId);
+        }
 
-    if !verify_app_id(&app_id) {
-        return Err(ApiErrors::InvalidAppId);
+        Api::new(port, AppId::new(app_id))
     }
 
-    Api::new(port, AppId::new(app_id))
-}
-
-impl Api {
     fn new(port: u16, app_id: AppId) -> Result<Self, ApiErrors> {
         Ok(Self {
             inner: Arc::new(ApiInner::new(port, app_id)?),
@@ -90,6 +92,7 @@ impl Api {
                 Ok(AppEvent::IncomingConnection(incoming))
             }
             InnerAppEvent::Closed => Ok(AppEvent::Closed),
+            InnerAppEvent::ProtocolFailed(reason) => Ok(AppEvent::ProtocolFailed(reason)),
         }
     }
 }
