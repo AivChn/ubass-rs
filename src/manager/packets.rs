@@ -4,21 +4,15 @@ use crate::{
         ManagerToProcessor,
         state::{HandshakeId, Port},
     },
-    packet_processor::serialize,
     prelude::*,
 };
 
 use core::ops::Deref;
-use std::{
-    fmt::Display,
-    net::{SocketAddr, SocketAddrV4},
-    result, vec,
-};
+use std::{fmt::Display, net::SocketAddr, vec};
 
 use crate::packet_processor::serialize::Serialize;
 use async_trait::async_trait;
 use derive_more::{Deref, DerefMut, Display};
-use rand::Rng;
 
 use crate::manager::AppId;
 use crate::packet_processor::fingerprint::{Fingerprint, Headers, Payload};
@@ -46,7 +40,7 @@ pub enum Packet {
     IncompatibleVersionPacket(Box<IncompatibleVersionPacket>),
     SessionDoesNotExistErrorPacket(Box<SessionDoesNotExistErrorPacket>),
     UnexpectedPacketErrorPacket(Box<UnexpectedPacketErrorPacket>),
-    AppRejectErrorPacket(Box<AppRejectErrorPacket>),
+    TrackRejectionPacket(Box<TrackRejectionPacket>),
     CloseSessionPacket(Box<CloseSessionPacket>),
     HandshakeRejection(Box<HandshakeRejection>),
 }
@@ -70,7 +64,7 @@ impl Packet {
             Packet::PlaybackControlPacket(packet) => Some(packet.session_id),
             Packet::SessionDoesNotExistErrorPacket(packet) => Some(packet.session_id),
             Packet::UnexpectedPacketErrorPacket(packet) => Some(packet.session_id),
-            Packet::AppRejectErrorPacket(packet) => Some(packet.session_id),
+            Packet::TrackRejectionPacket(packet) => Some(packet.session_id),
             Packet::CloseSessionPacket(packet) => Some(packet.session_id),
             Packet::HandshakeRejection(packet) => Some(packet.session_id),
             Packet::KeepAlivePacket(packet) => Some(packet.session_id),
@@ -82,6 +76,43 @@ impl Packet {
                 );
                 None
             }
+        }
+    }
+
+    pub fn mark_resend(&mut self) {
+        match self {
+            Packet::HelloPacket(packet) => packet.opts = packet.opts.set(OptionFlags::Resend),
+            Packet::TrackRequestPacket(packet) => {
+                packet.opts = packet.opts.set(OptionFlags::Resend);
+            }
+            Packet::DataPacket(packet) => packet.opts = packet.opts.set(OptionFlags::Resend),
+            Packet::MetadataPacket(packet) => packet.opts = packet.opts.set(OptionFlags::Resend),
+            Packet::ParityPacket(packet) => packet.opts = packet.opts.set(OptionFlags::Resend),
+            Packet::AckPacket(packet) => packet.opts = packet.opts.set(OptionFlags::Resend),
+            Packet::KeepAlivePacket(packet) => packet.opts = packet.opts.set(OptionFlags::Resend),
+            Packet::HandshakeAckPacket(packet) => {
+                packet.opts = packet.opts.set(OptionFlags::Resend);
+            }
+            Packet::RetransmitPacket(packet) => packet.opts = packet.opts.set(OptionFlags::Resend),
+            Packet::PlaybackControlPacket(packet) => {
+                packet.opts = packet.opts.set(OptionFlags::Resend);
+            }
+            Packet::SessionDoesNotExistErrorPacket(packet) => {
+                packet.opts = packet.opts.set(OptionFlags::Resend);
+            }
+            Packet::UnexpectedPacketErrorPacket(packet) => {
+                packet.opts = packet.opts.set(OptionFlags::Resend);
+            }
+            Packet::TrackRejectionPacket(packet) => {
+                packet.opts = packet.opts.set(OptionFlags::Resend);
+            }
+            Packet::CloseSessionPacket(packet) => {
+                packet.opts = packet.opts.set(OptionFlags::Resend);
+            }
+            Packet::HandshakeRejection(packet) => {
+                packet.opts = packet.opts.set(OptionFlags::Resend);
+            }
+            Packet::IncompatibleVersionPacket(_) => {}
         }
     }
 }
@@ -117,7 +148,7 @@ impl SendPacket for Packet {
             Packet::IncompatibleVersionPacket(packet) => packet.send(sender, address),
             Packet::SessionDoesNotExistErrorPacket(packet) => packet.send(sender, address),
             Packet::UnexpectedPacketErrorPacket(packet) => packet.send(sender, address),
-            Packet::AppRejectErrorPacket(packet) => packet.send(sender, address),
+            Packet::TrackRejectionPacket(packet) => packet.send(sender, address),
             Packet::HandshakeAckPacket(packet) => packet.send(sender, address),
             Packet::CloseSessionPacket(packet) => packet.send(sender, address),
             Packet::HandshakeRejection(packet) => packet.send(sender, address),
@@ -138,7 +169,7 @@ impl TryFrom<&Packet> for PacketFingerprint {
             Packet::RetransmitPacket(packet) => packet.as_ref().into(),
             Packet::PlaybackControlPacket(packet) => packet.as_ref().into(),
             Packet::UnexpectedPacketErrorPacket(packet) => packet.as_ref().into(),
-            Packet::AppRejectErrorPacket(packet) => packet.as_ref().into(),
+            Packet::TrackRejectionPacket(packet) => packet.as_ref().into(),
             Packet::CloseSessionPacket(packet) => packet.as_ref().into(),
             _x @ (Packet::AckPacket(_)
             | Packet::IncompatibleVersionPacket(_)
@@ -546,28 +577,18 @@ impl AckPacket {
     }
 }
 
-impl Serialize for Option<SocketAddrV4> {
-    fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
-        if buf.len() < self.sized() {
-            return Err(());
-        }
-
-        match self {
-            None => [0u8; 6].serialize(buf),
-            Some(addr) => addr.serialize(buf),
-        }
+// fake impl just because im too lazy to special case KeepAlive
+impl Serialize for Option<SocketAddr> {
+    fn serialize(&self, _buf: &mut [u8]) -> EmptyResult {
+        Ok(())
     }
 
-    fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
-        if [0u8; 6][..] == bytes[..6] {
-            Ok(None)
-        } else {
-            Ok(Some(SocketAddrV4::deserialize(bytes)?))
-        }
+    fn deserialize(_bytes: &[u8]) -> core::result::Result<Self, ()> {
+        Ok(None)
     }
 
     fn sized(&self) -> usize {
-        6
+        0
     }
 }
 
@@ -579,7 +600,7 @@ pub struct KeepAlivePacket {
     reserved: Reserved<3>,
     pub session_id: SessionId,
     pub timestamp: Timestamp,
-    pub address: Option<SocketAddrV4>,
+    pub address: Option<SocketAddr>,
 }
 
 impl KeepAlivePacket {
@@ -651,7 +672,7 @@ pub struct RetransmitPacket {
 impl RetransmitPacket {
     // closest I can get to `MAX_PAYLOAD_LENGTH` while aligning to 6 bytes
     pub const LOCAL_MAX_PAYLOAD_LENGTH: usize = MAX_PAYLOAD_LENGTH - (MAX_PAYLOAD_LENGTH % 6);
-    const HEADER_SIZE: usize = size_of::<Self>() - Self::LOCAL_MAX_PAYLOAD_LENGTH;
+    //const HEADER_SIZE: usize = size_of::<Self>() - Self::LOCAL_MAX_PAYLOAD_LENGTH;
 
     #[must_use]
     pub fn data(opts: Options, session_id: SessionId, payload: Vec<ByteRange>) -> Self {
@@ -946,59 +967,45 @@ impl UnexpectedPacketErrorPacket {
 }
 
 #[derive(Debug, SendPacket, Clone, Serialize, Headers, Payload)]
-pub struct AppRejectErrorPacket {
+pub struct TrackRejectionPacket {
     pub version: Version,
     pub opts: Options,
     pub packet_type: PacketType,
-    pub error_type: ErrorType,
+    pub control_type: ControlType,
     pub reserved: Reserved<2>,
     pub session_id: SessionId,
     pub timestamp: Timestamp,
-    pub received_type: PacketType,
-    pub received_control_type: ControlType,
-    pub received_fingerprint: PacketFingerprint,
     pub payload: PayloadField,
 }
 
-impl AppRejectErrorPacket {
+impl TrackRejectionPacket {
     pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<PayloadField>();
 
     #[must_use]
     pub fn new(
         opts: Options,
         session_id: SessionId,
-        received_type: PacketType,
-        received_control_type: ControlType,
-        received_fingerprint: PacketFingerprint,
-        message: String,
+        track_id: impl Into<PayloadField>,
     ) -> Box<Self> {
-        debug_assert!(
-            message.is_ascii(),
-            "Invariant broken while constructing `AppRejectErrorPacket`: \
-                message was not valid ascii. message: {message}"
-        );
         #[cfg(debug_assertions)]
-        assert_opts_valid(opts, "AppRejectErrorPacket");
+        assert_opts_valid(opts, "TrackRejectionPacket");
 
         let version = Version::CURRENT_VERSION;
         let opts = opts.set(OptionFlags::RequireAck);
-        let packet_type = PacketType::Error;
-        let error_type = ErrorType::AppReject;
+        let packet_type = PacketType::Session;
+        let control_type = SessionControlType::TrackReject.into();
         let reserved = Reserved;
         let timestamp = Timestamp::now();
-        let payload = message.into_bytes().into();
+        let payload = track_id.into();
 
         Box::new(Self {
             version,
             opts,
             packet_type,
-            error_type,
+            control_type,
             reserved,
             session_id,
             timestamp,
-            received_type,
-            received_control_type,
-            received_fingerprint,
             payload,
         })
     }
@@ -1256,7 +1263,6 @@ impl PartialOrd<usize> for BytePosition {
     }
 }
 
-
 #[allow(clippy::cast_possible_truncation)]
 impl From<usize> for BytePosition {
     fn from(value: usize) -> Self {
@@ -1403,7 +1409,8 @@ pub enum SessionControlType {
     Retransmit = 1,
     TrackRequest = 2,
     MetadataRequest = 3,
-    Close = 4,
+    TrackReject = 4,
+    Close = 5,
 }
 
 impl From<SessionControlType> for ControlType {
@@ -1435,8 +1442,7 @@ impl From<PlaybackControlType> for ControlType {
 #[repr(u8)]
 #[variants_array]
 pub enum ErrorType {
-    AppReject = 1,
-    UnexpectedPacket,
+    UnexpectedPacket = 1,
     IncomprehensiblePacket,
     SessionDoesNotExist,
 }
@@ -1479,6 +1485,7 @@ fn assert_opts_valid(opts: Options, contructing: &'static str) {
 pub enum OptionFlags {
     RequireAck = 1 << 0,
     Metadata = 1 << 1,
+    Resend = 1 << 2,
 }
 
 #[repr(transparent)]
