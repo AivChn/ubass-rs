@@ -5,7 +5,7 @@ use std::{fmt::Display, net::SocketAddr};
 use crate::api::{ReadableBuffer, WriteableBuffer};
 use crate::error::ApiErrors;
 use crate::manager::packets::{
-    BytePosition, ByteRange, Options, PlaybackControlPacket, PlaybackControlType,
+    BytePosition, ByteRange, Options, PacketFingerprint, PlaybackControlPacket, PlaybackControlType,
 };
 
 use derive_more::{Display, derive};
@@ -55,23 +55,6 @@ impl<Req: Send, Res: Send> OneShot<Req, Res> {
     }
 }
 
-impl<Req: Send> OneShot<Req, AppResponse> {
-    pub fn app(value: Req) -> (Self, ResponseReceiver<AppResponse>) {
-        OneShot::new(value)
-    }
-}
-
-impl<Req: Send> OneShot<Req, core::result::Result<Recovered, CouldNotRecover>> {
-    pub fn processor(
-        value: Req,
-    ) -> (
-        Self,
-        ResponseReceiver<core::result::Result<Recovered, CouldNotRecover>>,
-    ) {
-        OneShot::new(value)
-    }
-}
-
 #[derive(Debug)]
 pub enum AppResponse {
     AppApproved,
@@ -82,16 +65,23 @@ pub enum ApiMessage {
     IncommingConncetion {
         request: OneShot<AppId, AppResponse>,
         response: ResponseReceiver<
-            core::result::Result<(SessionId, Receiver<ConnectionEvent>), ConnectionError>,
+            core::result::Result<(SessionId, Receiver<InnerConnectionEvent>), ConnectionError>,
         >,
         peer_address: SocketAddr,
     },
 }
 
+/// Manager-side message pushed onto a session's connection channel.
+/// `Connection::listen()` translates these into the public `ConnectionEvent`
+/// (in `api/core/types.rs`), wrapping primitives like `TrackRequest` into
+/// `RequestedStream<Output>` so the app gets a typed accept/reject handle.
 #[derive(Debug)]
-pub enum ConnectionEvent {
-    TrackRequest(Box<[u8]>),
-    ProtocolClosed(Vec<ConnectionEvent>),
+pub enum InnerConnectionEvent {
+    TrackRequest {
+        track_id: Box<[u8]>,
+        fingerprint: PacketFingerprint,
+    },
+    ProtocolClosed,
     ConnectionClosed,
 }
 
@@ -101,6 +91,7 @@ pub struct StreamMessage {
     pub paused: bool,
     pub closed: bool,
     pub complete: Option<bool>,
+    pub approved: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -167,16 +158,16 @@ pub enum ApiCommand {
     Connect(
         OneShot<
             SocketAddr,
-            core::result::Result<(SessionId, Receiver<ConnectionEvent>), ConnectionError>,
+            core::result::Result<(SessionId, Receiver<InnerConnectionEvent>), ConnectionError>,
         >,
     ),
-    // DiscardConnection()
+    RejectTrackRequest(SessionId, Box<[u8]>),
     CloseSession(SessionId),
     CloseStream(SessionId),
     SetStreamComplete(SessionId, bool),
     FindHoles(OneShot<SessionId, Option<Vec<Range<usize>>>>),
     StreamAction(OneShot<(SessionId, PlaybackControl), EmptyResult>),
-    RequestData(OneShot<RequestDataRequest, core::result::Result<SessionId, ApiErrors>>),
+    RequestTrack(OneShot<RequestDataRequest, core::result::Result<SessionId, ApiErrors>>),
     SendData(OneShot<SendDataRequest, core::result::Result<SessionId, ApiErrors>>),
     Close,
 }
