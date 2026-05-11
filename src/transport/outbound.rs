@@ -1,7 +1,7 @@
 use crate::prelude::*;
 use crate::transport::types::OutboundReceiver;
 use crate::{manager::packets::PacketType, packet_processor::types::ProcessedPacket};
-use std::{mem, sync::Arc, vec};
+use std::sync::Arc;
 use tokio::{
     net::UdpSocket,
     time::{Duration, Instant, timeout},
@@ -79,13 +79,20 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
                 total_received += 1;
             }
 
-            if data.packet_type == PacketType::KeepAlive || data.packet_type == PacketType::Host {
-                let copy = listening_socket.clone();
-                monitor.dispatch(async move {
-                    _ = copy.send_to(&data.data, data.dest_addr).await;
-                });
-            } else {
-                buffer.push(data);
+            match data.packet_type {
+                PacketType::Data | PacketType::Metadata | PacketType::Parity => buffer.push(data),
+                PacketType::Host | PacketType::KeepAlive => {
+                    let copy = listening_socket.clone();
+                    monitor.dispatch(async move {
+                        _ = copy.send_to(&data.data, data.dest_addr).await;
+                    });
+                }
+                _ => {
+                    let socket = sockets.retrieve();
+                    monitor.dispatch(async move {
+                        _ = socket.send_to(&data.data, data.dest_addr).await;
+                    });
+                }
             }
         }
 
@@ -100,14 +107,11 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
             continue;
         }
 
-        #[cfg(debug_assertions)]
-        if buffer.len() == 1 {
-            debug!(
-                "single {} packet being sent: {:?}",
-                buffer[0].packet_type,
-                str::from_utf8(&buffer[0].data).unwrap_or(&format!("RAW: {:?}", buffer[0].data))
-            );
-        }
+        debug!(
+            "packets being sent, first: type {} content {:?}",
+            buffer[0].packet_type,
+            str::from_utf8(&buffer[0].data).unwrap_or(&format!("RAW: {:?}", buffer[0].data))
+        );
 
         debug!("sending packet buffer with {} packets", buffer.len(),);
         #[allow(clippy::drain_collect)]
@@ -115,12 +119,13 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
     }
 }
 
+#[instrument(skip_all)]
 async fn send_packets(buffer: Box<[ProcessedPacket]>, socket: Arc<UdpSocket>) {
     let total = buffer.len();
     #[cfg(test)]
     let (mut sent, mut failed) = (0usize, 0usize);
 
-    debug!("send_packets: starting batch of {total} packets");
+    debug!("starting batch of {total} packets");
     for packet in buffer {
         debug_assert!(
             packet.duplicate_count != 0,
@@ -151,7 +156,6 @@ async fn send_packets(buffer: Box<[ProcessedPacket]>, socket: Arc<UdpSocket>) {
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod test {
-    use core::net;
     use std::{
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
         sync::{Arc, atomic::AtomicU16},
@@ -163,8 +167,8 @@ mod test {
         error::ErrResult,
         manager::packets::PacketType,
         packet_processor::types::{OutboundSender, ProcessedPacket},
-        transport::{bind_listen_socket, outbound, types::OutboundReceiver},
-        utils::{TransportMessage, messages},
+        transport::{bind_listen_socket, outbound},
+        utils::TransportMessage,
     };
 
     static PORT: AtomicU16 = AtomicU16::new(43000);
@@ -194,7 +198,7 @@ mod test {
             }
         };
 
-        let (sender, handle) = prepare_init();
+        let (sender, _handle) = prepare_init();
         let packet = ProcessedPacket {
             dest_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
             packet_type: PacketType::Data,
@@ -233,7 +237,7 @@ mod test {
             Ok(())
         });
 
-        let (sender, handle) = prepare_init();
+        let (sender, _handle) = prepare_init();
         let packets: Vec<_> = messages
             .iter()
             .map(|message| ProcessedPacket {
