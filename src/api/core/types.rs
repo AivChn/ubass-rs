@@ -1,22 +1,29 @@
 use crate::{
     api::{
-        self, Api, SendTarget,
-        types::{ReadableBuffer, WriteableBuffer},
+        self, Api, SendTarget, StreamTrait,
+        types::{ApprovalStatus, ReadableBuffer, WriteableBuffer},
     },
-    error::{ConnectionError, EmptyResult},
+    error::{
+        ChannelError, ConnectionError, EmptyResult, Error as ProtoError, PacketProcessingError,
+        TaskError, TransportError,
+    },
     manager::{
-        AppId, endpoints,
-        packets::{BytePosition, MAX_PAYLOAD_LENGTH, PayloadField, PlaybackControlType, SessionId},
+        self, AppId, endpoints,
+        packets::{
+            BytePosition, MAX_PAYLOAD_LENGTH, PacketFingerprint, PayloadField, PlaybackControlType,
+            SessionId,
+        },
     },
     o_unwrap_or_return,
     prelude::{ApiCommand, ApiErrors, ApiMessage, AppResponse},
     utils::{
-        ConnectionEvent, OneShot, PanicInDebug, PlaybackControl, RequestDataRequest,
-        ResponseReceiver, SendDataRequest, StreamMessage,
+        InnerConnectionEvent, OneShot, PanicInDebug, PlaybackControl, RequestDataRequest,
+        ResponseReceiver, SendDataRequest, StreamMessage, not,
     },
 };
 use core::result::Result;
 use std::{
+    convert::identity,
     marker::PhantomData,
     net::SocketAddr,
     range::Range,
@@ -41,7 +48,7 @@ static PROTOCOL_OPEN: AtomicBool = AtomicBool::new(false);
 pub type ApiToManager = Sender<ApiCommand>;
 pub type ApiFromManager = Receiver<crate::prelude::Result<ApiMessage>>;
 
-pub type ConnectionReceiver = Receiver<ConnectionEvent>;
+pub type ConnectionReceiver = Receiver<InnerConnectionEvent>;
 
 pub struct ApiInner {
     manager_handle: Option<JoinHandle<Result<(), ApiErrors>>>,
@@ -101,7 +108,7 @@ impl ApiInner {
         &self,
         addr: std::net::SocketAddr,
     ) -> Result<
-        ResponseReceiver<Result<(SessionId, Receiver<ConnectionEvent>), ConnectionError>>,
+        ResponseReceiver<Result<(SessionId, Receiver<InnerConnectionEvent>), ConnectionError>>,
         ApiErrors,
     > {
         let (oneshot, reply) = OneShot::new(addr);
@@ -114,11 +121,37 @@ impl ApiInner {
 
     pub async fn listen(&self) -> Result<InnerAppEvent, ApiErrors> {
         match self.api_from_manager.lock().await.recv().await {
+            // Channel sender dropped — clean shutdown.
             None => Ok(InnerAppEvent::Closed),
-            Some(Err(_)) => {
-                // TODO: surface specific protocol errors to the app
-                Ok(InnerAppEvent::Closed)
+
+            // Manager surfaced an internal error. Two buckets:
+            //   - Channel/Task/Transport: fatal infrastructure failures the
+            //     app should be told about explicitly so it can decide what
+            //     to do (retry, surface to its own user, etc.).
+            //   - Anything else (peer-scoped PacketProcessor errors,
+            //     manager-internal StateMismatch / IrrelevantError that
+            //     leaked here): not protocol-wide; collapse to Closed so
+            //     the app sees the same shape as a clean shutdown.
+            Some(Err(error)) => {
+                let event = match error {
+                    ProtoError::Channel(_)
+                    | ProtoError::Task(TaskError::TaskFailed)
+                    | ProtoError::Transport(TransportError::RecvFailedTooManyTimes) => {
+                        InnerAppEvent::ProtocolFailed(ApiErrors::Internal)
+                    }
+                    ProtoError::Transport(TransportError::FailedToBind) => {
+                        InnerAppEvent::ProtocolFailed(ApiErrors::FailedToOpen)
+                    }
+                    ProtoError::PacketProcessor(PacketProcessingError::IncompatibleVersion(
+                        _,
+                        _,
+                    ))
+                    | ProtoError::StateMismatch { .. }
+                    | ProtoError::IrrelevantError => InnerAppEvent::Closed,
+                };
+                Ok(event)
             }
+
             Some(Ok(ApiMessage::IncommingConncetion {
                 request,
                 response,
@@ -159,11 +192,8 @@ impl ApiInner {
         track_id: impl Into<Box<[u8]>>,
         buffer: impl Into<WriteableBuffer>,
         sender: watch::Sender<StreamMessage>,
-    ) -> Result<SessionId, ApiErrors> {
+    ) -> ResponseReceiver<Result<SessionId, ApiErrors>> {
         let track_id = track_id.into();
-        if track_id.len() > MAX_PAYLOAD_LENGTH {
-            return Err(ApiErrors::BufferTooLarge);
-        }
         let (request, response) =
             OneShot::<RequestDataRequest, Result<SessionId, ApiErrors>>::new(RequestDataRequest {
                 target,
@@ -171,12 +201,12 @@ impl ApiInner {
                 buffer: buffer.into(),
                 sender,
             });
-        self.api_to_manager
-            .send(ApiCommand::RequestData(request))
-            .await
-            .map_err(|_| ApiErrors::ProtocolClosed)?;
+        _ = self
+            .api_to_manager
+            .send(ApiCommand::RequestTrack(request))
+            .await;
 
-        response.recv().await?
+        response
     }
 
     async fn close_stream(&self, session_id: SessionId) {
@@ -186,11 +216,11 @@ impl ApiInner {
             .await;
     }
 
-    fn close_session(&self, session_id: SessionId) {
-        // HACK: find a better way to handle this being syncronous
+    async fn close_session(&self, session_id: SessionId) {
         _ = self
             .api_to_manager
-            .try_send(ApiCommand::CloseSession(session_id));
+            .send(ApiCommand::CloseSession(session_id))
+            .await;
     }
 
     async fn complete_stream(&self, session_id: SessionId, allow_partial: bool) {
@@ -224,27 +254,42 @@ impl ApiInner {
             .await;
         receiver
     }
+
+    async fn reject_track_request(&self, session_id: SessionId, track_id: Box<[u8]>) {
+        _ = self
+            .api_to_manager
+            .send(ApiCommand::RejectTrackRequest(session_id, track_id))
+            .await;
+    }
 }
 
 #[derive(Debug)]
 pub enum AppEvent {
     IncomingConnection(IncomingConnection),
+    /// Protocol shut down cleanly (or for a reason the app needn't act on
+    /// — peer-scoped or manager-internal anomaly).
     Closed,
+    /// Protocol stopped due to an infrastructure-level failure. The reason
+    /// gives the app what it needs to log, branch, or surface to its own
+    /// caller. After this event the API instance will not produce further
+    /// events.
+    ProtocolFailed(ApiErrors),
 }
 
 pub enum InnerAppEvent {
     IncomingConnection {
         request: OneShot<AppId, AppResponse>,
         response: ResponseReceiver<
-            core::result::Result<(SessionId, Receiver<ConnectionEvent>), ConnectionError>,
+            core::result::Result<(SessionId, Receiver<InnerConnectionEvent>), ConnectionError>,
         >,
         peer_address: SocketAddr,
     },
     Closed,
+    ProtocolFailed(ApiErrors),
 }
 
 type HandshakeDoneReceiver =
-    ResponseReceiver<Result<(SessionId, Receiver<ConnectionEvent>), ConnectionError>>;
+    ResponseReceiver<Result<(SessionId, Receiver<InnerConnectionEvent>), ConnectionError>>;
 
 pub struct PendingConnection {
     api: Weak<ApiInner>,
@@ -305,7 +350,7 @@ impl api::types::PendingConnection for PendingConnection {
                 return;
             };
 
-            api.close_session(session_id);
+            api.close_session(session_id).await;
         });
 
         Ok(())
@@ -443,7 +488,10 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         let api: Arc<ApiInner> = o_unwrap_or_return!(self.api.upgrade());
-        api.close_session(self.session_id);
+        let session_id = self.session_id;
+        let tx = api.api_to_manager.clone();
+        _ = std::thread::spawn(move || tx.blocking_send(ApiCommand::CloseSession(session_id)))
+            .join();
     }
 }
 
@@ -452,30 +500,54 @@ impl api::types::Connection for Connection {
     type Error = ConnectionError;
     type InputStream = InputStream;
     type OutputStream = OutputStream;
+    type PendingInputStream = PendingStream<api::types::Input>;
 
-    async fn listen(&mut self) -> Result<Self::Event, Self::Error> {
-        if self.api.strong_count() == 0 {
-            let mut buffer = vec![];
+    async fn listen(mut self) -> Result<Self::Event, Self::Error> {
+        let inner = if self.api.strong_count() == 0 {
+            let mut last = Box::new(None);
             while let Some(message) = self.receiver.recv().await {
-                buffer.push(message);
+                last.replace(message);
             }
-            match buffer.last() {
-                Some(ConnectionEvent::ProtocolClosed(_)) => {
-                    Ok(ConnectionEvent::ProtocolClosed(buffer))
-                }
-                _ => Err(ConnectionError::ProtocolClosed),
+            match *last {
+                Some(InnerConnectionEvent::ProtocolClosed) => InnerConnectionEvent::ProtocolClosed,
+                _ => return Err(ConnectionError::ProtocolClosed),
             }
         } else {
             self.receiver
                 .recv()
                 .await
-                .ok_or(ConnectionError::ProtocolClosed)
-        }
+                .ok_or(ConnectionError::ProtocolClosed)?
+        };
+
+        let event = match inner {
+            InnerConnectionEvent::TrackRequest {
+                track_id,
+                fingerprint,
+            } => {
+                let api = self.api.clone();
+                let session_id = self.session_id;
+                ConnectionEvent::TrackRequested(RequestedStream::new_output(
+                    api,
+                    session_id,
+                    track_id,
+                    fingerprint,
+                    self,
+                ))
+            }
+            InnerConnectionEvent::ProtocolClosed => ConnectionEvent::ProtocolClosed,
+            InnerConnectionEvent::ConnectionClosed => ConnectionEvent::ConnectionClosed,
+        };
+        Ok(event)
     }
 
     #[allow(refining_impl_trait)]
-    async fn send(self, buffer: impl Into<ReadableBuffer>) -> Result<OutputStream, Self::Error> {
-        let api = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+    async fn send(
+        self,
+        buffer: impl Into<ReadableBuffer>,
+    ) -> Result<OutputStream, (Self::Error, Self)> {
+        let Some(api) = self.api.upgrade() else {
+            return Err((ConnectionError::ProtocolClosed, self));
+        };
         let buffer = buffer.into();
         let length = buffer.len();
         let (sender, receiver) = watch::channel(StreamMessage::default());
@@ -490,7 +562,7 @@ impl api::types::Connection for Connection {
                 length,
                 receiver,
             )),
-            Err(e) => Err(ConnectionError::from_api(e)),
+            Err(e) => Err((ConnectionError::from_api(e), self)),
         }
     }
 
@@ -498,48 +570,82 @@ impl api::types::Connection for Connection {
         self,
         identifier: impl Into<Box<[u8]>>,
         buffer: impl Into<WriteableBuffer>,
-    ) -> Result<InputStream, Self::Error> {
-        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+    ) -> Result<PendingStream<api::types::Input>, (Self::Error, Self)> {
+        let Some(api) = self.api.upgrade() else {
+            return Err((ConnectionError::ProtocolClosed, self));
+        };
+
+        let api: Arc<ApiInner> = api;
+
+        let track_id = identifier.into();
+        if track_id.len() > MAX_PAYLOAD_LENGTH {
+            return Err((ConnectionError::BufferTooLarge, self));
+        }
+
         let buffer = buffer.into();
+        let buffer_len = buffer.len();
         let length = buffer.len();
         let (sender, receiver) = watch::channel(StreamMessage::default());
-        match api
+
+        let response = api
             .request_track(
                 SendTarget::Session(self.session_id),
-                identifier.into(),
+                track_id,
                 buffer,
                 sender,
             )
-            .await
-        {
-            Ok(_) => Ok(InputStream::new(
+            .await;
+
+        match response.recv().await {
+            Ok(Ok(s)) => Ok(PendingStream::new_input(
                 self.api.clone(),
                 self.session_id,
-                self,
-                length,
+                buffer_len,
                 receiver,
+                self,
             )),
-            Err(e) => Err(ConnectionError::from_api(e)),
+            Ok(Err(e)) => {
+                let error = match e {
+                    // These two should be impossible
+                    ApiErrors::NoFreeSession | ApiErrors::SessionOccupied => {
+                        ConnectionError::UnknownInternalError
+                    }
+                    ApiErrors::SessionDoesNotExist => ConnectionError::SessionClosedByPeer,
+                    _ => ConnectionError::ProtocolClosed,
+                };
+                Err((error, self))
+            }
+            Err(_) => Err((ConnectionError::ProtocolClosed, self)),
         }
     }
 
     async fn close(self) {
         let api: Arc<ApiInner> = o_unwrap_or_return!(self.api.upgrade());
-        api.close_session(self.session_id);
+        api.close_session(self.session_id).await;
     }
 }
 
+/// Direction-parameterized stream type. Common fields live here once;
+/// direction-specific behavior is supplied via per-direction trait impls
+/// (`impl api::types::Stream for Stream<Input>`, etc.). `allow_partial` is
+/// only meaningful for the `Input` direction (it's read in `Stream<Input>`'s
+/// `complete`); `Output` ignores it.
+#[allow(private_bounds)]
 #[derive(Debug)]
-pub struct InputStream {
+pub struct Stream<Direction: api::types::StreamDirection> {
     api: Weak<ApiInner>,
     session: SessionId,
     stream_size: usize,
     connection: Connection,
     allow_partial: bool,
     update: watch::Receiver<StreamMessage>,
+    _marker: PhantomData<Direction>,
 }
 
-impl InputStream {
+pub type InputStream = Stream<api::types::Input>;
+pub type OutputStream = Stream<api::types::Output>;
+
+impl<Direction: api::types::StreamDirection> Stream<Direction> {
     pub(super) fn new(
         api: Weak<ApiInner>,
         session_id: SessionId,
@@ -554,11 +660,12 @@ impl InputStream {
             connection,
             allow_partial: false,
             update: receiver,
+            _marker: PhantomData,
         }
     }
 }
 
-impl InputStream {
+impl Stream<api::types::Input> {
     async fn send_playback_control(
         &self,
         control: PlaybackControl,
@@ -591,7 +698,7 @@ impl InputStream {
     }
 }
 
-impl api::types::PlaybackControl for InputStream {
+impl api::types::PlaybackControl for Stream<api::types::Input> {
     async fn pause(&self) -> Result<usize, Self::Error> {
         self.send_playback_control(PlaybackControl::Pause).await
     }
@@ -606,7 +713,7 @@ impl api::types::PlaybackControl for InputStream {
     }
 }
 
-impl api::types::Stream for InputStream {
+impl api::types::Stream for Stream<api::types::Input> {
     type Error = ConnectionError;
     type Idx = usize;
     type Connection = Connection;
@@ -634,42 +741,16 @@ impl api::types::Stream for InputStream {
         Ok(self.connection)
     }
 
-    async fn close(self) -> Result<Self::Connection, Self::Error> {
-        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+    async fn close(self) -> Result<Self::Connection, (Self::Error, Self::Connection)> {
+        let Some(api) = self.api.upgrade() else {
+            return Err((ConnectionError::ProtocolClosed, self.connection));
+        };
         api.close_stream(self.session).await;
         Ok(self.connection)
     }
 }
 
-#[allow(private_bounds)]
-#[derive(Debug)]
-pub struct OutputStream {
-    api: Weak<ApiInner>,
-    session: SessionId,
-    stream_size: usize,
-    connection: Connection,
-    update: watch::Receiver<StreamMessage>,
-}
-
-impl OutputStream {
-    pub(super) fn new(
-        api: Weak<ApiInner>,
-        session_id: SessionId,
-        connection: Connection,
-        stream_size: usize,
-        receiver: watch::Receiver<StreamMessage>,
-    ) -> Self {
-        Self {
-            api,
-            session: session_id,
-            connection,
-            stream_size,
-            update: receiver,
-        }
-    }
-}
-
-impl api::types::Stream for OutputStream {
+impl api::types::Stream for Stream<api::types::Output> {
     type Error = ConnectionError;
     type Idx = usize;
     type Connection = Connection;
@@ -694,9 +775,205 @@ impl api::types::Stream for OutputStream {
         Ok(self.connection)
     }
 
-    async fn close(self) -> Result<Self::Connection, Self::Error> {
-        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+    async fn close(self) -> Result<Self::Connection, (Self::Error, Self::Connection)> {
+        let Some(api) = self.api.upgrade() else {
+            return Err((ConnectionError::ProtocolClosed, self.connection));
+        };
         api.close_stream(self.session).await;
         Ok(self.connection)
+    }
+}
+
+// ============================================================================
+// Public ConnectionEvent + RequestedStream<Direction> + PendingStream<Direction>
+// ============================================================================
+
+/// Public event yielded by [`Connection::listen()`]. Internally the connection
+/// channel carries `InnerConnectionEvent` (primitives + fingerprint); this
+/// enum is the API-facing wrapping with typed handles.
+#[derive(Debug)]
+pub enum ConnectionEvent {
+    TrackRequested(RequestedStream<api::types::Output>),
+    ProtocolClosed,
+    ConnectionClosed,
+}
+
+#[allow(private_bounds)]
+#[derive(Debug)]
+pub struct RequestedStream<Direction: api::types::StreamDirection> {
+    api: Weak<ApiInner>,
+    session: SessionId,
+    track_id: Box<[u8]>,
+    fingerprint: PacketFingerprint,
+    connection: Connection,
+    _marker: PhantomData<Direction>,
+}
+
+impl RequestedStream<api::types::Output> {
+    pub(crate) fn new_output(
+        api: Weak<ApiInner>,
+        session: SessionId,
+        track_id: Box<[u8]>,
+        fingerprint: PacketFingerprint,
+        connection: Connection,
+    ) -> Self {
+        Self {
+            api,
+            session,
+            track_id,
+            fingerprint,
+            connection,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl api::types::RequestedStream for RequestedStream<api::types::Output> {
+    type Stream = Stream<api::types::Output>;
+    type Error = ConnectionError;
+    type OwningConnection = Connection;
+    type ApprovalBuffer = ReadableBuffer;
+
+    fn track_id(&self) -> &[u8] {
+        &self.track_id
+    }
+
+    async fn reject(self) -> Result<Connection, Self::Error> {
+        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+        api.reject_track_request(self.session, self.track_id).await;
+        Ok(self.connection)
+    }
+
+    async fn approve_and_ready(
+        self,
+        buffer: impl Into<ReadableBuffer>,
+    ) -> Result<Stream<api::types::Output>, (Self::Error, Connection)> {
+        let Some(api) = self.api.upgrade() else {
+            return Err((ConnectionError::ProtocolClosed, self.connection));
+        };
+        let api: Arc<ApiInner> = api;
+
+        let buffer = buffer.into();
+        let length = buffer.len();
+        let (sender, receiver) = watch::channel(StreamMessage::default());
+        match api
+            .send_data(SendTarget::Session(self.session), buffer, sender)
+            .await
+        {
+            Ok(_) => Ok(Stream::<api::types::Output>::new(
+                self.api.clone(),
+                self.session,
+                self.connection,
+                length,
+                receiver,
+            )),
+            Err(e) => Err((ConnectionError::from_api(e), self.connection)),
+        }
+    }
+}
+
+// `RequestedStream<Input>` (peer offers data, we receive) is not yet
+// implemented in the protocol — kept as a typestate placeholder for when
+// that flow is wired.
+impl api::types::RequestedStream for RequestedStream<api::types::Input> {
+    type Stream = Stream<api::types::Input>;
+    type Error = ConnectionError;
+    type OwningConnection = Connection;
+    type ApprovalBuffer = WriteableBuffer;
+
+    fn track_id(&self) -> &[u8] {
+        &self.track_id
+    }
+
+    async fn reject(self) -> Result<Connection, Self::Error> {
+        todo!("RequestedStream<Input> not yet wired")
+    }
+
+    async fn approve_and_ready(
+        self,
+        _buffer: impl Into<WriteableBuffer>,
+    ) -> Result<Stream<api::types::Input>, (Self::Error, Connection)> {
+        todo!("RequestedStream<Input> not yet wired")
+    }
+}
+
+#[allow(private_bounds)]
+#[derive(Debug)]
+pub struct PendingStream<Direction: api::types::StreamDirection> {
+    api: Weak<ApiInner>,
+    session: SessionId,
+    stream_size: usize,
+    update: watch::Receiver<StreamMessage>,
+    connection: Connection,
+    _marker: PhantomData<Direction>,
+}
+
+impl PendingStream<api::types::Input> {
+    pub(crate) fn new_input(
+        api: Weak<ApiInner>,
+        session: SessionId,
+        stream_size: usize,
+        update: watch::Receiver<StreamMessage>,
+        connection: Connection,
+    ) -> Self {
+        Self {
+            api,
+            session,
+            stream_size,
+            update,
+            connection,
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl api::types::PendingStream for PendingStream<api::types::Input> {
+    type Stream = Stream<api::types::Input>;
+    type Error = ConnectionError;
+    type OwningConnection = Connection;
+
+    async fn ready(mut self) -> Result<Stream<api::types::Input>, (Self::Error, Connection)> {
+        let Ok(r) = self.update.wait_for(|e| e.approved.is_some()).await else {
+            return Err((ConnectionError::ProtocolClosed, self.connection));
+        };
+
+        if r.approved.is_some_and(identity) {
+            drop(r);
+            Ok(Stream::<api::types::Input>::new(
+                self.api,
+                self.session,
+                self.connection,
+                self.stream_size,
+                self.update,
+            ))
+        } else {
+            Err((ConnectionError::PeerRejected(None), self.connection))
+        }
+    }
+
+    async fn discard(self) -> Result<Connection, (Self::Error, Connection)> {
+        let Some(api) = self.api.upgrade() else {
+            return Err((ConnectionError::ProtocolClosed, self.connection));
+        };
+        let stream = self.ready().await?;
+        stream.close().await
+    }
+}
+
+// `PendingStream<Output>` has no use case in the current protocol model
+// (`Connection::send` already returns the live OutputStream synchronously
+// since there's no per-stream peer-approval step on the sender side).
+// Kept as a typestate placeholder for symmetry.
+impl api::types::PendingStream for PendingStream<api::types::Output> {
+    type Stream = Stream<api::types::Output>;
+    type Error = ConnectionError;
+    type OwningConnection = Connection;
+
+    async fn ready(self) -> Result<Stream<api::types::Output>, (Self::Error, Connection)> {
+        todo!("PendingStream<Output> not yet wired")
+    }
+
+    async fn discard(self) -> Result<Connection, (Self::Error, Self::OwningConnection)> {
+        todo!("PendingStream<Output> not yet wired")
     }
 }
