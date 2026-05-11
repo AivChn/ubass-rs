@@ -1,11 +1,9 @@
 #![allow(clippy::wildcard_imports)]
 use std::{
     net::SocketAddr,
-    os::unix::fs::lchown,
-    ptr::addr_of,
     range::Range,
     sync::mpsc::{SyncSender, sync_channel},
-    thread::{JoinHandle, current},
+    thread::JoinHandle,
     time::Duration,
 };
 
@@ -15,25 +13,24 @@ use tokio::{
 };
 #[cfg(debug_assertions)]
 use tracing::info;
-use tracing::{debug, error, instrument, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::{
-    api::WriteableBuffer,
     error::{ApiErrors, ConnectionError, EmptyResult},
     get_state, lock_read, lock_write,
     manager::{
         self, AppId, STATE, key_exchange,
         packets::*,
         state::{
-            ConnectionStates, EstablishedState, HandshakeId, SessionStateFlag, SessionStateFlags,
-            SessionStates, StreamState, Streaming, StreamingTo,
+            ConnectionStates, EstablishedState, HandshakeId,
+            SessionStates, StreamState, Streaming,
         },
         types::{ManagerFromApi, ManagerToApi, ManagerToProcessor},
     },
     match_or_return, o_unwrap_or_return,
     utils::{
-        ConnectionEvent, Flags, LogFail, OneShot, PanicInDebug, PlaybackControl,
-        RequestDataRequest, SendDataRequest, SendPacket, SendTarget, StreamEvent, StreamMessage,
+        Flags, InnerConnectionEvent, LogFail, OneShot, PanicInDebug, PlaybackControl,
+        RequestDataRequest, SendDataRequest, SendPacket, SendTarget,
         not,
     },
 };
@@ -101,7 +98,7 @@ pub async fn connect(
         response,
     }: OneShot<
         SocketAddr,
-        core::result::Result<(SessionId, Receiver<ConnectionEvent>), ConnectionError>,
+        core::result::Result<(SessionId, Receiver<InnerConnectionEvent>), ConnectionError>,
     >,
     outbound_sender: ManagerToProcessor,
 ) {
@@ -240,16 +237,20 @@ pub async fn request_track(
             return;
         }
     };
+
+    {
+        let mut lock = lock_write!(get_state!().connections);
+        let Some(state) = lock.get_mut(&session_id).panic_in_debug(&format!(
+            "Invariant broken in `request_track`: session {session_id} does not exist"
+        )) else {
+            _ = response.send(Err(ApiErrors::SessionDoesNotExist));
+            return;
+        };
+        state.streaming_from(buffer, sender);
+    }
+
     _ = response.send(Ok(session_id));
 
-    o_unwrap_or_return!(
-        lock_write!(get_state!().connections)
-            .get_mut(&session_id)
-            .panic_in_debug(&format!(
-                "Invariant broken in `request_track`: session {session_id} does not exist"
-            ))
-    )
-    .streaming_from(buffer, sender);
     debug!("session {} switched to `StreamingFrom` state", session_id);
 
     TrackRequestPacket::request_track(Options::none(), session_id, id.into())
@@ -257,9 +258,9 @@ pub async fn request_track(
         .await;
 }
 
-pub fn request_metadata() {
-    todo!()
-}
+//pub fn request_metadata() {
+//    todo!()
+//}
 
 #[instrument(skip_all)]
 pub async fn close_session(session_id: SessionId, sender: ManagerToProcessor) {
@@ -390,7 +391,7 @@ async fn update_paused(session_id: SessionId, paused: bool) -> Option<bool> {
             return Some(false);
         }
 
-        let current = stream.borrow().paused;
+        let _current = stream.borrow().paused;
         stream.send_modify(|m| m.paused = paused);
         Some(true)
     } else {
@@ -446,4 +447,31 @@ pub async fn find_holes(
     };
 
     _ = response.send(to_send);
+}
+
+pub async fn reject_track_request(
+    session_id: SessionId,
+    track_id: Box<[u8]>,
+    sender: ManagerToProcessor,
+) {
+    let address = {
+        if let Some(ConnectionStates::Established(box EstablishedState {
+            state: SessionStates::Up | SessionStates::Down,
+            address,
+            ..
+        })) = lock_read!(get_state!().connections).get(&session_id)
+        {
+            *lock_read!(address)
+        } else {
+            return;
+        }
+    };
+
+    Box::new(TrackRejectionPacket::new(
+        Options::construct(&[OptionFlags::RequireAck]),
+        session_id,
+        track_id,
+    ))
+    .send(sender, address)
+    .await;
 }

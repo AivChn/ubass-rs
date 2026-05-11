@@ -1,30 +1,23 @@
 #![allow(clippy::pedantic)]
-use std::{
-    net::SocketAddr,
-    ptr::dangling,
-    sync::{Arc, atomic::Ordering},
-};
+use std::{net::SocketAddr, sync::Arc};
 
-use tokio::sync::oneshot;
 use tracing::{error, instrument};
 
+#[allow(unused_imports)]
 use crate::{
     manager::{
         EncryptionMonitor, PendingAckMonitor,
         packets::{
-            BatchID, OptionFlags, Packet, PacketFingerprint, PacketType, PacketWrapper,
-            ParityPacket, SessionId,
+            BatchID, OptionFlags, Packet, PacketType, PacketWrapper, ParityPacket, SessionId,
         },
-        state,
     },
     packet_processor::{
         encryption::{self, Encryptable},
-        fec::{self, FECCompatible, Recovered},
-        serialize::{self, Serialize},
+        fec::{self, FECCompatible},
+        serialize::Serialize,
         types::{InboundSender, OutboundSender, ProcessedPacket},
     },
     prelude::*,
-    r_unwrap_or_return,
 };
 
 use super::types::OutboundChannels;
@@ -50,13 +43,17 @@ macro_rules! processed {
 macro_rules! add_ack {
     (for $packet_type:ident($packet:ident), sent to $addr:ident, saved to $pending_ack_monitor:ident) => {
         if $packet.opts.contains(OptionFlags::RequireAck) {
-            add_pending_ack(
-                PacketWrapper {
-                    addr: $addr,
-                    packet: Packet::$packet_type($packet.clone()),
-                },
-                $pending_ack_monitor,
-            )
+            if $packet.opts.contains(OptionFlags::Resend) {
+                $packet.opts = $packet.opts.unset(OptionFlags::Resend)
+            } else {
+                add_pending_ack(
+                    PacketWrapper {
+                        addr: $addr,
+                        packet: Packet::$packet_type($packet.clone()),
+                    },
+                    $pending_ack_monitor,
+                )
+            }
         }
     };
 }
@@ -82,13 +79,6 @@ pub async fn init(
 
         let packet = match msg {
             PacketProcessingMessage::SendPacket(packet_wrapper) => packet_wrapper,
-            PacketProcessingMessage::Recover(OneShot {
-                data: (session_id, batch_id),
-                response,
-            }) => {
-                monitor.dispatch(recover(session_id, batch_id, response));
-                continue;
-            }
             PacketProcessingMessage::Close => {
                 monitor.flush().await;
                 _ = t_sender.send(TransportMessage::Close).await;
@@ -149,15 +139,15 @@ async fn handle_packet(
         }
 
         //encrypted
-        Packet::TrackRequestPacket(packet) => {
+        Packet::TrackRequestPacket(mut packet) => {
             add_ack!(for TrackRequestPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
             let serialized = process_encrypted(packet, session_id, addr, encryption_monitor).await;
             processed!(serialized to addr as Session 3 times)
         }
-        Packet::AppRejectErrorPacket(packet) => {
-            add_ack!(for AppRejectErrorPacket(packet), sent to addr, saved to pending_ack_monitor);
+        Packet::TrackRejectionPacket(mut packet) => {
+            add_ack!(for TrackRejectionPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
             let serialized = process_encrypted(packet, session_id, addr, encryption_monitor).await;
@@ -165,7 +155,7 @@ async fn handle_packet(
         }
 
         // authenticated
-        Packet::RetransmitPacket(packet) => {
+        Packet::RetransmitPacket(mut packet) => {
             add_ack!(for RetransmitPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
@@ -173,7 +163,7 @@ async fn handle_packet(
                 process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await;
             processed!(serialized to addr as Session 3 times)
         }
-        Packet::PlaybackControlPacket(packet) => {
+        Packet::PlaybackControlPacket(mut packet) => {
             add_ack!(for PlaybackControlPacket(packet), sent to addr, saved to pending_ack_monitor);
 
             let session_id = packet.session_id;
@@ -187,7 +177,7 @@ async fn handle_packet(
                 process_authenticated(packet.as_ref(), session_id, addr, encryption_monitor).await;
             processed!(serialized to addr as Session 3 times)
         }
-        Packet::SessionDoesNotExistErrorPacket(packet) => {
+        Packet::SessionDoesNotExistErrorPacket(mut packet) => {
             add_ack!(
                 for SessionDoesNotExistErrorPacket(packet),
                 sent to addr,
@@ -272,8 +262,8 @@ async fn handle_packet(
             }
         }
 
-        // later
-        Packet::MetadataPacket(_) => unimplemented!(),
+        // TODO: metadata flow not wired yet — silently drop.
+        Packet::MetadataPacket(_) => return,
 
         // never
         Packet::ParityPacket(_) => {
@@ -287,7 +277,7 @@ async fn handle_packet(
 async fn process_encrypted(
     mut packet: Box<impl Encryptable + Serialize>,
     session_id: SessionId,
-    addr: SocketAddr,
+    _addr: SocketAddr,
     encryption_monitor: EncryptionMonitor,
 ) -> Vec<u8> {
     encryption::encrypt(packet.as_mut(), session_id, encryption_monitor).await;
@@ -300,7 +290,7 @@ async fn process_encrypted(
 async fn process_authenticated(
     packet: &impl Serialize,
     session_id: SessionId,
-    addr: SocketAddr,
+    _addr: SocketAddr,
     encryption_monitor: EncryptionMonitor,
 ) -> Vec<u8> {
     let mut serialized;
@@ -308,19 +298,6 @@ async fn process_authenticated(
 
     encryption::tag(&mut serialized, session_id, encryption_monitor).await;
     serialized
-}
-
-async fn recover(
-    session_id: SessionId,
-    batch_id: BatchID,
-    sender: oneshot::Sender<core::result::Result<Recovered, CouldNotRecover>>,
-) {
-    let message = match fec::recover(batch_id, session_id).await {
-        Some(recovered) => Ok(recovered),
-        None => Err(CouldNotRecover),
-    };
-
-    _ = sender.send(message);
 }
 
 fn add_pending_ack(packet: PacketWrapper, pending_ack_monitor: PendingAckMonitor) {
@@ -396,7 +373,7 @@ async fn send_packet_to_transport(
 
 #[cfg(test)]
 mod test_packet_processor_macros {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::Ipv4Addr;
 
     use crate::manager::packets::{BytePosition, DataPacket, Options, Version};
 
@@ -489,7 +466,6 @@ mod test_packet_processor_macros {
 
 #[cfg(test)]
 mod integration_tests {
-    use core::panic;
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::{LazyLock, OnceLock},
@@ -504,7 +480,7 @@ mod integration_tests {
             state::{EncryptionTable, PendingAckWindow},
         },
         packet_processor::types::OutboundChannels,
-        transport::{self, types::ReceivedPacket},
+        transport::types::ReceivedPacket,
         utils::{ManagerMessage, PacketProcessingMessage, TransportMessage},
     };
 

@@ -1,20 +1,20 @@
 use std::sync::Arc;
 
 use crate::{
-    get_state,
     manager::{
         routines::{
-            errors::{self, handle_errors},
+            errors::handle_errors,
             received::{
                 self, received_close_session_packet, received_handshake_ack_packet,
-                received_handshake_rejected_packet, received_keep_alive_packet,
-                received_parity_packet, received_playback_control_packet,
-                received_retransmit_request,
+                received_handshake_rejected_packet, received_incompatible_version_error,
+                received_keep_alive_packet, received_parity_packet,
+                received_playback_control_packet, received_retransmit_request,
+                received_session_does_not_exist_error, received_track_reject_packet,
+                received_unexpected_packet_error,
             },
         },
         types::{ManagerFromProcessor, ManagerToApi, ManagerToProcessor},
     },
-    packet_processor::fec::received,
     prelude::*,
 };
 
@@ -52,11 +52,6 @@ async fn handle_message(
     app_sender: ManagerToApi,
 ) {
     match message {
-        ManagerMessage::Recovered(_recoverd_packets) => {
-            todo!("recovered packets routine")
-            // TODO: call recoverd routine
-            // TODO: call data received routine
-        }
         ManagerMessage::Packet(packet_wrapper) => match packet_wrapper.packet {
             packets::Packet::HelloPacket(hello_packet) => {
                 received::received_hello_packet(
@@ -82,22 +77,27 @@ async fn handle_message(
             packets::Packet::AckPacket(ack_packet) => {
                 received::received_ack_packet(ack_packet).await;
             }
-            packets::Packet::IncompatibleVersionPacket(_incompatible_version_packet) => todo!(),
-            packets::Packet::SessionDoesNotExistErrorPacket(
-                _session_does_not_exist_error_packet,
-            ) => todo!(),
-            packets::Packet::AppRejectErrorPacket(_app_reject_error_packet) => todo!(),
+            packets::Packet::IncompatibleVersionPacket(packet) => {
+                received_incompatible_version_error(packet, packet_wrapper.addr).await;
+            }
+            packets::Packet::SessionDoesNotExistErrorPacket(packet) => {
+                received_session_does_not_exist_error(packet).await;
+            }
+            packets::Packet::TrackRejectionPacket(packet) => {
+                received_track_reject_packet(packet).await;
+            }
             // TODO: future features
             packets::Packet::RetransmitPacket(retransmit_packet) => {
                 received_retransmit_request(retransmit_packet, outbound_sender.clone()).await;
             }
-            packets::Packet::MetadataPacket(_metadata_packet) => todo!(),
+            // TODO: metadata flow not wired yet — silently drop.
+            packets::Packet::MetadataPacket(_metadata_packet) => {}
             packets::Packet::PlaybackControlPacket(playback_status_packet) => {
                 received_playback_control_packet(playback_status_packet, outbound_sender.clone())
                     .await;
             }
-            packets::Packet::UnexpectedPacketErrorPacket(_unexpected_packet_error_packet) => {
-                todo!()
+            packets::Packet::UnexpectedPacketErrorPacket(packet) => {
+                received_unexpected_packet_error(packet).await;
             }
             packets::Packet::CloseSessionPacket(close_session_packet) => {
                 received_close_session_packet(close_session_packet).await;

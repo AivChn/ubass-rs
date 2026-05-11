@@ -1,11 +1,7 @@
 #![allow(clippy::wildcard_imports)]
 
-use std::net::SocketAddr;
-
 use crate::{
-    get_state,
-    manager::{self, EncryptionMonitor, FingerprintMonitor, packets::*},
-    o_unwrap_or_return,
+    manager::{EncryptionMonitor, FingerprintMonitor, packets::*},
     packet_processor::{encryption, fingerprint::Headers, serialize::Serialize},
     prelude::*,
     r_unwrap_or_return,
@@ -100,11 +96,7 @@ async fn handle_packet(
     );
 
     if let Packet::KeepAlivePacket(keep_alive_packet) = &mut ready_packet {
-        let SocketAddr::V4(addr) = packet.src_addr else {
-            // TODO: figure out how to handle this case gracefully
-            unimplemented!()
-        };
-        keep_alive_packet.address.replace(addr);
+        keep_alive_packet.address.replace(packet.src_addr);
     }
 
     send_up(
@@ -177,8 +169,9 @@ async fn deserialize_and_decrypt(
             .await
         }
 
-        // Not yet
-        PacketType::Metadata => unimplemented!(),
+        // TODO: metadata packets aren't wired yet — silently drop until the
+        // metadata flow is implemented end-to-end.
+        PacketType::Metadata => Err(()),
     }
 }
 
@@ -223,13 +216,23 @@ async fn deserialize_and_auth_control_packet(
                     .ok_or(())?;
                 Packet::TrackRequestPacket(packet)
             }
-            ControlType::Session(SessionControlType::MetadataRequest) => unimplemented!(),
+            // TODO: metadata-request flow not wired yet — silently drop.
+            ControlType::Session(SessionControlType::MetadataRequest) => return Err(()),
             ControlType::Session(SessionControlType::Close) => {
                 authenticate(&mut data, session_id, encryption_monitor).await?;
                 let data = dedup_no_payload(data, session_id, fingerprint_monitor)
                     .await
                     .ok_or(())?;
                 Packet::CloseSessionPacket(Box::new(CloseSessionPacket::deserialize(&data)?))
+            }
+
+            ControlType::Session(SessionControlType::TrackReject) => {
+                let mut packet = Box::new(TrackRejectionPacket::deserialize(&data)?);
+                encryption::decrypt(packet.as_mut(), session_id, encryption_monitor).await?;
+                let packet = dedup_with_payload(packet, session_id, fingerprint_monitor)
+                    .await
+                    .ok_or(())?;
+                Packet::TrackRejectionPacket(packet)
             }
 
             //playback
@@ -252,15 +255,6 @@ async fn deserialize_and_auth_error_packet(
 ) -> core::result::Result<Packet, ()> {
     Ok(
         match ErrorType::deserialize(&data[SECONDARY_TYPE_OFFSET..])? {
-            ErrorType::AppReject => {
-                let mut packet = Box::new(AppRejectErrorPacket::deserialize(&data)?);
-                encryption::decrypt(packet.as_mut(), session_id, encryption_monitor).await?;
-                let packet = dedup_with_payload(packet, session_id, fingerprint_monitor)
-                    .await
-                    .ok_or(())?;
-                Packet::AppRejectErrorPacket(packet)
-            }
-
             ErrorType::UnexpectedPacket | ErrorType::IncomprehensiblePacket => {
                 authenticate(&mut data, session_id, encryption_monitor).await?;
                 let data = dedup_no_payload(data, session_id, fingerprint_monitor)
@@ -298,7 +292,7 @@ async fn authenticate(
 
 async fn dedup_no_payload(
     packet: Vec<u8>,
-    session_id: SessionId,
+    _session_id: SessionId,
     fingerprint_monitor: FingerprintMonitor,
 ) -> Option<Vec<u8>> {
     let fingerprint = PacketFingerprint::from(&packet);
@@ -313,7 +307,7 @@ async fn dedup_no_payload(
 
 async fn dedup_with_payload<T: Headers>(
     packet: Box<T>,
-    session_id: SessionId,
+    _session_id: SessionId,
     fingerprint_monitor: FingerprintMonitor,
 ) -> Option<Box<T>> {
     let fingerprint: PacketFingerprint = packet.as_ref().into();
@@ -332,23 +326,19 @@ async fn send_up(message: Result<ManagerMessage>, sender: InboundSender) {
 
 #[cfg(test)]
 mod test {
-    use std::sync::{Arc, LazyLock, atomic::AtomicU64};
+    use std::sync::{LazyLock, atomic::AtomicU64};
 
     use tokio::time::Instant;
 
     use crate::{
-        lock_write,
         manager::{
             packets::{
                 BatchID, BytePosition, DataPacket, FECInfo, Options, PacketFingerprint, SessionId,
             },
             state::*,
         },
-        packet_processor::{
-            fingerprint,
-            inbound::{dedup_no_payload, dedup_with_payload},
-        },
-        prelude::{PROTOCOL_EPOCH, Timestamp},
+        packet_processor::inbound::{dedup_no_payload, dedup_with_payload},
+        prelude::PROTOCOL_EPOCH,
         utils::Flags,
     };
 

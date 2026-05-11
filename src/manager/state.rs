@@ -1,13 +1,12 @@
-use aes_gcm_siv::{Aes256GcmSiv, aead::Buffer};
+use aes_gcm_siv::Aes256GcmSiv;
 use derive_more::{Deref, Display};
-use reed_solomon_simd::engine::tables;
 use tokio::{
-    select, stream,
+    select,
     sync::{Mutex, RwLock, mpsc, oneshot, watch},
     task::JoinHandle,
     time::{interval, sleep as tokio_sleep},
 };
-use tracing::{debug, field::debug, instrument, warn};
+use tracing::{debug, instrument, warn};
 use x25519_dalek::EphemeralSecret;
 
 use crate::{
@@ -23,18 +22,17 @@ use crate::{
         types::{ForeignTimestamp, ManagerToProcessor},
     },
     match_or_return, o_unwrap_or_return,
-    packet_processor::fec::{self, Recovered, inference},
+    packet_processor::fec::{self, Recovered},
     prelude::*,
     r_unwrap_or_return,
 };
 use core::panic;
 use std::{
-    collections::{HashSet, VecDeque, hash_map::Entry},
+    collections::{BTreeSet, HashSet, VecDeque, hash_map::Entry},
     convert::identity,
-    fmt::{Display, format},
-    mem,
+    fmt::Display,
     net::{SocketAddr, SocketAddrV4, SocketAddrV6},
-    ops::{Deref, Range},
+    ops::Range,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering},
@@ -75,10 +73,6 @@ pub struct ConnectionStatesTable(RwLock<HashMap<SessionId, ConnectionStates>>);
 #[derive(Debug)]
 pub struct StreamingTo {
     pub buffer: ReadableBuffer,
-    /// Monotonically-incrementing batch id source. Stored atomic so the
-    /// "increment-and-return-new" sequence can run without holding an
-    /// exclusive `connections` lock and so concurrent retransmit_action and
-    /// send_stream_action callers can never observe the same value.
     pub current_batch: AtomicU16,
     pub event: Arc<Shared<StreamEvent>>,
 }
@@ -100,11 +94,6 @@ impl StreamingTo {
 #[derive(Debug)]
 pub struct StreamingFrom {
     pub buffer: WriteableBuffer,
-    /// Chunks for which we have an in-flight retransmit request. Acts as the
-    /// dedup ground for any retransmission decision maker (FEC TTL prune,
-    /// score policy). Inserted by `reserve_for_request`, cleared when data
-    /// arrives via `clear_pending`, expired by `sweep_pending` after the TTL
-    /// in case the response was lost.
     pub pending: HashMap<usize, Timestamp>,
 }
 
@@ -134,7 +123,7 @@ impl StreamingFrom {
         positions
             .into_iter()
             .filter(|pos| {
-                let idx = (*pos.deref() as usize) / MAX_PAYLOAD_LENGTH;
+                let idx = (**pos as usize) / MAX_PAYLOAD_LENGTH;
                 if self.buffer.position_occupied(*pos).unwrap_or(true) {
                     return false;
                 }
@@ -169,7 +158,7 @@ impl StreamingFrom {
                 (r.start..r.end).map(|i| BytePosition((i * MAX_PAYLOAD_LENGTH) as u32))
             })
             .filter(|pos| {
-                let p = *pos.deref() as usize;
+                let p = **pos as usize;
                 !fec_active.iter().any(|r| r.contains(&p))
             })
             .collect();
@@ -193,7 +182,7 @@ impl StreamingFrom {
                 (r.start..r.end).map(|i| BytePosition((i * MAX_PAYLOAD_LENGTH) as u32))
             })
             .filter(|pos| {
-                let p = *pos.deref() as usize;
+                let p = **pos as usize;
                 !fec_active.iter().any(|r| r.contains(&p))
             })
             .collect();
@@ -298,7 +287,7 @@ impl Display for SessionStates {
 pub struct EstablishedState {
     pub session_id: SessionId,
     pub last_activity: Mutex<ForeignTimestamp>,
-    pub connection: mpsc::Sender<ConnectionEvent>,
+    pub connection: mpsc::Sender<InnerConnectionEvent>,
     pub state: SessionStates,
     pub address: RwLock<SocketAddr>,
     pub app_id: AppId,
@@ -309,7 +298,10 @@ pub enum ConnectionStates {
     Handshake {
         session_id: SessionId,
         ack_triggered_response: oneshot::Sender<
-            core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
+            core::result::Result<
+                (SessionId, mpsc::Receiver<InnerConnectionEvent>),
+                ConnectionError,
+            >,
         >,
         signal: watch::Sender<bool>,
         app_id: AppId,
@@ -487,6 +479,7 @@ impl ConnectionStates {
 
             stream.send_modify(|m| {
                 m.head = streaming_from.buffer.head();
+                m.approved.replace(true);
             });
 
             let complete_allow_partial = stream.borrow().complete.is_some_and(identity);
@@ -494,14 +487,14 @@ impl ConnectionStates {
             // strict is_done = head reached end AND every chunk is filled.
             // partial-allow lets the user finish the stream with skipped data, but
             // we still wait until the head has reached the end of the buffer.
-            declare_done = streaming_from.buffer.is_done()
-                || (complete_allow_partial && head_at_end);
+            declare_done =
+                streaming_from.buffer.is_done() || (complete_allow_partial && head_at_end);
 
             // batch_pos runs [0, batch_size); the last data packet of a batch
             // has batch_pos == batch_size - 1. Widen to u16 so the +1 doesn't
             // panic when batch_pos == u8::MAX (retransmit batches > 256 chunks).
-            let batch_end = u16::from(packet.fec_info.batch_pos) + 1
-                == u16::from(packet.fec_info.batch_size);
+            let batch_end =
+                u16::from(packet.fec_info.batch_pos) + 1 == u16::from(packet.fec_info.batch_size);
 
             // Retransmit policy. Two modes:
             //  - `head_at_end`: every remaining hole is confirmed loss,
@@ -511,7 +504,9 @@ impl ConnectionStates {
             //    highest-scoring holes that clear `SCORE_THRESHOLD`.
             // FEC TTL prune still runs in parallel and handles partial
             // FEC-tracked batches.
-            score_ranges = if !declare_done {
+            score_ranges = if declare_done {
+                vec![]
+            } else {
                 let fec_active = fec.active_byte_ranges();
                 if head_at_end {
                     streaming_from.finalize_sweep_pick(&fec_active)
@@ -520,8 +515,6 @@ impl ConnectionStates {
                 } else {
                     vec![]
                 }
-            } else {
-                vec![]
             };
 
             address_copy = *lock_read!(address);
@@ -589,6 +582,8 @@ impl ConnectionStates {
             // Batch is settled — drop the manager-side mirror entry.
             fec.evict(recovered.batch_id);
 
+            stream.send_modify(|m| _ = m.approved.replace(true));
+
             for packet in recovered.packets {
                 let pos = packet.byte_range_start;
                 streaming_from.buffer.write(pos, packet.payload);
@@ -599,21 +594,21 @@ impl ConnectionStates {
             }
             let complete_allow_partial = stream.borrow().complete.is_some_and(identity);
             let head_at_end = streaming_from.buffer.head_at_end();
-            declare_done = streaming_from.buffer.is_done()
-                || (complete_allow_partial && head_at_end);
+            declare_done =
+                streaming_from.buffer.is_done() || (complete_allow_partial && head_at_end);
 
             // Recovery completing a batch is just as good a trigger as a
             // data batch_end. Same two-mode policy as `received_data_packet`:
             // finalize-sweep when head_at_end, score-policy otherwise.
-            score_ranges = if !declare_done {
+            score_ranges = if declare_done {
+                vec![]
+            } else {
                 let fec_active = fec.active_byte_ranges();
                 if head_at_end {
                     streaming_from.finalize_sweep_pick(&fec_active)
                 } else {
                     streaming_from.score_policy_pick(&fec_active)
                 }
-            } else {
-                vec![]
             };
 
             address_copy = *lock_read!(address);
@@ -735,12 +730,15 @@ impl ProtocolState {
         new_session_id: SessionId,
         address: SocketAddr,
         handshake_id: HandshakeId,
-        connection: mpsc::Sender<ConnectionEvent>,
+        connection: mpsc::Sender<InnerConnectionEvent>,
         app_id: AppId,
     ) -> Option<(
         EphemeralSecret,
         oneshot::Sender<
-            core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
+            core::result::Result<
+                (SessionId, mpsc::Receiver<InnerConnectionEvent>),
+                ConnectionError,
+            >,
         >,
     )> {
         let HandshakeState {
@@ -841,7 +839,10 @@ impl ProtocolState {
         &self,
         session_id: SessionId,
         response: oneshot::Sender<
-            core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
+            core::result::Result<
+                (SessionId, mpsc::Receiver<InnerConnectionEvent>),
+                ConnectionError,
+            >,
         >,
         address: SocketAddr,
         app_id: AppId,
@@ -896,7 +897,7 @@ impl ProtocolState {
                 }
                 ConnectionStates::Established(box EstablishedState { connection, .. }) => {
                     if connection
-                        .send(ConnectionEvent::ProtocolClosed(vec![]))
+                        .send(InnerConnectionEvent::ProtocolClosed)
                         .await
                         .is_err()
                     {
@@ -944,19 +945,7 @@ impl ProtocolState {
 
         let mut playing = true;
         let mut interval = interval(SEND_INTERVAL);
-        // Unified queue of chunks still owed to the receiver — seek-skipped
-        // bytes the sender wants to fill in, and retransmit requests from
-        // the receiver. Drained by the interval-paced `send_stream_action`
-        // only when fresh data is exhausted, so head-sends always win.
-        //
-        // Stored as a `BTreeSet` of chunk indices for two reasons:
-        //  - dedup: receiver re-requests every `PENDING_TTL_MS` while a
-        //    response is still in flight; without dedup the queue grows
-        //    linearly with backlog time and the server keeps sending
-        //    chunks the receiver already has.
-        //  - ordered draining: chunks go out in chunk-index order, which
-        //    matches the receiver's natural fill-from-head expectation.
-        let mut extras: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+        let mut extras: BTreeSet<usize> = std::collections::BTreeSet::new();
         let mut last_sent = BytePosition(0);
 
         loop {
@@ -972,9 +961,6 @@ impl ProtocolState {
                             StreamEvent::Playback(PlaybackControl::Pause) => playing = false,
                             StreamEvent::Playback(PlaybackControl::Play) => {
                                 playing = true;
-                                // No special handling: anything queued in
-                                // `extras` while paused drains naturally on
-                                // the next tick now that `playing` is true.
                             },
 
                             StreamEvent::Playback(PlaybackControl::Seek(to)) => {
@@ -996,9 +982,6 @@ impl ProtocolState {
                             }
 
                             StreamEvent::Retransmit(byte_ranges) => {
-                                // Split each requested range into chunk indices
-                                // and insert into the dedup set. Duplicate
-                                // requests for the same chunk are absorbed.
                                 for r in byte_ranges.into_iter()
                                     .flat_map(split_range_into_chunks)
                                 {
@@ -1048,7 +1031,7 @@ impl ProtocolState {
     }
 
     // CHECKPOINT
-    pub async fn close_stream(&self, session_id: SessionId, outbound_sender: ManagerToProcessor) {
+    pub async fn close_stream(&self, session_id: SessionId, _outbound_sender: ManagerToProcessor) {
         let mut lock = lock_write!(self.connections);
         let session = o_unwrap_or_return!(lock.get_mut(&session_id));
 
@@ -1237,7 +1220,7 @@ async fn send_stream_action(
 async fn close_outgoing_stream_action(session_id: SessionId) {
     debug!("close_outgoing_stream_action: session {session_id}");
     let mut lock = lock_write!(get_state!().connections);
-    let session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
+    let _session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
         "Invariant broken while trying to send on a session \
                             with ID {session_id}: session does not exist"
     )));
@@ -1386,13 +1369,6 @@ struct LayerHandles {
 }
 
 impl LayerHandles {
-    fn new(transport: JoinHandle<ErrResult>, processor: JoinHandle<ErrResult>) -> Self {
-        Self {
-            transport,
-            processor,
-        }
-    }
-
     /// Joins both layers
     async fn join(self) -> ErrResult {
         self.processor
@@ -1472,7 +1448,7 @@ pub struct HandshakeState {
     pub ephemeral_secret: EphemeralSecret,
     pub session_id: SessionId,
     pub response: oneshot::Sender<
-        core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
+        core::result::Result<(SessionId, mpsc::Receiver<InnerConnectionEvent>), ConnectionError>,
     >,
 }
 
@@ -1483,7 +1459,10 @@ impl HandshakeState {
         ephemeral_secret: EphemeralSecret,
         session_id: SessionId,
         response: oneshot::Sender<
-            core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
+            core::result::Result<
+                (SessionId, mpsc::Receiver<InnerConnectionEvent>),
+                ConnectionError,
+            >,
         >,
     ) -> Self {
         Self {
@@ -1575,7 +1554,10 @@ impl HandshakeStateTable {
         ephemeral_secret: EphemeralSecret,
         session_id: SessionId,
         response: oneshot::Sender<
-            core::result::Result<(SessionId, mpsc::Receiver<ConnectionEvent>), ConnectionError>,
+            core::result::Result<
+                (SessionId, mpsc::Receiver<InnerConnectionEvent>),
+                ConnectionError,
+            >,
         >,
     ) {
         lock_write!(self).insert(
@@ -1641,22 +1623,6 @@ impl SessionFecState {
             .add_data(batch_pos as usize, byte_range_start);
     }
 
-    pub fn add_parity(&mut self, batch_id: BatchID, fec_info: FECInfo) {
-        let FECInfo {
-            batch_size,
-            recovery_count,
-            ..
-        } = fec_info;
-        let entry = self
-            .table
-            .entry(batch_id)
-            .or_insert_with(|| FecBatchWindow::new(batch_size, recovery_count));
-        #[cfg(feature = "fec_xor")]
-        entry.add_parity();
-        #[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
-        entry.add_parity(fec_info.batch_pos as usize);
-    }
-
     /// Drop the manager's mirror entry for `batch_id`. Called when the
     /// receiver knows the batch is settled (e.g. successful recovery).
     pub fn evict(&mut self, batch_id: BatchID) {
@@ -1679,19 +1645,12 @@ impl SessionFecState {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 struct FecBatchWindow {
     batch_size: u8,
     recovery_count: u8,
-    data_arrived: FecArrivedBitMap,
-    recovery_arrived: FecArrivedBitMap,
     created_at: Timestamp,
-    /// First chunk's byte position, derived as
-    /// `byte_range_start - batch_pos * MAX_PAYLOAD_LENGTH` on the first
-    /// data packet to land. `None` if only parity has arrived so far.
     base_byte_pos: Option<BytePosition>,
-    /// True when every data packet's position matches `base + batch_pos * MPL`.
-    /// Retransmit batches break this; non-contiguous batches don't contribute
-    /// an active byte range.
     is_contiguous: bool,
 }
 
@@ -1700,16 +1659,10 @@ impl FecBatchWindow {
         Self {
             batch_size,
             recovery_count,
-            data_arrived: FecArrivedBitMap::default(),
-            recovery_arrived: FecArrivedBitMap::default(),
             created_at: Timestamp::now(),
             base_byte_pos: None,
             is_contiguous: true,
         }
-    }
-
-    fn recovery_ready(&self) -> bool {
-        self.data_arrived.count_set() + self.recovery_arrived.count_set() >= self.batch_size
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -1727,19 +1680,6 @@ impl FecBatchWindow {
             }
             _ => {}
         }
-        self.data_arrived.set_bit(index);
-    }
-
-    #[inline]
-    #[cfg(feature = "fec_xor")]
-    fn add_parity(&mut self) {
-        self.recovery_arrived.set_bit(0);
-    }
-
-    #[inline]
-    #[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
-    fn add_parity(&mut self, index: usize) {
-        self.recovery_arrived.set_bit(index);
     }
 
     /// `[base, base + batch_size * MAX_PAYLOAD_LENGTH)` for contiguous batches
@@ -1752,34 +1692,6 @@ impl FecBatchWindow {
         }
         let base = self.base_byte_pos?.0 as usize;
         Some(base..base + (self.batch_size as usize) * MAX_PAYLOAD_LENGTH)
-    }
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-struct FecArrivedBitMap([u128; 2]);
-
-impl FecArrivedBitMap {
-    /// Sets the bit of the given index
-    #[inline]
-    fn set_bit(&mut self, index: usize) {
-        self.0[index / 128] |= 1 << (index % 128);
-    }
-
-    /// Returns true if enough bits are set based on a specified threshold
-    #[inline]
-    fn enough_set(&self, threshold: u8) -> bool {
-        self.0[0].count_ones() + self.0[1].count_ones() >= threshold as u32
-    }
-
-    #[allow(clippy::cast_possible_truncation)]
-    fn count_set(&self) -> u8 {
-        (self.0[0].count_ones() + self.0[1].count_ones()) as u8
-    }
-
-    /// Returns true if the bit under the specified index is set
-    #[inline]
-    fn is_set(&self, index: usize) -> bool {
-        (self.0[index / 128] >> (index % 128)) % 2 == 1
     }
 }
 
@@ -1910,7 +1822,7 @@ impl PendingAckWindow {
         lock_write!(self.pending).remove(&fingerprint);
     }
 
-    async fn inner_add(&self, packet: Packet) {
+    async fn inner_add(&self, mut packet: Packet) {
         let fingerprint = r_unwrap_or_return!(PacketFingerprint::try_from(&packet).panic_in_debug(
             &format!(
                 "Invariant broken while adding a packet to `PendingAckWindow`:\
@@ -1918,6 +1830,7 @@ impl PendingAckWindow {
                 be found at the impl TryFrom<&Packet> for PacketFingerprint",
             )
         ));
+        packet.mark_resend();
 
         let entry = PendingAckQueueEntry::new(fingerprint.clone());
         lock_write!(self.pending).insert(fingerprint, packet);
@@ -2088,7 +2001,7 @@ impl FecPruneTask {
     /// A batch can sit in FEC inbound state this long before it's declared stuck.
     const TTL_MS: u64 = PACKET_DISCARD_TIME_MS;
     /// Sleep between sweeps. Smaller than TTL so a stuck batch is caught
-    /// within ~SLEEP_MS of crossing the threshold.
+    /// within ~`SLEEP_MS` of crossing the threshold.
     const SLEEP: Duration = Duration::from_millis(100);
 
     #[must_use]
@@ -2120,10 +2033,7 @@ impl FecPruneTask {
                 if positions.is_empty() {
                     continue;
                 }
-                by_session
-                    .entry(session_id)
-                    .or_default()
-                    .extend(positions);
+                by_session.entry(session_id).or_default().extend(positions);
             }
 
             for (session_id, positions) in by_session {
@@ -2155,7 +2065,9 @@ impl FecPruneTask {
                         None
                     }
                 };
-                let Some((accepted, addr)) = dispatch else { continue };
+                let Some((accepted, addr)) = dispatch else {
+                    continue;
+                };
 
                 let ranges = coalesce_byte_positions(accepted);
                 dispatch_retransmit_request(&self.sender, session_id, addr, ranges).await;

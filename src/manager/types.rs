@@ -1,7 +1,4 @@
-use std::{
-    net::SocketAddr,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::{
     sync::mpsc::{Receiver, Sender},
@@ -17,9 +14,6 @@ pub type ManagerFromProcessor = Receiver<Result<ManagerMessage>>;
 // api channels
 pub type ManagerToApi = Sender<Result<ApiMessage>>;
 pub type ManagerFromApi = Receiver<ApiCommand>;
-
-#[derive(Debug, Clone, Copy)]
-pub struct Address(SocketAddr);
 
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
 #[repr(transparent)]

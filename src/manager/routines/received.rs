@@ -1,20 +1,18 @@
-use std::{net::SocketAddr, ops::Deref, time::Duration};
+use std::{net::SocketAddr, time::Duration};
 
 use crate::{
     error::ConnectionError,
     lock,
-    manager::messages::PlaybackControl,
     manager::state::{
         ConnectionStates, EstablishedState, SessionStates, StreamState, Streaming, StreamingTo,
     },
     match_or_return,
     packet_processor::fec,
     prelude::*,
-    utils::PanicInDebug,
 };
 use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
 use tokio::sync::mpsc::{self, Receiver};
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::{
     DEFAULT_PORT, get_state, lock_read, lock_write,
@@ -25,28 +23,102 @@ use crate::{
         types::{ManagerToApi, ManagerToProcessor},
     },
     o_unwrap_or_return, r_unwrap_or_return,
-    utils::{ApiMessage, AppResponse, ConnectionEvent, Flags, OneShot, SendPacket},
+    utils::{ApiMessage, AppResponse, Flags, InnerConnectionEvent, OneShot, SendPacket},
 };
 
 const BUFFERING_TIME_FOR_HANDSHAKE: u64 = 7;
 
 pub async fn received_close_session_packet(packet: Box<CloseSessionPacket>) {
+    notify_and_close_session(packet.session_id).await;
+}
+
+/// Notify any active session at `session_id` that it's been closed by the
+/// peer (Streaming → flag closed; Established → `ConnectionClosed` event;
+/// Handshake → nothing actionable on our side, the handshake will time out
+/// naturally) and drop the local state.
+async fn notify_and_close_session(session_id: SessionId) {
     {
         let lock = lock_read!(get_state!().connections);
-        let session = o_unwrap_or_return!(lock.get(&packet.session_id));
+        let session = o_unwrap_or_return!(lock.get(&session_id));
         match session {
             ConnectionStates::Established(box EstablishedState {
                 state: SessionStates::Streaming(StreamState { stream, .. }),
                 ..
             }) => stream.send_modify(|m| m.closed = true),
             ConnectionStates::Established(box EstablishedState { connection, .. }) => {
-                _ = connection.send(ConnectionEvent::ConnectionClosed).await;
+                _ = connection
+                    .send(InnerConnectionEvent::ConnectionClosed)
+                    .await;
             }
             ConnectionStates::Handshake { .. } => {}
         }
     }
 
-    get_state!().close_session(packet.session_id).await;
+    get_state!().close_session(session_id).await;
+}
+
+/// Peer told us the `session_id` we used doesn't exist on their side. From
+/// our perspective there's nothing to recover — the peer won't process any
+/// more session-bound traffic from us. Treat it the same as a peer-initiated
+/// close.
+#[instrument(skip_all)]
+pub async fn received_session_does_not_exist_error(packet: Box<SessionDoesNotExistErrorPacket>) {
+    warn!(
+        "peer reports session {} does not exist on their side; closing locally",
+        packet.session_id
+    );
+    notify_and_close_session(packet.session_id).await;
+}
+
+/// Peer told us we sent an unexpected packet. This is a diagnostic — peer's
+/// session is still alive and we shouldn't tear ours down (would drop
+/// in-flight chunks / pending ops). Log enough to diagnose which packet
+/// upset them; let the session continue.
+#[instrument(skip_all)]
+pub async fn received_unexpected_packet_error(packet: Box<UnexpectedPacketErrorPacket>) {
+    warn!(
+        "peer reports unexpected packet for session {} (received_packet_type: {:?}, \
+         received_secondary_type: {:?}, fingerprint: {:?})",
+        packet.session_id,
+        packet.received_packet_type,
+        packet.received_secondary_type,
+        packet.received_fingerprint,
+    );
+}
+
+#[instrument(skip_all)]
+pub async fn received_track_reject_packet(packet: Box<TrackRejectionPacket>) {
+    warn!(
+        "peer's app rejected track request on session {}. track ID: {:?}",
+        packet.session_id, packet.payload,
+    );
+
+    let lock = lock_read!(get_state!().connections);
+    let Some(ConnectionStates::Established(box EstablishedState {
+        state: SessionStates::Streaming(StreamState { stream, .. }),
+        ..
+    })) = lock.get(&packet.session_id)
+    else {
+        return;
+    };
+
+    stream.send_modify(|m| _ = m.approved.replace(false));
+}
+
+/// Peer told us we're on an incompatible protocol version. The packet
+/// carries no `session_id` (it can be sent before any session exists), so
+/// there's nothing local to clean up here — any in-flight handshake to
+/// this peer will time out naturally. Surfacing this to the API caller of
+/// the affected handshake would need a handshake-by-addr lookup; deferred.
+#[instrument(skip_all)]
+pub async fn received_incompatible_version_error(
+    packet: Box<IncompatibleVersionPacket>,
+    src_addr: SocketAddr,
+) {
+    warn!(
+        "peer at {src_addr} reports incompatible version (peer min version: {})",
+        packet.min_version
+    );
 }
 
 pub async fn received_retransmit_request(
@@ -64,12 +136,8 @@ pub async fn received_retransmit_request(
     // PendingAckWindow and gets retried up to MAX_RETRIES times,
     // amplifying the outbound rate every TTL window.
     if packet.opts.contains(OptionFlags::RequireAck) {
-        received_packet_that_requires_ack(
-            packet.session_id,
-            packet.as_ref(),
-            outbound_sender,
-        )
-        .await;
+        received_packet_that_requires_ack(packet.session_id, packet.as_ref(), outbound_sender)
+            .await;
     }
 
     if let Some(ConnectionStates::Established(box EstablishedState {
@@ -77,8 +145,8 @@ pub async fn received_retransmit_request(
             SessionStates::Streaming(StreamState {
                 streaming:
                     Streaming::To(StreamingTo {
-                        buffer,
-                        current_batch,
+                        buffer: _,
+                        current_batch: _,
                         event,
                     }),
                 ..
@@ -95,10 +163,7 @@ pub async fn received_keep_alive_packet(packet: Box<KeepAlivePacket>) {
         .global_handle_monitor
         .dispatch(update_last_activity(packet.session_id, packet.timestamp));
     get_state!()
-        .update_address(
-            packet.session_id,
-            SocketAddr::V4(o_unwrap_or_return!(packet.address)),
-        )
+        .update_address(packet.session_id, o_unwrap_or_return!(packet.address))
         .await;
 }
 
@@ -106,13 +171,16 @@ pub async fn received_track_request_packet(packet: Box<TrackRequestPacket>) {
     get_state!()
         .global_handle_monitor
         .dispatch(update_last_activity(packet.session_id, packet.timestamp));
+
+    let session_id = packet.session_id;
     let track_id = packet.payload.take();
+
     let sender = {
         let lock = lock_read!(get_state!().connections);
         o_unwrap_or_return!({
             if let Some(ConnectionStates::Established(box EstablishedState {
                 connection, ..
-            })) = lock.get(&packet.session_id)
+            })) = lock.get(&session_id)
             {
                 Some(connection)
             } else {
@@ -121,8 +189,9 @@ pub async fn received_track_request_packet(packet: Box<TrackRequestPacket>) {
         })
         .clone()
     };
+
     _ = sender
-        .send(ConnectionEvent::TrackRequest(track_id.into()))
+        .send(InnerConnectionEvent::TrackRequest(track_id.into()))
         .await;
 }
 
@@ -188,16 +257,9 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
         .global_handle_monitor
         .dispatch(update_last_activity(packet.session_id, packet.timestamp));
 
-    // TODO: this part fails the test (commented) because the routine assumes the session ID already exists.
-    // this guarantee is hard to provide at this stage, but probably should. Right now it just
-    // gracefully exists.
-    if let ConnectionStates::Handshake { signal, .. } = o_unwrap_or_return!(
-        lock_read!(get_state!().connections).get(&packet.session_id) //.panic_in_debug(&format!(
-                                                                     //    "Invariant broken in `received_data_packet`: \
-                                                                     //    got a packet for a session that does not exist, \
-                                                                     //    this should not happen at this stage as it is handled earlier. {packet:?}"
-                                                                     //))
-    ) {
+    if let ConnectionStates::Handshake { signal, .. } =
+        o_unwrap_or_return!(lock_read!(get_state!().connections).get(&packet.session_id))
+    {
         let mut listener = signal.subscribe();
         _ = r_unwrap_or_return!(
             tokio::time::timeout(
@@ -300,7 +362,7 @@ pub async fn received_hello_packet_as_receiver(
     let (app_id_request, app_id_response) = OneShot::<_, AppResponse>::new(packet.app_id.clone());
     let (handshake_request, handshake_response) = OneShot::<
         _,
-        core::result::Result<(SessionId, Receiver<ConnectionEvent>), ConnectionError>,
+        core::result::Result<(SessionId, Receiver<InnerConnectionEvent>), ConnectionError>,
     >::new(());
     let wrapped = ApiMessage::IncommingConncetion {
         request: app_id_request,
@@ -397,7 +459,7 @@ pub async fn received_hello_packet_as_initializer(
         return;
     }
 
-    let (sender, receiver) = mpsc::channel::<ConnectionEvent>(256);
+    let (sender, receiver) = mpsc::channel::<InnerConnectionEvent>(256);
     let (secret, response) = o_unwrap_or_return!(
         get_state!()
             .promote_handshake(
@@ -470,7 +532,7 @@ pub async fn received_playback_control_packet(
     outbound_sender: ManagerToProcessor,
 ) {
     match packet.control_type {
-        new_event @ (PlaybackControlType::Done
+        _new_event @ (PlaybackControlType::Done
         | PlaybackControlType::Pause
         | PlaybackControlType::Play
         | PlaybackControlType::Seek) => {
@@ -517,28 +579,6 @@ pub async fn received_packet_that_requires_ack(
     AckPacket::new(Options::none(), session_id, fingerprint)
         .send(sender, address)
         .await;
-}
-
-pub async fn received_packet_with_invalid_session(
-    src_addr: SocketAddr,
-    sender: ManagerToProcessor,
-    session_id: SessionId,
-) {
-    let packet = Box::new(SessionDoesNotExistErrorPacket::new(
-        Options::none(),
-        session_id,
-    ));
-
-    if src_addr.port() != DEFAULT_PORT {
-        let mut alternative_address = src_addr;
-        alternative_address.set_port(DEFAULT_PORT);
-        packet
-            .clone()
-            .send(sender.clone(), alternative_address)
-            .await;
-    }
-
-    packet.send(sender, src_addr).await;
 }
 
 /// Routine to handle an incompatible version error, occuring during deserialization.

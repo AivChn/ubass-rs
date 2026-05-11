@@ -1,11 +1,10 @@
-use std::sync::{Arc, atomic::Ordering};
+use std::sync::Arc;
 
 use crate::{
     get_state,
     manager::{
-        STATE, outbound,
+        STATE,
         routines::endpoints,
-        state,
         types::{ManagerFromApi, ManagerToProcessor},
     },
     prelude::*,
@@ -23,7 +22,7 @@ pub async fn init(
             None => {
                 return Err(ChannelError::ChannelClosed(Outbound, Layer::Manager).into());
             }
-            Some(ApiCommand::RequestData(one_shot)) => {
+            Some(ApiCommand::RequestTrack(one_shot)) => {
                 monitor.dispatch(endpoints::request_track(
                     one_shot,
                     manager_to_processor.clone(),
@@ -78,6 +77,14 @@ pub async fn init(
                 response,
             })) => {
                 monitor.dispatch(endpoints::find_holes(session_id, response));
+            }
+
+            Some(ApiCommand::RejectTrackRequest(session_id, track_id)) => {
+                monitor.dispatch(endpoints::reject_track_request(
+                    session_id,
+                    track_id,
+                    manager_to_processor.clone(),
+                ));
             }
         }
     }
