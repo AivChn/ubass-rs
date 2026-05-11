@@ -1,22 +1,21 @@
-use std::error;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::sync::Arc;
 
 use crate::prelude::*;
 use crate::transport::types::InboundSender;
-use socket2::{Domain, Protocol, SockAddrStorage, Socket, Type};
 
 use tokio::net::UdpSocket;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, instrument, warn};
 
 use super::send_to_processing_layer;
 use super::types::{MAX_PACKET_SIZE, ReceivedPacket};
 
 const MAX_ALLOWED_FAILS: u32 = 10;
 
+#[instrument(skip_all)]
 pub async fn init(socket: Arc<UdpSocket>, sender: InboundSender) -> ErrResult {
     let mut fail_count = 0u32;
 
+    debug!("listening...");
     loop {
         let mut buffer = vec![0u8; MAX_PACKET_SIZE];
 
@@ -36,6 +35,9 @@ pub async fn init(socket: Arc<UdpSocket>, sender: InboundSender) -> ErrResult {
             }
         };
 
+        #[cfg(test)]
+        debug!("got packet from {} size {}", addr, buffer.len());
+
         let packet = ReceivedPacket {
             src_addr: addr,
             data: buffer,
@@ -52,22 +54,16 @@ pub async fn init(socket: Arc<UdpSocket>, sender: InboundSender) -> ErrResult {
 #[allow(clippy::unwrap_used)]
 #[cfg(test)]
 mod test {
-    use std::{
-        net::SocketAddrV4,
-        sync::{Arc, atomic::AtomicU16},
-        time::Duration,
-    };
+    use std::sync::{Arc, atomic::AtomicU16};
 
-    use aes_gcm_siv::aead::generic_array::typenum::type_operators;
     use tokio::{net::UdpSocket, task::JoinHandle};
 
     use crate::{
-        DEFAULT_PORT,
         error::{ChannelError, ErrResult, Error},
         packet_processor::types::InboundReceiver,
         transport::{
             bind_listen_socket, inbound,
-            types::{InboundSender, OutboundReceiver, ReceivedPacket},
+            types::{InboundSender, ReceivedPacket},
         },
         utils::PacketProcessingMessage,
     };

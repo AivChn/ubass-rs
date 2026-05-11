@@ -1,20 +1,14 @@
 use std::{
-    any::Any,
-    fmt::{Debug, format},
+    fmt::Debug,
     net::SocketAddr,
-    ops::Deref,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
 };
 
 use async_trait::async_trait;
-use tokio::{
-    sync::{Mutex, Notify, RwLock},
-    task::JoinHandle,
-};
+use tokio::sync::{Notify, RwLock};
 
 pub mod messages;
 

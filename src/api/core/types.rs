@@ -1,24 +1,21 @@
 use crate::{
     api::{
-        self, Api, SendTarget, StreamTrait,
-        types::{ApprovalStatus, ReadableBuffer, WriteableBuffer},
+        self, SendTarget, StreamTrait,
+        types::{ReadableBuffer, WriteableBuffer},
     },
     error::{
-        ChannelError, ConnectionError, EmptyResult, Error as ProtoError, PacketProcessingError,
-        TaskError, TransportError,
+        ConnectionError, EmptyResult, Error as ProtoError, PacketProcessingError, TaskError,
+        TransportError,
     },
     manager::{
-        self, AppId, endpoints,
-        packets::{
-            BytePosition, MAX_PAYLOAD_LENGTH, PacketFingerprint, PayloadField, PlaybackControlType,
-            SessionId,
-        },
+        AppId, endpoints,
+        packets::{MAX_PAYLOAD_LENGTH, SessionId},
     },
     o_unwrap_or_return,
     prelude::{ApiCommand, ApiErrors, ApiMessage, AppResponse},
     utils::{
         InnerConnectionEvent, OneShot, PanicInDebug, PlaybackControl, RequestDataRequest,
-        ResponseReceiver, SendDataRequest, StreamMessage, not,
+        ResponseReceiver, SendDataRequest, StreamMessage,
     },
 };
 use core::result::Result;
@@ -31,14 +28,10 @@ use std::{
     thread::JoinHandle,
 };
 
-use aes_gcm_siv::Error;
-use tokio::{
-    runtime::Runtime,
-    sync::{
-        Mutex,
-        mpsc::{self, Receiver, Sender},
-        oneshot, watch,
-    },
+use tokio::sync::{
+    Mutex,
+    mpsc::{self, Receiver, Sender},
+    oneshot, watch,
 };
 
 const CHANNEL_BUFFER_SIZE: usize = 256;
@@ -59,7 +52,7 @@ pub struct ApiInner {
 impl Drop for ApiInner {
     fn drop(&mut self) {
         let tx = self.api_to_manager.clone();
-        _ = std::thread::spawn(move || tx.blocking_send(ApiCommand::Close)).join();
+        _ = std::thread::spawn(move || _ = tx.blocking_send(ApiCommand::Close)).join();
         if let Some(handle) = self.manager_handle.take() {
             _ = handle.join();
         }
@@ -93,7 +86,7 @@ impl ApiInner {
     pub fn close(mut self) -> Result<(), ApiErrors> {
         let sender = self.api_to_manager.clone();
         // blocking_send panics from within a tokio runtime — spawn a plain OS thread to avoid that
-        _ = std::thread::spawn(move || sender.blocking_send(ApiCommand::Close)).join();
+        _ = std::thread::spawn(move || _ = sender.blocking_send(ApiCommand::Close)).join();
         if let Some(handle) = self.manager_handle.take() {
             match handle.join() {
                 Ok(res) => res?,
@@ -490,7 +483,7 @@ impl Drop for Connection {
         let api: Arc<ApiInner> = o_unwrap_or_return!(self.api.upgrade());
         let session_id = self.session_id;
         let tx = api.api_to_manager.clone();
-        _ = std::thread::spawn(move || tx.blocking_send(ApiCommand::CloseSession(session_id)))
+        _ = std::thread::spawn(move || _ = tx.blocking_send(ApiCommand::CloseSession(session_id)))
             .join();
     }
 }
@@ -520,18 +513,11 @@ impl api::types::Connection for Connection {
         };
 
         let event = match inner {
-            InnerConnectionEvent::TrackRequest {
-                track_id,
-                fingerprint,
-            } => {
+            InnerConnectionEvent::TrackRequest(track_id) => {
                 let api = self.api.clone();
                 let session_id = self.session_id;
                 ConnectionEvent::TrackRequested(RequestedStream::new_output(
-                    api,
-                    session_id,
-                    track_id,
-                    fingerprint,
-                    self,
+                    api, session_id, track_id, self,
                 ))
             }
             InnerConnectionEvent::ProtocolClosed => ConnectionEvent::ProtocolClosed,
@@ -584,7 +570,7 @@ impl api::types::Connection for Connection {
 
         let buffer = buffer.into();
         let buffer_len = buffer.len();
-        let length = buffer.len();
+        let _length = buffer.len();
         let (sender, receiver) = watch::channel(StreamMessage::default());
 
         let response = api
@@ -597,7 +583,7 @@ impl api::types::Connection for Connection {
             .await;
 
         match response.recv().await {
-            Ok(Ok(s)) => Ok(PendingStream::new_input(
+            Ok(Ok(_s)) => Ok(PendingStream::new_input(
                 self.api.clone(),
                 self.session_id,
                 buffer_len,
@@ -635,7 +621,7 @@ impl api::types::Connection for Connection {
 pub struct Stream<Direction: api::types::StreamDirection> {
     api: Weak<ApiInner>,
     session: SessionId,
-    stream_size: usize,
+    size: usize,
     connection: Connection,
     allow_partial: bool,
     update: watch::Receiver<StreamMessage>,
@@ -650,13 +636,13 @@ impl<Direction: api::types::StreamDirection> Stream<Direction> {
         api: Weak<ApiInner>,
         session_id: SessionId,
         connection: Connection,
-        stream_size: usize,
+        size: usize,
         receiver: watch::Receiver<StreamMessage>,
     ) -> Self {
         Self {
             api,
             session: session_id,
-            stream_size,
+            size,
             connection,
             allow_partial: false,
             update: receiver,
@@ -727,7 +713,7 @@ impl api::types::Stream for Stream<api::types::Input> {
     }
 
     async fn is_done(&self) -> bool {
-        self.update.borrow().head == self.stream_size || self.update.borrow().closed
+        self.update.borrow().head == self.size || self.update.borrow().closed
     }
 
     async fn complete(mut self) -> Result<Self::Connection, Self::Error> {
@@ -764,7 +750,7 @@ impl api::types::Stream for Stream<api::types::Output> {
     }
 
     async fn is_done(&self) -> bool {
-        self.update.borrow().head == self.stream_size
+        self.update.borrow().head == self.size
     }
 
     async fn complete(mut self) -> Result<Self::Connection, Self::Error> {
@@ -804,7 +790,6 @@ pub struct RequestedStream<Direction: api::types::StreamDirection> {
     api: Weak<ApiInner>,
     session: SessionId,
     track_id: Box<[u8]>,
-    fingerprint: PacketFingerprint,
     connection: Connection,
     _marker: PhantomData<Direction>,
 }
@@ -814,14 +799,12 @@ impl RequestedStream<api::types::Output> {
         api: Weak<ApiInner>,
         session: SessionId,
         track_id: Box<[u8]>,
-        fingerprint: PacketFingerprint,
         connection: Connection,
     ) -> Self {
         Self {
             api,
             session,
             track_id,
-            fingerprint,
             connection,
             _marker: PhantomData,
         }
@@ -875,6 +858,7 @@ impl api::types::RequestedStream for RequestedStream<api::types::Output> {
 // `RequestedStream<Input>` (peer offers data, we receive) is not yet
 // implemented in the protocol — kept as a typestate placeholder for when
 // that flow is wired.
+#[allow(clippy::todo)]
 impl api::types::RequestedStream for RequestedStream<api::types::Input> {
     type Stream = Stream<api::types::Input>;
     type Error = ConnectionError;
@@ -952,7 +936,7 @@ impl api::types::PendingStream for PendingStream<api::types::Input> {
     }
 
     async fn discard(self) -> Result<Connection, (Self::Error, Connection)> {
-        let Some(api) = self.api.upgrade() else {
+        let Some(_api) = self.api.upgrade() else {
             return Err((ConnectionError::ProtocolClosed, self.connection));
         };
         let stream = self.ready().await?;
@@ -964,6 +948,7 @@ impl api::types::PendingStream for PendingStream<api::types::Input> {
 // (`Connection::send` already returns the live OutputStream synchronously
 // since there's no per-stream peer-approval step on the sender side).
 // Kept as a typestate placeholder for symmetry.
+#[allow(clippy::todo)]
 impl api::types::PendingStream for PendingStream<api::types::Output> {
     type Stream = Stream<api::types::Output>;
     type Error = ConnectionError;

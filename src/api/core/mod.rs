@@ -8,19 +8,14 @@ pub use types::{
 };
 
 use crate::{
-    api::{
-        ReadableBuffer,
-        core::types::{ApiInner, InnerAppEvent},
-    },
+    api::core::types::{ApiInner, InnerAppEvent},
     error::ApiErrors,
-    manager::packets::SessionId,
 };
 
 use std::sync::Arc;
 
 use crate::{DEFAULT_PORT, manager::AppId};
 
-use crate::utils::SendTarget;
 
 pub struct Api {
     inner: Arc<ApiInner>,
@@ -32,7 +27,7 @@ impl Api {
     /// - `InvalidAppId` if the app ID is longer than [`MAX_PAYLOAD_LENGTH`] or not valid ASCII
     /// - `InvalidPort` if the port is 1024 or lower
     /// - `AlreadyOpen` if the protocol is already open
-    pub async fn open(app_id: impl Into<String>, port: Option<u16>) -> Result<Self, ApiErrors> {
+    pub fn open(app_id: impl Into<String>, port: Option<u16>) -> Result<Self, ApiErrors> {
         let app_id = app_id.into();
         let port = match port {
             Some(0..=1024) => return Err(ApiErrors::InvalidPort),

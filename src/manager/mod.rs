@@ -6,7 +6,7 @@ mod routines;
 pub mod state;
 pub mod types;
 
-use std::sync::{OnceLock, atomic::Ordering, mpsc as std_mpsc};
+use std::sync::OnceLock;
 
 use crate::{
     lock_read,
@@ -21,7 +21,6 @@ use crate::{
 };
 
 use tokio::{
-    runtime::Builder as RuntimeBuilder,
     sync::{mpsc, oneshot},
     task::JoinHandle,
     time::Instant,
@@ -29,6 +28,7 @@ use tokio::{
 
 pub use routines::endpoints;
 pub use state::{AppId, EncryptionMonitor, FingerprintMonitor, PendingAckMonitor};
+use tracing::{debug, info};
 use types::*;
 
 /// random number, might change
@@ -71,6 +71,7 @@ pub async fn init(
     manager_to_api: ManagerToApi,
     manager_from_api: ManagerFromApi,
 ) -> core::result::Result<(), ApiErrors> {
+    info!("launching protocol on app {app_id} with port {port}");
     // try to create receiving socket
     std::net::UdpSocket::bind(format!("0.0.0.0:{port}"))
         .map_err(|_| ApiErrors::PortAlreadyInUse(port))?;
@@ -100,6 +101,8 @@ pub async fn init(
     get_state!()
         .set_handles(transport_handle, processor_handle)
         .await;
+
+    debug!("state fully set");
 
     let mut inbound_handle = tokio::spawn(inbound::init(
         manager_from_processor,

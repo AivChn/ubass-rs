@@ -1,23 +1,21 @@
-use std::default;
+use std::net::SocketAddr;
 use std::range::Range;
-use std::{fmt::Display, net::SocketAddr};
 
 use crate::api::{ReadableBuffer, WriteableBuffer};
 use crate::error::ApiErrors;
 use crate::manager::packets::{
-    BytePosition, ByteRange, Options, PacketFingerprint, PlaybackControlPacket, PlaybackControlType,
+    BytePosition, ByteRange, PlaybackControlPacket, PlaybackControlType,
 };
 
-use derive_more::{Display, derive};
+use derive_more::Display;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{oneshot, watch};
 
 use crate::manager::AppId;
-use crate::packet_processor::fec::Recovered;
 use crate::prelude::*;
 use crate::{
-    manager::packets::{BatchID, PacketWrapper, PayloadField, SessionId},
-    packet_processor::{fec::RecoverdPacket, types::ProcessedPacket},
+    manager::packets::{PacketWrapper, SessionId},
+    packet_processor::types::ProcessedPacket,
     transport::types::ReceivedPacket,
 };
 
@@ -77,10 +75,7 @@ pub enum ApiMessage {
 /// `RequestedStream<Output>` so the app gets a typed accept/reject handle.
 #[derive(Debug)]
 pub enum InnerConnectionEvent {
-    TrackRequest {
-        track_id: Box<[u8]>,
-        fingerprint: PacketFingerprint,
-    },
+    TrackRequest(Box<[u8]>),
     ProtocolClosed,
     ConnectionClosed,
 }
@@ -179,7 +174,6 @@ impl<Req: Send> OneShot<Req, core::result::Result<(), ApiErrors>> {
 }
 
 pub enum ManagerMessage {
-    Recovered(Recovered),
     Packet(PacketWrapper),
     Closed,
 }
@@ -191,7 +185,6 @@ pub struct CouldNotRecover;
 pub enum PacketProcessingMessage {
     SendPacket(PacketWrapper),
     ReceivedPacket(ReceivedPacket),
-    Recover(OneShot<(SessionId, BatchID), core::result::Result<Recovered, CouldNotRecover>>),
     Close,
     Closed,
 }

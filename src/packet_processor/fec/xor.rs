@@ -94,11 +94,10 @@ impl InboundBatchData {
             let pkt_byte_pos =
                 BytePosition(<u32>::deserialize(&data.data.0[..4]).expect("Exact size"));
             #[allow(clippy::cast_possible_truncation)]
-            let derived_base = BytePosition(
-                pkt_byte_pos
-                    .0
-                    .saturating_sub(u32::from(data.fec_info.batch_pos) * MAX_PAYLOAD_LENGTH as u32),
-            );
+            let derived_base =
+                BytePosition(pkt_byte_pos.0.saturating_sub(
+                    u32::from(data.fec_info.batch_pos) * MAX_PAYLOAD_LENGTH as u32,
+                ));
             match self.base_byte_pos {
                 None => self.base_byte_pos = Some(derived_base),
                 Some(existing) if existing.0 != derived_base.0 => {
@@ -189,7 +188,7 @@ impl OutboundBatchData {
     }
 
     /// Adds another packet to the prodcut.
-    /// If this packet completes the batch (current_size hits batch_size for the
+    /// If this packet completes the batch (`current_size` hits `batch_size` for the
     /// first time), returns `true`; on subsequent over-fills returns `false` so
     /// only a single caller proceeds to remove the batch from the outbound map.
     fn add(&mut self, data: FECData) -> bool {

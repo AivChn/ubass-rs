@@ -2,9 +2,8 @@ use std::{io, net::SocketAddr};
 
 use crate::{
     api::IncomingConnection,
-    error,
     manager::{
-        packets::{BatchID, MAX_PAYLOAD_LENGTH, SessionId, Version},
+        packets::Version,
         state::{ConnectionStates, EstablishedState, SessionStates, StreamState, Streaming},
     },
 };
@@ -40,6 +39,8 @@ pub enum ApiErrors {
     ProtocolClosed,
     #[error("Buffer exceeds MAX_PAYLOAD_LENGTH")]
     BufferTooLarge,
+    #[error("Internal protocol error")]
+    Internal,
 }
 
 // this is a comment
@@ -192,20 +193,10 @@ impl From<ChannelError> for Error {
     }
 }
 
-/// Errors that can occur during packet processing operations.
-/// Covers deserialization failures, version incompatibilities, and internal errors.
 #[derive(Debug, thiserror::Error)]
 pub enum PacketProcessingError {
     #[error("Received a packet with an incompatible version ({0}) from {1}")]
     IncompatibleVersion(Version, SocketAddr),
-    #[error("Got a packet with an impossible header size {0} from {1}")]
-    WrongHeaderSize(usize, SocketAddr),
-    #[error("Got a packe with an invalid packet type header ({0}")]
-    InvalidPacketTypeHeader(u8),
-    #[error("Faild to deserialize a packet")]
-    FailedToDeserialize,
-    #[error("Session does not exist on this host")]
-    SessionDoesNotExist(SessionId, SocketAddr),
 }
 
 impl From<PacketProcessingError> for Error {

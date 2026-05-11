@@ -9,9 +9,7 @@ pub mod types;
 
 use crate::{
     manager::{EncryptionMonitor, FingerprintMonitor, PendingAckMonitor},
-    packet_processor::types::{
-        InboundReceiver, InboundSender, OutboundReceiver, OutboundSender, PacketProcessorChannels,
-    },
+    packet_processor::types::PacketProcessorChannels,
     prelude::*,
 };
 

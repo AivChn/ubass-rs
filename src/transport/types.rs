@@ -4,7 +4,7 @@ use crate::{
 };
 use std::{
     fmt::Debug,
-    net::{SocketAddr, SocketAddrV4},
+    net::SocketAddr,
     sync::Arc,
 };
 use tokio::net::UdpSocket;
