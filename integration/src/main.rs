@@ -64,6 +64,8 @@ impl Display for Test {
                 Test::Seek => "seek_test",
                 Test::PausePlay => "pause_play",
                 Test::AudioDataPlayback => "audio_data_playback",
+                Test::PauseAfterBufferDone => "pause_after_buffer_done",
+                Test::TrackRequestRejected => "track_request_rejected",
             }
         )
     }
@@ -79,6 +81,8 @@ enum Test {
     Seek,
     PausePlay,
     AudioDataPlayback,
+    PauseAfterBufferDone,
+    TrackRequestRejected,
 }
 
 #[derive(Parser)]
@@ -159,14 +163,17 @@ async fn exec_client_test(test: Test, port: u16, app_id: String, server_addr: So
         }
 
         Test::ConnectionRefused => connection_refused_client(port, app_id, server_addr).await,
+
         Test::BigBuffer => {
             let data = fs::read("/home/aiv/dev/ubass-rs/tests/very_big_data.txt").unwrap();
             general_send_client(port, app_id, server_addr, data).await;
         }
+
         Test::AudioData => {
             let data = fs::read("/home/aiv/dev/ubass-rs/tests/song.flac").unwrap();
             general_send_client(port, app_id, server_addr, data).await;
         }
+
         Test::Seek => {
             let data = fs::read("/home/aiv/dev/ubass-rs/tests/very_big_data2.txt").unwrap();
             client(port, app_id, server_addr, playback_seek_client(data)).await;
@@ -176,16 +183,32 @@ async fn exec_client_test(test: Test, port: u16, app_id: String, server_addr: So
             let data = fs::read("/home/aiv/dev/ubass-rs/tests/very_big_data2.txt").unwrap();
             client(port, app_id, server_addr, pause_play_test(data)).await;
         }
+
         Test::AudioDataPlayback => {
             let data = fs::read("/home/aiv/dev/ubass-rs/tests/song.flac").unwrap();
             client(port, app_id, server_addr, audio_data_test(data)).await;
+        }
+
+        Test::PauseAfterBufferDone => {
+            let data = LOREM_IPSUM.to_string().into_bytes();
+            client(
+                port,
+                app_id,
+                server_addr,
+                pause_after_buffer_done_client(data),
+            )
+            .await;
+        }
+
+        Test::TrackRequestRejected => {
+            client(port, app_id, server_addr, track_rejected_client()).await;
         }
     }
 }
 
 async fn exec_server_test(test: Test, port: u16, app_id: String) {
     match test {
-        Test::Echo => general_send_server(port, app_id, None).await,
+        Test::Echo | Test::PauseAfterBufferDone => general_send_server(port, app_id, None).await,
         Test::TwoPackets => {
             general_send_server(
                 port,
@@ -213,6 +236,7 @@ async fn exec_server_test(test: Test, port: u16, app_id: String) {
             let data = fs::read("/home/aiv/dev/ubass-rs/tests/very_big_data2.txt").unwrap();
             general_send_server(port, app_id, Some(data.into())).await;
         }
+        Test::TrackRequestRejected => server(port, app_id, track_rejected_server()).await,
     }
 }
 

@@ -3,9 +3,78 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, info};
 use ubass::{
-    api::{Connection, ConnectionTrait, PendingStreamTrait, PlaybackControl, StreamTrait},
+    api::{
+        Connection, ConnectionEvent, ConnectionTrait, PendingStreamTrait, PlaybackControl,
+        RequestedStreamTrait, StreamTrait,
+    },
+    error::ConnectionError,
     prelude::packets::MAX_PAYLOAD_LENGTH,
 };
+
+pub fn track_rejected_client() -> impl AsyncFnOnce(Connection) {
+    async move |connection| {
+        debug!("trying to request stream with {}", connection.session_id());
+
+        let buffer = vec![0u8; 1];
+        let buffer = Box::into_raw(buffer.into());
+        let id = b"The answer to everything".to_vec();
+        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            pending
+                .ready()
+                .await
+                .is_err_and(|e| matches!(e.0, ConnectionError::PeerRejected(_)))
+        );
+    }
+}
+
+pub fn track_rejected_server() -> impl AsyncFnOnce(Connection) {
+    async move |connection| {
+        let event = connection.listen().await.unwrap();
+        let ConnectionEvent::TrackRequested(request) = event else {
+            panic!("wrong event!");
+        };
+
+        assert!(request.reject().await.is_ok());
+    }
+}
+
+pub fn pause_after_buffer_done_client(message: Vec<u8>) -> impl AsyncFnOnce(Connection) {
+    async move |connection: Connection| {
+        debug!("trying to request stream with {}", connection.session_id());
+
+        let buffer = vec![0u8; message.len()];
+        let buffer = Box::into_raw(buffer.into());
+        let mut id = message.clone();
+        id.truncate(MAX_PAYLOAD_LENGTH);
+        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer))
+            .await
+            .unwrap()
+            .unwrap();
+        let stream = pending.ready().await.map_err(|(e, _)| e).unwrap();
+
+        while !stream.is_done().await {}
+
+        assert!(stream.pause().await.is_ok());
+        assert!(stream.play().await.is_ok());
+
+        debug!("waiting for stream to complete");
+        _ = timeout(Duration::from_secs(10), stream.complete())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let buffer = unsafe { Box::from_raw(buffer).to_vec() };
+        assert_eq!(buffer, message.clone());
+        let buffer_rep = str::from_utf8(&buffer).unwrap_or("FAILED PARSING");
+        let message_rep = str::from_utf8(&buffer).unwrap_or("FAILED PARSING");
+        info!("test passed! {buffer_rep} == {message_rep}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 
 pub fn playback_seek_client(message: Vec<u8>) -> impl AsyncFnOnce(Connection) {
     async move |connection: Connection| {

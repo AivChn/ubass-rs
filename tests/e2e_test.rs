@@ -350,6 +350,86 @@ mod tests {
 
     #[ignore = "requires single threaded"]
     #[test]
+    fn pause_after_buffer_done() {
+        let client_port = free_port();
+        let server_port = free_port();
+        let server_address = format!("127.0.0.1:{server_port}");
+
+        let mut server = KillOnDrop::spawn(
+            std::process::Command::new(BIN_PATH).args(prep_server_args(
+                "pause-after-buffer-done",
+                &server_port.to_string(),
+            )),
+            "server",
+        );
+
+        // give the server time to bind and start listening
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut client = KillOnDrop::spawn(
+            std::process::Command::new(BIN_PATH).args(prep_client_args(
+                &client_port.to_string(),
+                "pause-after-buffer-done",
+                &server_address,
+            )),
+            "client",
+        );
+
+        let client_status = wait_timeout(&mut client, TIMEOUT).expect("client timed out");
+        let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
+
+        assert!(
+            client_status.success(),
+            "client exited with: {client_status}"
+        );
+        assert!(
+            server_status.success(),
+            "server exited with: {server_status}"
+        );
+    }
+
+    #[ignore = "requires single threaded"]
+    #[test]
+    fn track_request_rejected() {
+        let client_port = free_port();
+        let server_port = free_port();
+        let server_address = format!("127.0.0.1:{server_port}");
+
+        let mut server = KillOnDrop::spawn(
+            std::process::Command::new(BIN_PATH).args(prep_server_args(
+                "track-request-rejected",
+                &server_port.to_string(),
+            )),
+            "server",
+        );
+
+        // give the server time to bind and start listening
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut client = KillOnDrop::spawn(
+            std::process::Command::new(BIN_PATH).args(prep_client_args(
+                &client_port.to_string(),
+                "track-request-rejected",
+                &server_address,
+            )),
+            "client",
+        );
+
+        let client_status = wait_timeout(&mut client, TIMEOUT).expect("client timed out");
+        let server_status = wait_timeout(&mut server, TIMEOUT).expect("server timed out");
+
+        assert!(
+            client_status.success(),
+            "client exited with: {client_status}"
+        );
+        assert!(
+            server_status.success(),
+            "server exited with: {server_status}"
+        );
+    }
+
+    #[ignore = "requires single threaded"]
+    #[test]
     fn pause_play() {
         let client_port = free_port();
         let server_port = free_port();
