@@ -1,6 +1,6 @@
 #![allow(async_fn_in_trait)]
 #![allow(clippy::len_without_is_empty)]
-use std::{cmp::Ordering, fmt::Debug, ops::Range, ptr, slice::SliceIndex};
+use std::{cmp::Ordering, fmt::Debug, ops::Range, slice::SliceIndex};
 
 use tracing::debug;
 
@@ -95,7 +95,10 @@ impl From<&[u8]> for WriteableBuffer {
             buffer: Buffer::new(std::ptr::from_ref(value).cast_mut()),
             head: BytePosition(0),
             map: vec![false; num_chunks],
-            invalid_areas: vec![Area(Range { start: 0, end: num_chunks })],
+            invalid_areas: vec![Area(Range {
+                start: 0,
+                end: num_chunks,
+            })],
         }
     }
 }
@@ -112,7 +115,10 @@ where
             buffer: Buffer::new(value),
             head: BytePosition(0),
             map: vec![false; num_chunks],
-            invalid_areas: vec![Area(Range { start: 0, end: num_chunks })],
+            invalid_areas: vec![Area(Range {
+                start: 0,
+                end: num_chunks,
+            })],
         }
     }
 }
@@ -205,7 +211,10 @@ impl WriteableBuffer {
         debug!("occupied position {i}");
 
         if let Some(pos) = self.invalid_areas.iter().position(|a| a.0.contains(&i)) {
-            let (start, end) = (self.invalid_areas[pos].0.start, self.invalid_areas[pos].0.end);
+            let (start, end) = (
+                self.invalid_areas[pos].0.start,
+                self.invalid_areas[pos].0.end,
+            );
 
             if start == i {
                 if end == i + 1 {
@@ -407,35 +416,77 @@ impl ReadableBuffer {
     }
 }
 
-pub trait PendingStream {
+/// Sealed marker trait carrying the direction of a stream — receiver-side
+/// (`Input`) or sender-side (`Output`). Used to parametrize `Stream`,
+/// `RequestedStream`, and `PendingStream` so the same struct shape works
+/// in either role and direction-specific behavior can be specialized via
+/// trait impls (`impl Stream for Stream<Input>`, etc.).
+pub trait StreamDirection: stream_direction_sealed::Sealed {}
+
+mod stream_direction_sealed {
+    pub trait Sealed {}
+}
+
+#[derive(Debug)]
+pub struct Input;
+#[derive(Debug)]
+pub struct Output;
+impl stream_direction_sealed::Sealed for Input {}
+impl stream_direction_sealed::Sealed for Output {}
+impl StreamDirection for Input {}
+impl StreamDirection for Output {}
+
+pub trait PendingStream: Sized {
     type Stream: Stream;
     type Error: std::error::Error;
     type OwningConnection: Connection;
 
     async fn ready(
         self,
-        connection: Self::OwningConnection,
     ) -> core::result::Result<Self::Stream, (Self::Error, Self::OwningConnection)>;
-    async fn discard(self) -> core::result::Result<(), Self::Error>;
+    async fn discard(
+        self,
+    ) -> core::result::Result<Self::OwningConnection, (Self::Error, Self::OwningConnection)>;
+}
+
+pub enum ApprovalStatus<A, S> {
+    Approved(A),
+    Rejected(S),
 }
 
 pub trait RequestedStream: Sized {
     type Stream: Stream;
     type Error: std::error::Error;
     type OwningConnection: Connection;
+    type ApprovalBuffer;
 
     fn track_id(&self) -> &[u8];
-    async fn reject(self, reason: impl Into<String>) -> Result<(), Self>;
+
+    async fn reject(self) -> core::result::Result<Self::OwningConnection, Self::Error>;
     async fn approve_and_ready(
         self,
-        connection: Self::OwningConnection,
+        buffer: impl Into<Self::ApprovalBuffer>,
     ) -> core::result::Result<Self::Stream, (Self::Error, Self::OwningConnection)>;
+
     async fn approve_if_and_ready(
         self,
         f: impl FnOnce(&[u8]) -> bool,
-        reject_reason: impl Into<String>,
-        connection: Self::OwningConnection,
-    ) -> Option<core::result::Result<Self::Stream, (Self::Error, Self::OwningConnection)>>;
+        buffer: impl Into<Self::ApprovalBuffer>,
+    ) -> ApprovalStatus<
+        Result<Self::Stream, (Self::Error, Self::OwningConnection)>,
+        Result<Self::OwningConnection, Self::Error>,
+    >
+    where
+        Self: Sized,
+    {
+        {
+            if f(self.track_id()) {
+                ApprovalStatus::Approved(self.approve_and_ready(buffer).await)
+            } else {
+                ApprovalStatus::Rejected(self.reject().await)
+            }
+        }
+    }
 }
 
 pub trait Stream {
@@ -447,7 +498,7 @@ pub trait Stream {
     fn is_playing(&self) -> bool;
     async fn is_done(&self) -> bool;
     async fn complete(self) -> Result<Self::Connection, Self::Error>;
-    async fn close(self) -> Result<Self::Connection, Self::Error>;
+    async fn close(self) -> Result<Self::Connection, (Self::Error, Self::Connection)>;
 }
 
 pub trait PlaybackControl: Stream {
@@ -478,22 +529,28 @@ pub trait PendingConnection {
     async fn discard(self) -> core::result::Result<(), Self::Error>;
 }
 
-pub trait Connection {
+pub trait Connection: Sized {
+    /// Event yielded by `listen`. Listen consumes the connection because
+    /// some events (e.g. `TrackRequested`) wrap a `RequestedStream` that
+    /// owns the connection; terminal events (closed) drop it.
     type Event;
     type Error: std::error::Error;
     type InputStream: Stream;
     type OutputStream: Stream;
+    /// Pending input stream returned by `request` — owns the connection
+    /// until `ready()` finalizes into an `InputStream`.
+    type PendingInputStream: PendingStream<Stream = Self::InputStream, OwningConnection = Self>;
 
-    async fn listen(&mut self) -> core::result::Result<Self::Event, Self::Error>;
+    async fn listen(self) -> core::result::Result<Self::Event, Self::Error>;
     async fn send(
         self,
         buffer: impl Into<ReadableBuffer>,
-    ) -> core::result::Result<Self::OutputStream, Self::Error>;
+    ) -> core::result::Result<Self::OutputStream, (Self::Error, Self)>;
     async fn request(
         self,
         identifier: impl Into<Box<[u8]>>,
         buffer: impl Into<WriteableBuffer>,
-    ) -> core::result::Result<Self::InputStream, Self::Error>;
+    ) -> core::result::Result<Self::PendingInputStream, (Self::Error, Self)>;
     async fn close(self);
 }
 
@@ -507,7 +564,7 @@ mod tests {
     fn make_buf(num_chunks: usize) -> WriteableBuffer {
         let len = (num_chunks - 1) * MAX_PAYLOAD_LENGTH + 1;
         let leaked: &'static mut [u8] = vec![0u8; len].leak();
-        WriteableBuffer::from(leaked as *mut [u8])
+        WriteableBuffer::from(std::ptr::from_mut(leaked))
     }
 
     #[allow(clippy::cast_possible_truncation)]
@@ -516,11 +573,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn fresh_buffer_scores_zero() {
         // One area covering the whole buffer, nothing valid past it → confidence 0.
         let buf = make_buf(8);
         let scores = buf.score_areas();
         assert_eq!(scores.len(), 1);
+        // float_cmp allowed here because the score is expected to be exactly 0
         assert_eq!(scores[0].1, 0.0);
     }
 
@@ -579,13 +638,16 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)]
     fn before_head_score_zero_until_data_arrives_past() {
         // Forward-seek to chunk 10 in a 20-chunk buffer; nothing past head is
         // filled yet → confidence 0 → score 0, even though urgency is capped at 0.9.
         let mut buf = make_buf(20);
+        #[allow(clippy::cast_possible_truncation)] // 10 * MAX_PAYLOAD_LENGTH = 13840 < u32::MAX
         buf.seek_head(BytePosition((10 * MAX_PAYLOAD_LENGTH) as u32));
         let scores = buf.score_areas();
         assert_eq!(scores.len(), 1);
+        // float_cmp allowed here because the score is expected to be exactly 0
         assert_eq!(scores[0].1, 0.0);
 
         // Now fill a couple of chunks past head. Before-head area's score
