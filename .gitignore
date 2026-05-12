@@ -15,3 +15,4 @@ target/
 /test
 /tests/song.flac
 /tests/logs
+/summary.md
