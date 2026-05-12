@@ -66,6 +66,7 @@ impl Display for Test {
                 Test::AudioDataPlayback => "audio_data_playback",
                 Test::PauseAfterBufferDone => "pause_after_buffer_done",
                 Test::TrackRequestRejected => "track_request_rejected",
+                Test::MultiStream => "multi_stream",
             }
         )
     }
@@ -83,6 +84,7 @@ enum Test {
     AudioDataPlayback,
     PauseAfterBufferDone,
     TrackRequestRejected,
+    MultiStream,
 }
 
 #[derive(Parser)]
@@ -203,6 +205,17 @@ async fn exec_client_test(test: Test, port: u16, app_id: String, server_addr: So
         Test::TrackRequestRejected => {
             client(port, app_id, server_addr, track_rejected_client()).await;
         }
+
+        Test::MultiStream => {
+            let data = fs::read("/home/aiv/dev/ubass-rs/tests/very_big_data2.txt").unwrap();
+            client(
+                port,
+                app_id,
+                server_addr,
+                multi_stream_client(LOREM_IPSUM.to_string().into_bytes(), data.clone(), data),
+            )
+            .await;
+        }
     }
 }
 
@@ -237,6 +250,15 @@ async fn exec_server_test(test: Test, port: u16, app_id: String) {
             general_send_server(port, app_id, Some(data.into())).await;
         }
         Test::TrackRequestRejected => server(port, app_id, track_rejected_server()).await,
+        Test::MultiStream => {
+            let data = fs::read("/home/aiv/dev/ubass-rs/tests/very_big_data2.txt").unwrap();
+            server(
+                port,
+                app_id,
+                multi_stream_server(LOREM_IPSUM.to_string().into_bytes(), data.clone(), data),
+            )
+            .await;
+        }
     }
 }
 

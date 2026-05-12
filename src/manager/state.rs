@@ -21,7 +21,7 @@ use crate::{
         },
         types::{ForeignTimestamp, ManagerToProcessor},
     },
-    match_or_return, o_unwrap_or_return,
+    o_unwrap_or_return,
     packet_processor::fec::{self, Recovered},
     prelude::*,
     r_unwrap_or_return,
@@ -44,6 +44,11 @@ const PACKET_DISCARD_TIME_MS: u64 = 500;
 const SEND_INTERVAL: Duration = Duration::from_millis(25);
 pub const PACKET_COUNT_PER_BATCH: usize = 28;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(500);
+
+#[cfg(feature = "fec_xor")]
+const RECOVERY_COUNT: u8 = 0;
+#[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
+const RECOVERY_COUNT: u8 = 3;
 
 macro_rules! sessions_state_fields {
     ($($name:ident($key:ty => $value:ty)),*) => {
@@ -318,34 +323,36 @@ impl ConnectionStates {
         sender: watch::Sender<StreamMessage>,
     ) {
         match self {
-            Self::Established(box EstablishedState {
-                state: state @ (SessionStates::Up | SessionStates::Down),
-                ..
-            }) => {
-                *state = SessionStates::Streaming(StreamState {
-                    streaming: Streaming::From(StreamingFrom::new(buffer)),
-                    stream: sender,
-                    fec: SessionFecState::default(),
-                });
-            }
-
-            Self::Established(box EstablishedState {
-                state,
-                address,
-                app_id,
-                ..
-            }) => {
-                debug_assert!(
-                    false,
-                    "Invariant broken while trying to stream from {} with app_id {}: Session was not free, instead being in state {}",
-                    *address.try_read().unwrap_or_else(|_| panic!(
-                        "Invariant broken while trying to stream with app_id {app_id}: \
+            Self::Established(established) => {
+                if let EstablishedState {
+                    state: state @ (SessionStates::Up | SessionStates::Down),
+                    ..
+                } = established.as_mut()
+                {
+                    *state = SessionStates::Streaming(StreamState {
+                        streaming: Streaming::From(StreamingFrom::new(buffer)),
+                        stream: sender,
+                        fec: SessionFecState::default(),
+                    });
+                } else {
+                    let EstablishedState {
+                        state,
+                        address,
+                        app_id,
+                        ..
+                    } = established.as_ref();
+                    debug_assert!(
+                        false,
+                        "Invariant broken while trying to stream from {} with app_id {}: Session was not free, instead being in state {}",
+                        *address.try_read().unwrap_or_else(|_| panic!(
+                            "Invariant broken while trying to stream with app_id {app_id}: \
                         Session was not free, instead being in state {state}, \
                         as well as failed to get the address from the RwLock: {address:?}"
-                    )),
-                    app_id,
-                    state
-                );
+                        )),
+                        app_id,
+                        state
+                    );
+                }
             }
             Self::Handshake {
                 app_id, address, ..
@@ -362,40 +369,43 @@ impl ConnectionStates {
     /// # Panics
     pub fn stream_to(&mut self, buffer: ReadableBuffer, sender: watch::Sender<StreamMessage>) {
         match self {
-            Self::Established(box EstablishedState {
-                state: state @ (SessionStates::Up | SessionStates::Down),
-                ..
-            }) => {
-                *state = SessionStates::Streaming(StreamState {
-                    streaming: Streaming::To(StreamingTo {
-                        buffer,
-                        event: Arc::default(),
-                        // First `next_batch_id()` call yields 1.
-                        current_batch: AtomicU16::new(0),
-                    }),
-                    stream: sender,
-                    fec: SessionFecState::default(),
-                });
-            }
-
-            Self::Established(box EstablishedState {
-                state,
-                address,
-                app_id,
-                ..
-            }) => {
-                debug_assert!(
-                    false,
-                    "Invariant broken while trying to stream to {} with app_id {}: Session was not free, instead being in state {}",
-                    *address.try_read().unwrap_or_else(|_| panic!(
-                        "Invariant broken while trying to stream with app_id {app_id}: \
+            Self::Established(established) => {
+                if let EstablishedState {
+                    state: state @ (SessionStates::Up | SessionStates::Down),
+                    ..
+                } = established.as_mut()
+                {
+                    *state = SessionStates::Streaming(StreamState {
+                        streaming: Streaming::To(StreamingTo {
+                            buffer,
+                            event: Arc::default(),
+                            // First `next_batch_id()` call yields 1.
+                            current_batch: AtomicU16::new(0),
+                        }),
+                        stream: sender,
+                        fec: SessionFecState::default(),
+                    });
+                } else {
+                    let EstablishedState {
+                        state,
+                        address,
+                        app_id,
+                        ..
+                    } = established.as_ref();
+                    debug_assert!(
+                        false,
+                        "Invariant broken while trying to stream to {} with app_id {}: Session was not free, instead being in state {}",
+                        *address.try_read().unwrap_or_else(|_| panic!(
+                            "Invariant broken while trying to stream with app_id {app_id}: \
                         Session was not free, instead being in state {state}, \
                         as well as failed to get the address from the RwLock: {address:?}"
-                    )),
-                    app_id,
-                    state
-                );
+                        )),
+                        app_id,
+                        state
+                    );
+                }
             }
+
             Self::Handshake {
                 app_id, address, ..
             } => {
@@ -409,31 +419,32 @@ impl ConnectionStates {
     }
 
     pub async fn close_stream(&mut self) {
-        let ConnectionStates::Established(box EstablishedState {
-            state: state @ SessionStates::Streaming(_),
-            ..
-        }) = self
-        else {
+        if let ConnectionStates::Established(established) = self
+            && let EstablishedState {
+                state: state @ SessionStates::Streaming(_),
+                ..
+            } = established.as_mut()
+        {
+            let SessionStates::Streaming(stream_state) = state else {
+                unreachable!("Any other arm has been handled by the let else statement above");
+            };
+
+            if let Streaming::To(StreamingTo { event, .. }) = &stream_state.streaming {
+                event
+                    .update(StreamEvent::Playback(PlaybackControl::Close))
+                    .await;
+            }
+
+            stream_state.stream.send_modify(|m| m.closed = true);
+
+            *state = SessionStates::Up;
+        } else {
             debug_assert!(
                 false,
                 "Invariant broken in `close_stream`: function has been called on a session with no open stream"
             );
             return;
         };
-
-        let SessionStates::Streaming(stream_state) = state else {
-            unreachable!("Any other arm has been handled by the let else statement above");
-        };
-
-        if let Streaming::To(StreamingTo { event, .. }) = &stream_state.streaming {
-            event
-                .update(StreamEvent::Playback(PlaybackControl::Close))
-                .await;
-        }
-
-        stream_state.stream.send_modify(|m| m.closed = true);
-
-        *state = SessionStates::Up;
     }
 
     // TODO:
@@ -446,20 +457,19 @@ impl ConnectionStates {
         let address_copy: SocketAddr;
         let declare_done: bool;
         let score_ranges: Vec<ByteRange>;
-        if let ConnectionStates::Established(box EstablishedState {
-            state:
-                SessionStates::Streaming(StreamState {
-                    streaming: Streaming::From(streaming_from),
-                    stream,
-                    fec,
-                }),
-            address,
-            ..
-        }) = self
+        if let ConnectionStates::Established(established) = self
+            && let EstablishedState {
+                state:
+                    SessionStates::Streaming(StreamState {
+                        streaming: Streaming::From(streaming_from),
+                        stream,
+                        fec,
+                    }),
+                address,
+                ..
+            } = established.as_mut()
         {
             debug!("received data: {}", packet.byte_range_start);
-            // Track this batch in the manager-side mirror (built purely from
-            // DataPacket info — no state bled across the FEC module boundary).
             fec.add_data(packet.batch_id, packet.fec_info, packet.byte_range_start);
 
             let payload = packet.payload.clone().take();
@@ -517,21 +527,16 @@ impl ConnectionStates {
         if declare_done {
             // TODO: key rotation
             debug!("buffer complete");
+
             Box::new(PlaybackControlPacket::done(
                 Options::construct(&[OptionFlags::RequireAck]),
                 packet.session_id,
             ))
-            .send(sender, address_copy)
+            .send(sender.clone(), address_copy)
             .await;
-            if let ConnectionStates::Established(box EstablishedState {
-                state: SessionStates::Streaming(StreamState { stream, .. }),
-                ..
-            }) = self
-            {
-                stream.send_modify(|m| {
-                    m.closed = true;
-                });
-            }
+
+            self.close_stream().await;
+
             return Ok(false);
         }
 
@@ -541,9 +546,10 @@ impl ConnectionStates {
     }
 
     pub async fn address(&self) -> SocketAddr {
-        let (ConnectionStates::Handshake { address, .. }
-        | ConnectionStates::Established(box EstablishedState { address, .. })) = self;
-        *lock_read!(address)
+        match self {
+            ConnectionStates::Handshake { address, .. } => *lock_read!(address),
+            ConnectionStates::Established(established) => *lock_read!(established.address),
+        }
     }
 
     // TODO:
@@ -557,17 +563,18 @@ impl ConnectionStates {
         let session_id_copy: SessionId;
         let declare_done: bool;
         let score_ranges: Vec<ByteRange>;
-        if let ConnectionStates::Established(box EstablishedState {
-            state:
-                SessionStates::Streaming(StreamState {
-                    streaming: Streaming::From(streaming_from),
-                    stream,
-                    fec,
-                }),
-            address,
-            session_id,
-            ..
-        }) = self
+        if let ConnectionStates::Established(established) = self
+            && let EstablishedState {
+                state:
+                    SessionStates::Streaming(StreamState {
+                        streaming: Streaming::From(streaming_from),
+                        stream,
+                        fec,
+                    }),
+                address,
+                session_id,
+                ..
+            } = established.as_mut()
         {
             // Batch is settled — drop the manager-side mirror entry.
             fec.evict(recovered.batch_id);
@@ -627,10 +634,11 @@ impl ConnectionStates {
             ))
             .send(sender, address_copy)
             .await;
-            if let ConnectionStates::Established(box EstablishedState {
-                state: SessionStates::Streaming(StreamState { stream, .. }),
-                ..
-            }) = self
+            if let ConnectionStates::Established(established) = self
+                && let EstablishedState {
+                    state: SessionStates::Streaming(StreamState { stream, .. }),
+                    ..
+                } = established.as_ref()
             {
                 stream.send_modify(|m| {
                     m.closed = true;
@@ -645,16 +653,17 @@ impl ConnectionStates {
     }
 
     pub async fn update_address(&self, new: SocketAddr) {
-        let (ConnectionStates::Established(box EstablishedState { address, .. })
-        | ConnectionStates::Handshake { address, .. }) = self;
-
-        *lock_write!(address) = new;
+        match self {
+            ConnectionStates::Handshake { address, .. } => *lock_write!(address) = new,
+            ConnectionStates::Established(established) => *lock_write!(established.address) = new,
+        }
     }
 
     pub fn session_id(&self) -> SessionId {
-        let (ConnectionStates::Established(box EstablishedState { session_id, .. })
-        | ConnectionStates::Handshake { session_id, .. }) = self;
-        *session_id
+        match self {
+            ConnectionStates::Handshake { session_id, .. } => *session_id,
+            ConnectionStates::Established(established) => established.session_id,
+        }
     }
 }
 
@@ -894,8 +903,9 @@ impl ProtocolState {
                         );
                     }
                 }
-                ConnectionStates::Established(box EstablishedState { connection, .. }) => {
-                    if connection
+                ConnectionStates::Established(established) => {
+                    if established
+                        .connection
                         .send(InnerConnectionEvent::ProtocolClosed)
                         .await
                         .is_err()
@@ -927,19 +937,26 @@ impl ProtocolState {
             )));
 
             session.stream_to(buffer, sender);
-            debug_match_or_return!(
-                session,
-                ConnectionStates::Established(box EstablishedState {
+
+            if let ConnectionStates::Established(established) = session
+                && let EstablishedState {
                     state:
                         SessionStates::Streaming(StreamState {
                             streaming: Streaming::To(StreamingTo { event, .. }),
                             ..
-                        }), ..
-                }) => event,
-                format!("Invariant broken in `send_on_session` \
-                    with ID {session_id}: session not in correct state even though stream_to() was just called")
-            )
-            .clone()
+                        }),
+                    ..
+                } = established.as_ref()
+            {
+                event.clone()
+            } else {
+                debug_assert!(
+                    false,
+                    "Invariant broken in `send_on_session` \
+                    with ID {session_id}: session not in correct state even though stream_to() was just called"
+                );
+                return;
+            }
         };
 
         let mut playing = true;
@@ -1014,9 +1031,7 @@ impl ProtocolState {
                 _ = ack_triggered_response.send(Err(ConnectionError::SessionClosedByPeer));
                 *lock_read!(address)
             }
-            ConnectionStates::Established(box EstablishedState { address, .. }) => {
-                *lock_read!(address)
-            }
+            ConnectionStates::Established(established) => *lock_read!(established.address),
         };
 
         o_unwrap_or_return!(
@@ -1029,12 +1044,13 @@ impl ProtocolState {
         lock_write!(get_state!().encryption).remove(&session_id);
     }
 
-    // CHECKPOINT
     pub async fn close_stream(&self, session_id: SessionId, _outbound_sender: ManagerToProcessor) {
         let mut lock = lock_write!(self.connections);
         let session = o_unwrap_or_return!(lock.get_mut(&session_id));
 
-        if let ConnectionStates::Established(box EstablishedState { state, .. }) = session {
+        if let ConnectionStates::Established(established) = session
+            && let EstablishedState { state, .. } = established.as_mut()
+        {
             match state {
                 SessionStates::Streaming(
                     StreamState {
@@ -1067,11 +1083,10 @@ impl ProtocolState {
         new: SocketAddr,
     ) -> Option<SocketAddr> {
         let curr = {
-            let lock = lock_read!(self.connections);
-            let (ConnectionStates::Handshake { address, .. }
-            | ConnectionStates::Established(box EstablishedState { address, .. })) =
-                lock.get(&session_id)?;
-            let curr = *lock_read!(address);
+            let curr = lock_read!(self.connections)
+                .get(&session_id)?
+                .address()
+                .await;
 
             (new != curr).then_some(())?;
 
@@ -1118,20 +1133,19 @@ impl ProtocolState {
 }
 
 async fn seek_action(session_id: SessionId, pos: BytePosition) {
-    let mut lock = lock_write!(get_state!().connections);
-    match_or_return!(
-        lock.get_mut(&session_id),
-        Some(ConnectionStates::Established(box EstablishedState {
+    if let Some(ConnectionStates::Established(established)) =
+        lock_write!(get_state!().connections).get_mut(&session_id)
+        && let EstablishedState {
             state:
                 SessionStates::Streaming(StreamState {
                     streaming: Streaming::To(StreamingTo { buffer, .. }),
                     ..
                 }),
             ..
-        }))
-    );
-
-    buffer.seek(pos);
+        } = established.as_mut()
+    {
+        buffer.seek(pos);
+    }
 }
 
 #[instrument(skip_all)]
@@ -1144,17 +1158,18 @@ async fn send_stream_action(
     let action = {
         let mut lock = lock_write!(get_state!().connections);
         let session = lock.get_mut(&session_id)?;
-        if let ConnectionStates::Established(box EstablishedState {
-            state:
-                SessionStates::Streaming(
-                    stream @ StreamState {
-                        streaming: Streaming::To(_),
-                        ..
-                    },
-                ),
-            address,
-            ..
-        }) = session
+        if let ConnectionStates::Established(established) = session
+            && let EstablishedState {
+                state:
+                    SessionStates::Streaming(
+                        stream @ StreamState {
+                            streaming: Streaming::To(_),
+                            ..
+                        },
+                    ),
+                address,
+                ..
+            } = established.as_mut()
             && let Some(chunks) = stream.get_chunks(n)
         {
             // Head sends always win the tick budget. Only fall through to
@@ -1242,7 +1257,7 @@ async fn send_data_packets(
             FECInfo {
                 batch_size: len,
                 batch_pos: i as u8,
-                recovery_count: 1,
+                recovery_count: RECOVERY_COUNT.min(len),
             },
             session_id,
             position,
@@ -1261,13 +1276,13 @@ impl AddressSessionIdTable {
         lock.get(&address)?
             .iter()
             .find(|session| {
-                matches!(
-                    connections.get(session),
-                    Some(ConnectionStates::Established(box EstablishedState {
-                        state: SessionStates::Up | SessionStates::Down,
-                        ..
-                    }))
-                )
+                if let Some(ConnectionStates::Established(established)) = connections.get(*session)
+                    && matches!(established.state, SessionStates::Up | SessionStates::Down)
+                {
+                    true
+                } else {
+                    false
+                }
             })
             .copied()
     }
@@ -1889,13 +1904,13 @@ impl PendingAckWindow {
 
                 let addr = {
                     let lock = lock_read!(get_state!().connections);
-                    let Some(ConnectionStates::Established(box EstablishedState {
-                        address, ..
-                    })) = lock.get(&session_id)
-                    else {
+                    if let Some(ConnectionStates::Established(established)) = lock.get(&session_id)
+                        && let EstablishedState { address, .. } = established.as_ref()
+                    {
+                        *lock_read!(address)
+                    } else {
                         continue;
-                    };
-                    *lock_read!(address)
+                    }
                 };
 
                 lock!(self.queue).push_back(entry);
@@ -2050,15 +2065,16 @@ impl FecPruneTask {
                     let Some(state) = lock.get_mut(&session_id) else {
                         continue;
                     };
-                    if let ConnectionStates::Established(box EstablishedState {
-                        state:
-                            SessionStates::Streaming(StreamState {
-                                streaming: Streaming::From(streaming_from),
-                                ..
-                            }),
-                        address,
-                        ..
-                    }) = state
+                    if let ConnectionStates::Established(established) = state
+                        && let EstablishedState {
+                            state:
+                                SessionStates::Streaming(StreamState {
+                                    streaming: Streaming::From(streaming_from),
+                                    ..
+                                }),
+                            address,
+                            ..
+                        } = established.as_mut()
                     {
                         let accepted = streaming_from.reserve_for_request(positions);
                         if accepted.is_empty() {

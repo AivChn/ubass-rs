@@ -11,6 +11,106 @@ use ubass::{
     prelude::packets::MAX_PAYLOAD_LENGTH,
 };
 
+pub fn multi_stream_server(
+    msg1: Vec<u8>,
+    msg2: Vec<u8>,
+    msg3: Vec<u8>,
+) -> impl AsyncFnOnce(Connection) {
+    async move |connection| {
+        let ConnectionEvent::TrackRequested(req) = connection.listen().await.unwrap() else {
+            panic!("not track request");
+        };
+        let stream = req.approve_and_ready(msg1).await.unwrap();
+
+        let connection = stream.complete().await.unwrap();
+
+        let ConnectionEvent::TrackRequested(req) = connection.listen().await.unwrap() else {
+            panic!("not track request");
+        };
+        let stream = req.approve_and_ready(msg2).await.unwrap();
+
+        let connection = stream.complete().await.unwrap();
+
+        let ConnectionEvent::TrackRequested(req) = connection.listen().await.unwrap() else {
+            panic!("not track request");
+        };
+        let stream = req.approve_and_ready(msg3).await.unwrap();
+
+        let connection = stream.complete().await.unwrap();
+        _ = connection;
+    }
+}
+
+pub fn multi_stream_client(
+    msg1: Vec<u8>,
+    msg2: Vec<u8>,
+    msg3: Vec<u8>,
+) -> impl AsyncFnOnce(Connection) {
+    async move |connection| {
+        debug!(
+            "trying to request stream 1 with {}",
+            connection.session_id()
+        );
+
+        let mut buffer = vec![0u8; msg1.len()];
+        let stream = connection
+            .request(b"track 1".to_vec(), buffer.as_slice())
+            .await
+            .unwrap()
+            .ready()
+            .await
+            .unwrap();
+
+        let connection = stream.complete().await.unwrap();
+
+        assert_eq!(buffer, msg1);
+
+        debug!(
+            "trying to request stream 2 with {}",
+            connection.session_id()
+        );
+
+        buffer.resize(msg2.len(), 0);
+        buffer.fill(0);
+
+        let stream = connection
+            .request(b"track 2".to_vec(), buffer.as_slice())
+            .await
+            .unwrap()
+            .ready()
+            .await
+            .unwrap();
+
+        let connection = stream.close().await.unwrap();
+
+        assert_ne!(buffer, msg2);
+
+        debug!(
+            "trying to request stream 3 with {}",
+            connection.session_id()
+        );
+
+        buffer.resize(msg3.len(), 0);
+        buffer.fill(0);
+
+        let stream = connection
+            .request(b"track 3".to_vec(), buffer.as_slice())
+            .await
+            .unwrap()
+            .ready()
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        stream.pause().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        stream.play().await.unwrap();
+
+        let connection = stream.complete().await.unwrap();
+        _ = connection;
+    }
+}
+
 pub fn track_rejected_client() -> impl AsyncFnOnce(Connection) {
     async move |connection| {
         debug!("trying to request stream with {}", connection.session_id());

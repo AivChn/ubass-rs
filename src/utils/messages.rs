@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::range::Range;
+use std::ops::Range;
 
 use crate::api::{ReadableBuffer, WriteableBuffer};
 use crate::error::ApiErrors;

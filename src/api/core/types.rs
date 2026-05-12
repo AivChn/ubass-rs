@@ -23,7 +23,7 @@ use std::{
     convert::identity,
     marker::PhantomData,
     net::SocketAddr,
-    range::Range,
+    ops::Range,
     sync::{Arc, Weak, atomic::AtomicBool},
     thread::JoinHandle,
 };

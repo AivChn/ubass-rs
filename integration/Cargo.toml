@@ -10,7 +10,10 @@ thiserror = "2.0.18"
 tokio = { version = "1.52.1", features = ["full"] }
 tracing = { version = "0.1.44", features = ["async-await"] }
 tracing-subscriber = "0.3.23"
-ubass-rs = { path = "../." }
+ubass-rs = { path = "../.", default-features = false, features = [
+  "fec_rs",
+  "rust-api",
+] }
 
 [lints.clippy]
 pedantic = "warn"

@@ -1,7 +1,7 @@
 #![allow(clippy::wildcard_imports)]
 use std::{
     net::SocketAddr,
-    range::Range,
+    ops::Range,
     sync::mpsc::{SyncSender, sync_channel},
     thread::JoinHandle,
     time::Duration,
@@ -22,16 +22,14 @@ use crate::{
         self, AppId, STATE, key_exchange,
         packets::*,
         state::{
-            ConnectionStates, EstablishedState, HandshakeId,
-            SessionStates, StreamState, Streaming,
+            ConnectionStates, EstablishedState, HandshakeId, SessionStates, StreamState, Streaming,
         },
         types::{ManagerFromApi, ManagerToApi, ManagerToProcessor},
     },
-    match_or_return, o_unwrap_or_return,
+    o_unwrap_or_return,
     utils::{
         Flags, InnerConnectionEvent, LogFail, OneShot, PanicInDebug, PlaybackControl,
-        RequestDataRequest, SendDataRequest, SendPacket, SendTarget,
-        not,
+        RequestDataRequest, SendDataRequest, SendPacket, SendTarget, not,
     },
 };
 
@@ -171,14 +169,14 @@ async fn resolve_target(
     info!("trying to resolve target {target:?}");
     match target {
         SendTarget::Session(session_id) => {
-            let lock = lock_read!(get_state!().connections);
-            let connection = lock.get(session_id).ok_or(ApiErrors::SessionDoesNotExist)?;
-
-            if let ConnectionStates::Established(box EstablishedState {
-                address,
-                state: SessionStates::Up | SessionStates::Down,
-                ..
-            }) = connection
+            if let ConnectionStates::Established(established) = lock_read!(get_state!().connections)
+                .get(session_id)
+                .ok_or(ApiErrors::SessionDoesNotExist)?
+                && let EstablishedState {
+                    address,
+                    state: SessionStates::Up | SessionStates::Down,
+                    ..
+                } = established.as_ref()
             {
                 let address = *lock_read!(address);
 
@@ -232,6 +230,17 @@ pub async fn request_track(
 
     let (session_id, addr) = match resolve_target(&target).await {
         Ok(pair) => pair,
+        Err(ApiErrors::SessionOccupied) => {
+            // HACK: give some grace time for a stream that might be currently closing
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            match resolve_target(&target).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    _ = response.send(Err(e));
+                    return;
+                }
+            }
+        }
         Err(e) => {
             _ = response.send(Err(e));
             return;
@@ -300,15 +309,15 @@ pub async fn close_stream(session_id: SessionId, sender: ManagerToProcessor) {
 }
 
 pub async fn set_complete_stream(session_id: SessionId, allow_partial: bool) {
-    let lock = lock_read!(get_state!().connections);
-    match_or_return!(
-        lock.get(&session_id),
-        Some(ConnectionStates::Established(box EstablishedState {
+    if let Some(ConnectionStates::Established(established)) =
+        lock_read!(get_state!().connections).get(&session_id)
+        && let EstablishedState {
             state: SessionStates::Streaming(StreamState { stream, .. }),
             ..
-        }))
-    );
-    stream.send_modify(|m| _ = m.complete.replace(allow_partial));
+        } = established.as_ref()
+    {
+        stream.send_modify(|m| _ = m.complete.replace(allow_partial));
+    }
 }
 
 #[instrument(skip_all)]
@@ -319,7 +328,8 @@ pub async fn send_playback_control_packet(
     sender: ManagerToProcessor,
 ) {
     let address = if let Some(session) = lock_read!(get_state!().connections).get(&session_id)
-        && let ConnectionStates::Established(box EstablishedState { address, .. }) = session
+        && let ConnectionStates::Established(established) = session
+        && let EstablishedState { address, .. } = established.as_ref()
     {
         *lock_read!(address)
     } else {
@@ -382,10 +392,12 @@ pub async fn send_playback_control_packet(
 }
 
 async fn update_paused(session_id: SessionId, paused: bool) -> Option<bool> {
-    if let Some(ConnectionStates::Established(box EstablishedState {
-        state: SessionStates::Streaming(StreamState { stream, .. }),
-        ..
-    })) = lock_read!(get_state!().connections).get(&session_id)
+    if let Some(ConnectionStates::Established(established)) =
+        lock_read!(get_state!().connections).get(&session_id)
+        && let EstablishedState {
+            state: SessionStates::Streaming(StreamState { stream, .. }),
+            ..
+        } = established.as_ref()
     {
         if paused == stream.borrow().paused {
             return Some(false);
@@ -401,19 +413,20 @@ async fn update_paused(session_id: SessionId, paused: bool) -> Option<bool> {
 
 async fn seek(session_id: SessionId, pos: BytePosition) -> Option<bool> {
     let mut lock = lock_write!(get_state!().connections);
-    let Some(ConnectionStates::Established(box EstablishedState {
-        state:
-            SessionStates::Streaming(StreamState {
-                streaming: Streaming::From(streaming_from),
-                ..
-            }),
-        ..
-    })) = lock.get_mut(&session_id)
-    else {
+    if let Some(ConnectionStates::Established(established)) = lock.get_mut(&session_id)
+        && let EstablishedState {
+            state:
+                SessionStates::Streaming(StreamState {
+                    streaming: Streaming::From(streaming_from),
+                    ..
+                }),
+            ..
+        } = established.as_mut()
+    {
+        streaming_from.buffer.seek_head(pos)
+    } else {
         return None;
-    };
-
-    streaming_from.buffer.seek_head(pos)
+    }
 }
 
 pub async fn find_holes(
@@ -422,14 +435,15 @@ pub async fn find_holes(
 ) {
     let to_send = {
         let lock = lock_read!(get_state!().connections);
-        if let Some(ConnectionStates::Established(box EstablishedState {
-            state:
-                SessionStates::Streaming(StreamState {
-                    streaming: Streaming::From(streaming_from),
-                    ..
-                }),
-            ..
-        })) = lock.get(&session_id)
+        if let Some(ConnectionStates::Established(established)) = lock.get(&session_id)
+            && let EstablishedState {
+                state:
+                    SessionStates::Streaming(StreamState {
+                        streaming: Streaming::From(streaming_from),
+                        ..
+                    }),
+                ..
+            } = established.as_ref()
         {
             let buf = &streaming_from.buffer;
             Some(
@@ -455,11 +469,13 @@ pub async fn reject_track_request(
     sender: ManagerToProcessor,
 ) {
     let address = {
-        if let Some(ConnectionStates::Established(box EstablishedState {
-            state: SessionStates::Up | SessionStates::Down,
-            address,
-            ..
-        })) = lock_read!(get_state!().connections).get(&session_id)
+        if let Some(ConnectionStates::Established(established)) =
+            lock_read!(get_state!().connections).get(&session_id)
+            && let EstablishedState {
+                state: SessionStates::Up | SessionStates::Down,
+                address,
+                ..
+            } = established.as_ref()
         {
             *lock_read!(address)
         } else {

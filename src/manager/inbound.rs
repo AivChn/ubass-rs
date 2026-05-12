@@ -71,8 +71,8 @@ async fn handle_message(
             packets::Packet::TrackRequestPacket(track_request_packet) => {
                 received::received_track_request_packet(track_request_packet).await;
             }
-            packets::Packet::ParityPacket(box parity_packet) => {
-                received_parity_packet(parity_packet, outbound_sender.clone()).await;
+            packets::Packet::ParityPacket(parity_packet) => {
+                received_parity_packet(*parity_packet, outbound_sender.clone()).await;
             }
             packets::Packet::AckPacket(ack_packet) => {
                 received::received_ack_packet(ack_packet).await;

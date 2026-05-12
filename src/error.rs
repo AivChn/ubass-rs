@@ -4,7 +4,7 @@ use crate::{
     api::IncomingConnection,
     manager::{
         packets::Version,
-        state::{ConnectionStates, EstablishedState, SessionStates, StreamState, Streaming},
+        state::{ConnectionStates, SessionStates, Streaming},
     },
 };
 pub type Result<T> = core::result::Result<T, Error>;
@@ -145,30 +145,14 @@ impl From<&ConnectionStates> for FlatState {
     fn from(value: &ConnectionStates) -> Self {
         match value {
             ConnectionStates::Handshake { .. } => Self::Handshake,
-            ConnectionStates::Established(box EstablishedState {
-                state: SessionStates::Up,
-                ..
-            }) => Self::Up,
-            ConnectionStates::Established(box EstablishedState {
-                state: SessionStates::Down,
-                ..
-            }) => Self::Down,
-            ConnectionStates::Established(box EstablishedState {
-                state:
-                    SessionStates::Streaming(StreamState {
-                        streaming: Streaming::To(_),
-                        ..
-                    }),
-                ..
-            }) => Self::StreamingTo,
-            ConnectionStates::Established(box EstablishedState {
-                state:
-                    SessionStates::Streaming(StreamState {
-                        streaming: Streaming::From(_),
-                        ..
-                    }),
-                ..
-            }) => Self::StreamingFrom,
+            ConnectionStates::Established(established) => match &established.state {
+                SessionStates::Up => Self::Up,
+                SessionStates::Down => Self::Down,
+                SessionStates::Streaming(stream_state) => match stream_state.streaming {
+                    Streaming::To(_) => Self::StreamingTo,
+                    Streaming::From(_) => Self::StreamingFrom,
+                },
+            },
         }
     }
 }

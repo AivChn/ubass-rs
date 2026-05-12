@@ -6,7 +6,6 @@ use crate::{
     manager::state::{
         ConnectionStates, EstablishedState, SessionStates, StreamState, Streaming, StreamingTo,
     },
-    match_or_return,
     packet_processor::fec,
     prelude::*,
 };
@@ -40,17 +39,18 @@ async fn notify_and_close_session(session_id: SessionId) {
     {
         let lock = lock_read!(get_state!().connections);
         let session = o_unwrap_or_return!(lock.get(&session_id));
-        match session {
-            ConnectionStates::Established(box EstablishedState {
-                state: SessionStates::Streaming(StreamState { stream, .. }),
-                ..
-            }) => stream.send_modify(|m| m.closed = true),
-            ConnectionStates::Established(box EstablishedState { connection, .. }) => {
-                _ = connection
-                    .send(InnerConnectionEvent::ConnectionClosed)
-                    .await;
+        if let ConnectionStates::Established(establised) = session {
+            match establised.as_ref() {
+                EstablishedState {
+                    state: SessionStates::Streaming(StreamState { stream, .. }),
+                    ..
+                } => stream.send_modify(|m| m.closed = true),
+                EstablishedState { connection, .. } => {
+                    _ = connection
+                        .send(InnerConnectionEvent::ConnectionClosed)
+                        .await;
+                }
             }
-            ConnectionStates::Handshake { .. } => {}
         }
     }
 
@@ -94,15 +94,14 @@ pub async fn received_track_reject_packet(packet: Box<TrackRejectionPacket>) {
     );
 
     let lock = lock_read!(get_state!().connections);
-    let Some(ConnectionStates::Established(box EstablishedState {
-        state: SessionStates::Streaming(StreamState { stream, .. }),
-        ..
-    })) = lock.get(&packet.session_id)
-    else {
-        return;
-    };
-
-    stream.send_modify(|m| _ = m.approved.replace(false));
+    if let Some(ConnectionStates::Established(established)) = lock.get(&packet.session_id)
+        && let EstablishedState {
+            state: SessionStates::Streaming(StreamState { stream, .. }),
+            ..
+        } = established.as_ref()
+    {
+        stream.send_modify(|m| _ = m.approved.replace(false));
+    }
 }
 
 /// Peer told us we're on an incompatible protocol version. The packet
@@ -140,19 +139,21 @@ pub async fn received_retransmit_request(
             .await;
     }
 
-    if let Some(ConnectionStates::Established(box EstablishedState {
-        state:
-            SessionStates::Streaming(StreamState {
-                streaming:
-                    Streaming::To(StreamingTo {
-                        buffer: _,
-                        current_batch: _,
-                        event,
-                    }),
-                ..
-            }),
-        ..
-    })) = lock_read!(get_state!().connections).get(&packet.session_id)
+    if let Some(ConnectionStates::Established(established)) =
+        lock_read!(get_state!().connections).get(&packet.session_id)
+        && let EstablishedState {
+            state:
+                SessionStates::Streaming(StreamState {
+                    streaming:
+                        Streaming::To(StreamingTo {
+                            buffer: _,
+                            current_batch: _,
+                            event,
+                        }),
+                    ..
+                }),
+            ..
+        } = established.as_ref()
     {
         event.update(StreamEvent::Retransmit(packet.payload)).await;
     }
@@ -175,29 +176,20 @@ pub async fn received_track_request_packet(packet: Box<TrackRequestPacket>) {
     let session_id = packet.session_id;
     let track_id = packet.payload.take();
 
-    let sender = {
-        let lock = lock_read!(get_state!().connections);
-        o_unwrap_or_return!({
-            if let Some(ConnectionStates::Established(box EstablishedState {
-                connection, ..
-            })) = lock.get(&session_id)
-            {
-                Some(connection)
-            } else {
-                None
-            }
-        })
-        .clone()
-    };
-
-    _ = sender
-        .send(InnerConnectionEvent::TrackRequest(track_id.into()))
-        .await;
+    if let Some(ConnectionStates::Established(established)) =
+        lock_read!(get_state!().connections).get(&session_id)
+        && let EstablishedState { connection, .. } = established.as_ref()
+    {
+        _ = connection
+            .send(InnerConnectionEvent::TrackRequest(track_id.into()))
+            .await;
+    }
 }
 
 pub async fn update_last_activity(session_id: SessionId, ts: Timestamp) {
-    if let Some(ConnectionStates::Established(box EstablishedState { last_activity, .. })) =
+    if let Some(ConnectionStates::Established(established)) =
         lock_read!(get_state!().connections).get(&session_id)
+        && let EstablishedState { last_activity, .. } = established.as_ref()
     {
         lock!(last_activity).update(ts.get());
     }
@@ -358,10 +350,11 @@ async fn failed_to_deref_buffer(session_id: SessionId) {
         let lock = lock_write!(get_state!().connections);
         let session = o_unwrap_or_return!(lock.get(&session_id));
 
-        if let ConnectionStates::Established(box EstablishedState {
-            state: SessionStates::Streaming(StreamState { stream, .. }),
-            ..
-        }) = session
+        if let ConnectionStates::Established(established) = session
+            && let EstablishedState {
+                state: SessionStates::Streaming(StreamState { stream, .. }),
+                ..
+            } = established.as_ref()
         {
             stream.send_modify(|m| m.buffer_closed = true);
         }
@@ -588,14 +581,16 @@ pub async fn received_playback_control_packet(
         | PlaybackControlType::Pause
         | PlaybackControlType::Play
         | PlaybackControlType::Seek) => {
-            if let Some(ConnectionStates::Established(box EstablishedState {
-                state:
-                    SessionStates::Streaming(StreamState {
-                        streaming: Streaming::To(StreamingTo { event, .. }),
-                        ..
-                    }),
-                ..
-            })) = lock_read!(get_state!().connections).get(&packet.session_id)
+            if let Some(ConnectionStates::Established(established)) =
+                lock_read!(get_state!().connections).get(&packet.session_id)
+                && let EstablishedState {
+                    state:
+                        SessionStates::Streaming(StreamState {
+                            streaming: Streaming::To(StreamingTo { event, .. }),
+                            ..
+                        }),
+                    ..
+                } = established.as_ref()
             {
                 event.update((*packet).into()).await;
             }
@@ -618,12 +613,14 @@ pub async fn received_packet_that_requires_ack(
     sender: ManagerToProcessor,
 ) {
     let address = {
-        let lock = lock_read!(get_state!().connections);
-        match_or_return!(
-            lock.get(&session_id),
-            Some(ConnectionStates::Established(box EstablishedState { address, .. }))
-        );
-        *lock_read!(address)
+        if let Some(ConnectionStates::Established(established)) =
+            lock_read!(get_state!().connections).get(&session_id)
+            && let EstablishedState { address, .. } = established.as_ref()
+        {
+            *lock_read!(address)
+        } else {
+            return;
+        }
     };
 
     let fingerprint = fingerprint.into();
