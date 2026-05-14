@@ -86,6 +86,20 @@ pub async fn init(
                     manager_to_processor.clone(),
                 ));
             }
+
+            Some(ApiCommand::DrainData(OneShot {
+                data: session_id,
+                response,
+            })) => {
+                // The drain is async (it round-trips through the collector
+                // task), but it doesn't depend on any per-request manager
+                // state — dispatch on the monitor so we don't block the
+                // outbound loop on the collector's response.
+                monitor.dispatch(async move {
+                    let entries = get_state!().data_drain.drain(session_id).await;
+                    let _ = response.send(entries);
+                });
+            }
         }
     }
 }

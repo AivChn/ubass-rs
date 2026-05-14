@@ -506,7 +506,17 @@ pub trait Stream {
     fn current_position(&self) -> Self::Idx;
     fn is_playing(&self) -> bool;
     async fn is_done(&self) -> bool;
-    async fn complete(self) -> Result<Self::Connection, Self::Error>;
+    /// Pull every data-collection entry accumulated for this stream's session
+    /// since the last drain (any partial open window is flushed too). Safe to
+    /// call repeatedly — each call returns only what landed since the
+    /// previous one. Empty after protocol shutdown.
+    async fn drain_data(&self) -> Vec<crate::utils::DataEntry>;
+    /// Wait for the stream to settle, then return the owning [`Connection`]
+    /// alongside the trailing data-collection entries (everything accumulated
+    /// between the last [`drain_data`] call and stream close).
+    ///
+    /// [`drain_data`]: Self::drain_data
+    async fn complete(self) -> Result<(Self::Connection, Vec<crate::utils::DataEntry>), Self::Error>;
     async fn close(self) -> Result<Self::Connection, (Self::Error, Self::Connection)>;
 }
 
@@ -554,11 +564,13 @@ pub trait Connection: Sized {
     async fn send(
         self,
         buffer: impl Into<ReadableBuffer>,
+        fec_config: crate::manager::packets::FecConfig,
     ) -> core::result::Result<Self::OutputStream, (Self::Error, Self)>;
     async fn request(
         self,
         identifier: impl Into<Box<[u8]>>,
         buffer: impl Into<WriteableBuffer>,
+        fec_config: crate::manager::packets::FecConfig,
     ) -> core::result::Result<Self::PendingInputStream, (Self::Error, Self)>;
     async fn close(self);
 }

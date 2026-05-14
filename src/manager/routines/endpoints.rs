@@ -28,8 +28,9 @@ use crate::{
     },
     o_unwrap_or_return,
     utils::{
-        Flags, InnerConnectionEvent, LogFail, OneShot, PanicInDebug, PlaybackControl,
-        RequestDataRequest, SendDataRequest, SendPacket, SendTarget, not,
+        Flags, InnerConnectionEvent, LogFail, Observation, OneShot, PanicInDebug, PlaybackControl,
+        RequestDataRequest, SendDataRequest, SendPacket, SendTarget, hash_addr, hash_local_port,
+        not,
     },
 };
 
@@ -141,6 +142,7 @@ pub async fn send_data(
                 target,
                 buffer,
                 sender,
+                fec_config,
             },
         response: reply,
     }: OneShot<SendDataRequest, core::result::Result<SessionId, ApiErrors>>,
@@ -158,7 +160,7 @@ pub async fn send_data(
     _ = reply.send(Ok(session_id));
 
     get_state!()
-        .send_on_session(session_id, buffer, sender, outbound_sender)
+        .send_on_session(session_id, buffer, sender, outbound_sender, fec_config)
         .await;
 }
 
@@ -214,6 +216,7 @@ pub async fn request_track(
                 id,
                 buffer,
                 sender,
+                fec_config,
             },
         response,
     }: OneShot<RequestDataRequest, Result<SessionId, ApiErrors>>,
@@ -222,9 +225,9 @@ pub async fn request_track(
     info!("requesting track from {:?}, id: \"{:?}\"", target, id);
 
     debug_assert!(
-        id.len() <= MAX_PAYLOAD_LENGTH,
-        "Invariant broken in `request_track`: id exceeds `MAX_PAYLOAD_LENGTH` ({} > {})",
-        id.len(),
+        id.len() <= MAX_PAYLOAD_LENGTH - 3,
+        "Invariant broken in `request_track`: id + 3-byte FecConfig prefix exceeds `MAX_PAYLOAD_LENGTH` ({} > {})",
+        id.len() + 3,
         MAX_PAYLOAD_LENGTH,
     );
 
@@ -255,14 +258,36 @@ pub async fn request_track(
             _ = response.send(Err(ApiErrors::SessionDoesNotExist));
             return;
         };
-        state.streaming_from(buffer, sender);
+        state.streaming_from(buffer, sender, session_id);
     }
+
+    // Site 10 (open, receiver side): we just transitioned to `StreamingFrom`.
+    // Stamp the identity row with the same `fec_config` the requester chose —
+    // the peer will honour it for outbound data after parsing our request.
+    get_state!()
+        .data_collection
+        .post(Observation::SessionOpened {
+            session: session_id,
+            local_addr_hash: hash_local_port(*get_state!().port()),
+            remote_addr_hash: hash_addr(&addr),
+            fec_config,
+        });
 
     _ = response.send(Ok(session_id));
 
     debug!("session {} switched to `StreamingFrom` state", session_id);
 
-    TrackRequestPacket::request_track(Options::none(), session_id, id.into())
+    // Wire format for TrackRequestPacket payload: [scheme:u8][recovery_count:u8][batch_size:u8][track_id..].
+    // The peer reads the FecConfig prefix and emits it alongside the track id to its
+    // app via `InnerConnectionEvent::TrackRequest` so its send_data uses the
+    // requester's chosen FEC. See `received_track_request_packet`.
+    let mut payload: Vec<u8> = Vec::with_capacity(3 + id.len());
+    payload.push(fec_config.scheme as u8);
+    payload.push(fec_config.recovery_count);
+    payload.push(fec_config.batch_size);
+    payload.extend_from_slice(&id);
+
+    TrackRequestPacket::request_track(Options::none(), session_id, payload.into())
         .send(outbound_sender, addr)
         .await;
 }
@@ -349,6 +374,20 @@ pub async fn send_playback_control_packet(
         return;
     }
 
+    // Site 12 (receiver side): record the app-issued action on the
+    // originating peer so its dataset row reflects the event too. The peer
+    // gets its own flag flip via the send-loop match in `send_on_session`.
+    let dc = &get_state!().data_collection;
+    match control {
+        PlaybackControl::Pause => {
+            dc.post(Observation::Paused { session: session_id });
+        }
+        PlaybackControl::Seek(_) => {
+            dc.post(Observation::Seeked { session: session_id });
+        }
+        _ => {}
+    }
+
     let (control, seek_pos) = match control {
         PlaybackControl::Play => (PlaybackControlType::Play, None),
         PlaybackControl::Pause => (PlaybackControlType::Pause, None),
@@ -425,7 +464,7 @@ async fn seek(session_id: SessionId, pos: BytePosition) -> Option<bool> {
     {
         streaming_from.buffer.seek_head(pos)
     } else {
-        return None;
+        None
     }
 }
 

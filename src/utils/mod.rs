@@ -10,8 +10,13 @@ use std::{
 use async_trait::async_trait;
 use tokio::sync::{Notify, RwLock};
 
+pub mod data_collection;
 pub mod messages;
 
+pub use data_collection::{
+    DataCollectionChannel, DataEntry, DrainHandle, Observation, hash_addr, hash_local_port,
+    start_data_collector,
+};
 pub use messages::*;
 use tracing::{debug, error, info, warn};
 

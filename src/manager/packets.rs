@@ -1507,26 +1507,53 @@ impl SessionId {
     }
 }
 
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+#[variants_array]
+pub enum FecScheme {
+    Xor = 1,
+    ReedSolomon = 2,
+}
+
+/// User-facing FEC configuration. Chosen by the app for each
+/// [`SendDataRequest`]/[`RequestDataRequest`] and carried through to the
+/// outbound packets via [`FECInfo`]. No `Default` impl on purpose — a zero
+/// `recovery_count` panics in Reed-Solomon and is meaningless for XOR, so
+/// every caller must choose explicitly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FecConfig {
+    pub scheme: FecScheme,
+    pub recovery_count: u8,
+    pub batch_size: u8,
+}
+
 #[repr(C)]
 #[derive(Debug, Serialize, Clone, Copy, PartialEq)]
 pub struct FECInfo {
     pub batch_size: u8,
     pub batch_pos: u8,
     pub recovery_count: u8,
+    pub scheme: FecScheme,
 }
 
 impl FECInfo {
     #[must_use]
-    pub const fn const_new(batch_size: u8, batch_pos: u8, recovery_count: u8) -> Self {
+    pub const fn const_new(
+        batch_size: u8,
+        batch_pos: u8,
+        recovery_count: u8,
+        scheme: FecScheme,
+    ) -> Self {
         Self {
             batch_size,
             batch_pos,
             recovery_count,
+            scheme,
         }
     }
 
     #[must_use]
-    pub fn new(batch_size: u8, batch_pos: u8, recovery_count: u8) -> Self {
+    pub fn new(batch_size: u8, batch_pos: u8, recovery_count: u8, scheme: FecScheme) -> Self {
         debug_assert!(
             batch_pos < batch_size + recovery_count,
             "Invariant broken while constructing `FECInfo`: \
@@ -1541,6 +1568,7 @@ impl FECInfo {
             batch_size,
             batch_pos,
             recovery_count,
+            scheme,
         }
     }
 }

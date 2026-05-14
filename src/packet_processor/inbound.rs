@@ -1,7 +1,8 @@
 #![allow(clippy::wildcard_imports)]
 
 use crate::{
-    manager::{EncryptionMonitor, FingerprintMonitor, packets::*},
+    get_state,
+    manager::{EncryptionMonitor, FingerprintMonitor, STATE, packets::*},
     packet_processor::{encryption, fingerprint::Headers, serialize::Serialize},
     prelude::*,
     r_unwrap_or_return,
@@ -85,6 +86,8 @@ async fn handle_packet(
     let packet_type =
         r_unwrap_or_return!(PacketType::deserialize(&packet.data[PACKET_TYPE_OFFSET..]));
 
+    let wire_bytes = packet.data.len() as u64;
+
     let mut ready_packet = r_unwrap_or_return!(
         deserialize_and_decrypt(
             packet_type,
@@ -97,6 +100,34 @@ async fn handle_packet(
 
     if let Packet::KeepAlivePacket(keep_alive_packet) = &mut ready_packet {
         keep_alive_packet.address.replace(packet.src_addr);
+    }
+
+    // Site 2: emit `BytesReceived` for data + parity, plus the per-type
+    // counter. Other packet kinds (control, ack, keepalive) don't feed the
+    // training features and are skipped here to keep the dataset focused.
+    // The collector synthesises `InterArrival` and `LastActivityGap` from
+    // the arrival timing of these emissions.
+    let dc = &get_state!().data_collection;
+    match &ready_packet {
+        Packet::DataPacket(p) => {
+            dc.post(Observation::BytesReceived {
+                session: p.session_id,
+                bytes: wire_bytes,
+            });
+            dc.post(Observation::DataPacketReceived {
+                session: p.session_id,
+            });
+        }
+        Packet::ParityPacket(p) => {
+            dc.post(Observation::BytesReceived {
+                session: p.session_id,
+                bytes: wire_bytes,
+            });
+            dc.post(Observation::ParityPacketReceived {
+                session: p.session_id,
+            });
+        }
+        _ => {}
     }
 
     send_up(
@@ -333,7 +364,8 @@ mod test {
     use crate::{
         manager::{
             packets::{
-                BatchID, BytePosition, DataPacket, FECInfo, Options, PacketFingerprint, SessionId,
+                BatchID, BytePosition, DataPacket, FECInfo, FecScheme, Options, PacketFingerprint,
+                SessionId,
             },
             state::*,
         },
@@ -383,6 +415,7 @@ mod test {
                 batch_size: 10,
                 batch_pos: 2,
                 recovery_count: 3,
+                scheme: FecScheme::Xor,
             },
             next_session(),
             BytePosition(12),
@@ -408,6 +441,7 @@ mod test {
                 batch_size: 10,
                 batch_pos: 2,
                 recovery_count: 3,
+                scheme: FecScheme::Xor,
             },
             next_session(),
             BytePosition(12),

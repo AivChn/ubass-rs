@@ -9,7 +9,9 @@ use std::sync::LazyLock;
 
 use crate::packet_processor::serialize::Serialize;
 
-use crate::manager::packets::{BatchID, BytePosition, DataPacket, FECInfo, MAX_PAYLOAD_LENGTH};
+use crate::manager::packets::{
+    BatchID, BytePosition, DataPacket, FECInfo, FecScheme, MAX_PAYLOAD_LENGTH,
+};
 use crate::manager::packets::{ParityPacket, SessionId};
 use crate::transport::types::ReceivedPacket;
 
@@ -149,27 +151,41 @@ pub trait FECCompatible: Into<FECPacket> {}
 impl FECCompatible for DataPacket {}
 impl FECCompatible for ParityPacket {}
 
-#[cfg(all(feature = "fec_rs", feature = "fec_xor"))]
-compile_error!("cannot enable both fec_rs and fec_xor, disable fec_xor to use Reed-Solomon");
+static XOR: LazyLock<xor::Xor> = LazyLock::new(xor::Xor::new);
+static RS: LazyLock<reed_solomon::RS> = LazyLock::new(reed_solomon::RS::new);
 
-#[cfg(feature = "fec_xor")]
-type FECImpl = xor::Xor;
-
-#[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
-type FECImpl = reed_solomon::RS;
-
-static FEC: LazyLock<FECImpl> = LazyLock::new(FECImpl::new);
-
+/// Dispatch a sent data packet to the FEC codec selected by the packet's own
+/// `fec_info.scheme`. Returns the parity packets if the batch is now full.
 pub async fn sent(packet: impl FECCompatible) -> Option<Vec<ParityPacket>> {
-    FEC.sent(packet.into()).await
+    let fec_packet: FECPacket = packet.into();
+    match fec_packet.fec_info.scheme {
+        FecScheme::Xor => XOR.sent(fec_packet).await,
+        FecScheme::ReedSolomon => RS.sent(fec_packet).await,
+    }
 }
 
+/// Dispatch an inbound data/parity packet to the FEC codec selected by the
+/// packet's own `fec_info.scheme`. Returns `true` if the batch is recoverable.
 pub async fn received(packet: impl FECCompatible) -> bool {
-    FEC.received(packet.into()).await
+    let fec_packet: FECPacket = packet.into();
+    match fec_packet.fec_info.scheme {
+        FecScheme::Xor => XOR.received(fec_packet).await,
+        FecScheme::ReedSolomon => RS.received(fec_packet).await,
+    }
 }
 
-pub async fn recover(batch_id: BatchID, session_id: SessionId) -> Option<Recovered> {
-    let packets = FEC.recover(batch_id, session_id).await?;
+/// Recover a batch's missing packets. The caller must remember the scheme it
+/// saw on the triggering packet (via `packet.fec_info.scheme`) since the
+/// packet has been moved into the codec by the time `recover` runs.
+pub async fn recover(
+    batch_id: BatchID,
+    session_id: SessionId,
+    scheme: FecScheme,
+) -> Option<Recovered> {
+    let packets = match scheme {
+        FecScheme::Xor => XOR.recover(batch_id, session_id).await,
+        FecScheme::ReedSolomon => RS.recover(batch_id, session_id).await,
+    }?;
     Some(Recovered {
         session_id,
         batch_id,
@@ -177,6 +193,10 @@ pub async fn recover(batch_id: BatchID, session_id: SessionId) -> Option<Recover
     })
 }
 
+/// Sweep both codecs. Each owns its own batch tables; expired entries are
+/// returned together so the caller can drive retransmits uniformly.
 pub async fn prune(ttl_ms: u64) -> Vec<(SessionId, BatchID, Vec<BytePosition>)> {
-    FEC.prune(ttl_ms).await
+    let mut out = XOR.prune(ttl_ms).await;
+    out.extend(RS.prune(ttl_ms).await);
+    out
 }

@@ -8,7 +8,13 @@ use ubass::{
         RequestedStreamTrait, StreamTrait,
     },
     error::ConnectionError,
-    prelude::packets::MAX_PAYLOAD_LENGTH,
+    prelude::packets::{FecConfig, FecScheme, MAX_PAYLOAD_LENGTH},
+};
+
+const FEC: FecConfig = FecConfig {
+    scheme: FecScheme::Xor,
+    recovery_count: 1,
+    batch_size: 28,
 };
 
 pub fn multi_stream_server(
@@ -22,21 +28,21 @@ pub fn multi_stream_server(
         };
         let stream = req.approve_and_ready(msg1).await.unwrap();
 
-        let connection = stream.complete().await.unwrap();
+        let (connection, _entries) = stream.complete().await.unwrap();
 
         let ConnectionEvent::TrackRequested(req) = connection.listen().await.unwrap() else {
             panic!("not track request");
         };
         let stream = req.approve_and_ready(msg2).await.unwrap();
 
-        let connection = stream.complete().await.unwrap();
+        let (connection, _entries) = stream.complete().await.unwrap();
 
         let ConnectionEvent::TrackRequested(req) = connection.listen().await.unwrap() else {
             panic!("not track request");
         };
         let stream = req.approve_and_ready(msg3).await.unwrap();
 
-        let connection = stream.complete().await.unwrap();
+        let (connection, _entries) = stream.complete().await.unwrap();
         _ = connection;
     }
 }
@@ -54,14 +60,14 @@ pub fn multi_stream_client(
 
         let mut buffer = vec![0u8; msg1.len()];
         let stream = connection
-            .request(b"track 1".to_vec(), buffer.as_slice())
+            .request(b"track 1".to_vec(), buffer.as_slice(), FEC)
             .await
             .unwrap()
             .ready()
             .await
             .unwrap();
 
-        let connection = stream.complete().await.unwrap();
+        let (connection, _entries) = stream.complete().await.unwrap();
 
         assert_eq!(buffer, msg1);
 
@@ -74,7 +80,7 @@ pub fn multi_stream_client(
         buffer.fill(0);
 
         let stream = connection
-            .request(b"track 2".to_vec(), buffer.as_slice())
+            .request(b"track 2".to_vec(), buffer.as_slice(), FEC)
             .await
             .unwrap()
             .ready()
@@ -94,7 +100,7 @@ pub fn multi_stream_client(
         buffer.fill(0);
 
         let stream = connection
-            .request(b"track 3".to_vec(), buffer.as_slice())
+            .request(b"track 3".to_vec(), buffer.as_slice(), FEC)
             .await
             .unwrap()
             .ready()
@@ -106,7 +112,7 @@ pub fn multi_stream_client(
         tokio::time::sleep(Duration::from_millis(10)).await;
         stream.play().await.unwrap();
 
-        let connection = stream.complete().await.unwrap();
+        let (connection, _entries) = stream.complete().await.unwrap();
         _ = connection;
     }
 }
@@ -118,7 +124,7 @@ pub fn track_rejected_client() -> impl AsyncFnOnce(Connection) {
         let buffer = vec![0u8; 1];
         let buffer = Box::into_raw(buffer.into());
         let id = b"The answer to everything".to_vec();
-        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer))
+        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer, FEC))
             .await
             .unwrap()
             .unwrap();
@@ -149,8 +155,8 @@ pub fn pause_after_buffer_done_client(message: Vec<u8>) -> impl AsyncFnOnce(Conn
         let buffer = vec![0u8; message.len()];
         let buffer = Box::into_raw(buffer.into());
         let mut id = message.clone();
-        id.truncate(MAX_PAYLOAD_LENGTH);
-        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer))
+        id.truncate(MAX_PAYLOAD_LENGTH - 3);
+        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer, FEC))
             .await
             .unwrap()
             .unwrap();
@@ -183,8 +189,8 @@ pub fn playback_seek_client(message: Vec<u8>) -> impl AsyncFnOnce(Connection) {
         let buffer = vec![0u8; message.len()];
         let buffer = Box::into_raw(buffer.into());
         let mut id = message.clone();
-        id.truncate(MAX_PAYLOAD_LENGTH);
-        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer))
+        id.truncate(MAX_PAYLOAD_LENGTH - 3);
+        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer, FEC))
             .await
             .unwrap()
             .unwrap();
@@ -219,8 +225,8 @@ pub fn pause_play_test(message: Vec<u8>) -> impl AsyncFnOnce(Connection) {
         let buffer = vec![0u8; message.len()];
         let buffer = Box::into_raw(buffer.into());
         let mut id = message.clone();
-        id.truncate(MAX_PAYLOAD_LENGTH);
-        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer))
+        id.truncate(MAX_PAYLOAD_LENGTH - 3);
+        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer, FEC))
             .await
             .unwrap()
             .unwrap();
@@ -253,8 +259,8 @@ pub fn audio_data_test(message: Vec<u8>) -> impl AsyncFnOnce(Connection) {
         let buffer = vec![0u8; message.len()];
         let buffer = Box::into_raw(buffer.into());
         let mut id = message.clone();
-        id.truncate(MAX_PAYLOAD_LENGTH);
-        let pending = timeout(Duration::from_millis(900), connection.request(id, buffer))
+        id.truncate(MAX_PAYLOAD_LENGTH - 3);
+        let pending = timeout(Duration::from_millis(900), connection.request(id, buffer, FEC))
             .await
             .unwrap()
             .unwrap();

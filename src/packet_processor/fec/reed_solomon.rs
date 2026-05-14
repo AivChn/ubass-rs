@@ -6,8 +6,8 @@ use reed_solomon_simd::{ReedSolomonDecoder, ReedSolomonEncoder};
 
 use crate::{
     manager::packets::{
-        BatchID, BytePosition, FECInfo, MAX_PAYLOAD_LENGTH, Options, PacketType, ParityPacket,
-        SessionId, Version,
+        BatchID, BytePosition, FECInfo, FecScheme, MAX_PAYLOAD_LENGTH, Options, PacketType,
+        ParityPacket, SessionId, Version,
     },
     packet_processor::fec::FECPacket,
     packet_processor::serialize::Serialize,
@@ -102,6 +102,7 @@ impl From<(u8, &FECPacket, &[u8])> for ParityPacket {
                 packet.fec_info.batch_size,
                 i,
                 packet.fec_info.recovery_count,
+                FecScheme::ReedSolomon,
             ),
             packet.session_id,
             payload,

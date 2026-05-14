@@ -12,11 +12,13 @@ pedantic = "warn"
 unwrap_used = { level = "deny", priority = -1 }
 
 [features]
-default = ["fec_xor", "rust-api"]
-fec_xor = []
-fec_rs = []
+default = ["rust-api"]
 rust-api = []
 uniffi-api = []
+# Receiver-only wrapper around the core API used to drive offline
+# data-collection sweeps. Off by default — production builds shouldn't
+# pull in the wrapper code path.
+data-collection-api = []
 
 [dependencies]
 ubass_macros = { path = "ubass_macros" }
@@ -36,6 +38,7 @@ async-trait = "0.1.89"
 x25519-dalek = "2.0.1"
 rand_core = "0.10.0"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+siphasher = "1.0.1"
 rand = "0.10.0"
 rustc-hash = "2.1.2"
 socket2 = "0.6.3"

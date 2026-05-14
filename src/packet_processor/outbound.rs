@@ -5,8 +5,9 @@ use tracing::{error, instrument};
 
 #[allow(unused_imports)]
 use crate::{
+    get_state,
     manager::{
-        EncryptionMonitor, PendingAckMonitor,
+        EncryptionMonitor, PendingAckMonitor, STATE,
         packets::{
             BatchID, OptionFlags, Packet, PacketType, PacketWrapper, ParityPacket, SessionId,
         },
@@ -135,6 +136,18 @@ async fn handle_packet(
 
             let mut serialized;
             serialize!(packet -> serialized);
+
+            // Site 1: emit `BytesSent` + `DataPacketSent` for every outbound
+            // data packet. Cost is two channel sends on the hot path.
+            let dc = &get_state!().data_collection;
+            dc.post(Observation::BytesSent {
+                session: session_id,
+                bytes: serialized.len() as u64,
+            });
+            dc.post(Observation::DataPacketSent {
+                session: session_id,
+            });
+
             processed!(serialized to addr as Data 1 times)
         }
 
@@ -337,6 +350,19 @@ async fn handle_parity(
     let session_id = packet.session_id;
     encryption::encrypt(&mut packet, session_id, encryption_monitor).await;
     serialize!(packet -> buffer);
+
+    // Site 1: emit `BytesSent` + `ParityPacketSent` for every outbound parity
+    // packet. Parity goes through this separate dispatch (not the main match)
+    // because FEC drives it from a HandleMonitor subtask.
+    let dc = &get_state!().data_collection;
+    dc.post(Observation::BytesSent {
+        session: session_id,
+        bytes: buffer.len() as u64,
+    });
+    dc.post(Observation::ParityPacketSent {
+        session: session_id,
+    });
+
     let processed_packet = ProcessedPacket {
         dest_addr,
         packet_type: PacketType::Parity,
@@ -389,6 +415,7 @@ mod test_packet_processor_macros {
                 batch_size: 9,
                 batch_pos: 2,
                 recovery_count: 5,
+                scheme: packets::FecScheme::Xor,
             },
             session_id: SessionId::new(5),
             timestamp: Timestamp(120),
@@ -397,7 +424,7 @@ mod test_packet_processor_macros {
         }
     }
 
-    const SERIALIZED_DATA_PACKET: [u8; 35] = [
+    const SERIALIZED_DATA_PACKET: [u8; 36] = [
         /*version*/ 0,
         1,
         /*opts*/ 0,
@@ -408,6 +435,7 @@ mod test_packet_processor_macros {
         /*fec_info*/ 9,
         2,
         5,
+        packets::FecScheme::Xor as u8,
         /*session_id*/ 0,
         0,
         0,

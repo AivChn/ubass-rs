@@ -18,9 +18,19 @@ use ubass::api::PendingStreamTrait;
 use ubass::api::RequestedStreamTrait;
 use ubass::api::StreamTrait;
 use ubass::prelude::packets::MAX_PAYLOAD_LENGTH;
+use ubass::prelude::packets::{FecConfig, FecScheme};
+
+const FEC: FecConfig = FecConfig {
+    scheme: FecScheme::Xor,
+    recovery_count: 1,
+    batch_size: 28,
+};
 
 mod connection_refused;
 use connection_refused::*;
+
+mod data_collection;
+use data_collection::*;
 
 mod playback_control;
 use playback_control::*;
@@ -67,6 +77,7 @@ impl Display for Test {
                 Test::PauseAfterBufferDone => "pause_after_buffer_done",
                 Test::TrackRequestRejected => "track_request_rejected",
                 Test::MultiStream => "multi_stream",
+                Test::DataCollection => "data_collection",
             }
         )
     }
@@ -85,6 +96,7 @@ enum Test {
     PauseAfterBufferDone,
     TrackRequestRejected,
     MultiStream,
+    DataCollection,
 }
 
 #[derive(Parser)]
@@ -216,6 +228,10 @@ async fn exec_client_test(test: Test, port: u16, app_id: String, server_addr: So
             )
             .await;
         }
+
+        Test::DataCollection => {
+            data_collection_client(port, app_id, server_addr).await;
+        }
     }
 }
 
@@ -259,6 +275,10 @@ async fn exec_server_test(test: Test, port: u16, app_id: String) {
             )
             .await;
         }
+
+        Test::DataCollection => {
+            data_collection_server(port, app_id).await;
+        }
     }
 }
 
@@ -284,7 +304,7 @@ async fn general_send_server(port: u16, app_id: String, reply: Option<Box<[u8]>>
             .map_err(|(e, _)| e)
             .unwrap();
 
-        _ = stream.complete().await.unwrap();
+        let (_connection, _entries) = stream.complete().await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
 
@@ -298,15 +318,15 @@ async fn general_send_client(port: u16, app_id: String, server_addr: SocketAddr,
         let buffer = vec![0u8; message.len()];
         let buffer = Box::into_raw(buffer.into());
         let mut id = message.clone();
-        id.truncate(MAX_PAYLOAD_LENGTH);
-        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer))
+        id.truncate(MAX_PAYLOAD_LENGTH - 3);
+        let pending = timeout(Duration::from_secs(2), connection.request(id, buffer, FEC))
             .await
             .unwrap()
             .unwrap();
         let stream = pending.ready().await.map_err(|(e, _)| e).unwrap();
 
         debug!("waiting for stream to complete");
-        let _connection = timeout(Duration::from_secs(50), stream.complete())
+        let (_connection, _entries) = timeout(Duration::from_secs(50), stream.complete())
             .await
             .unwrap()
             .unwrap();

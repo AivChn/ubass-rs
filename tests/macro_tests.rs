@@ -124,6 +124,7 @@ mod packet_fields {
                 batch_size: 9,
                 batch_pos: 2,
                 recovery_count: 5,
+                scheme: packets::FecScheme::Xor,
             },
             session_id: SessionId::new(1888),
             timestamp: Timestamp(120),
@@ -278,6 +279,7 @@ mod serialization {
                 batch_size: 9,
                 batch_pos: 2,
                 recovery_count: 5,
+                scheme: packets::FecScheme::Xor,
             },
             session_id: SessionId::new(5),
             timestamp: Timestamp(120),
@@ -286,7 +288,7 @@ mod serialization {
         }
     }
 
-    const SERIALIZED_DATA_PACKET: [u8; 35] = [
+    const SERIALIZED_DATA_PACKET: [u8; 36] = [
         /*version*/ 0,
         1,
         /*opts*/ 0,
@@ -297,6 +299,7 @@ mod serialization {
         /*fec_info*/ 9,
         2,
         5,
+        packets::FecScheme::Xor as u8,
         /*session_id*/ 0,
         0,
         0,

@@ -15,7 +15,7 @@ use crate::{
     manager::{
         CHANNEL_BUFFER_SIZE, STATE,
         packets::{
-            BatchID, BytePosition, ByteRange, DataPacket, FECInfo, KeepAlivePacket,
+            BatchID, BytePosition, ByteRange, DataPacket, FECInfo, FecConfig, KeepAlivePacket,
             MAX_PAYLOAD_LENGTH, OptionFlags, Options, Packet, PacketFingerprint,
             PlaybackControlPacket, RetransmitPacket, SessionId,
         },
@@ -45,10 +45,6 @@ const SEND_INTERVAL: Duration = Duration::from_millis(25);
 pub const PACKET_COUNT_PER_BATCH: usize = 28;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(500);
 
-#[cfg(feature = "fec_xor")]
-const RECOVERY_COUNT: u8 = 0;
-#[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
-const RECOVERY_COUNT: u8 = 3;
 
 macro_rules! sessions_state_fields {
     ($($name:ident($key:ty => $value:ty)),*) => {
@@ -80,6 +76,11 @@ pub struct StreamingTo {
     pub buffer: ReadableBuffer,
     pub current_batch: AtomicU16,
     pub event: Arc<Shared<StreamEvent>>,
+    /// FEC config the app chose at stream-open time. Read by
+    /// [`send_data_packets`] to build the `FECInfo` on every outbound
+    /// data packet. Not consulted by the FEC module — the receiver
+    /// learns the scheme from the wire byte in `FECInfo.scheme`.
+    pub fec_config: FecConfig,
 }
 
 impl StreamingTo {
@@ -100,6 +101,14 @@ impl StreamingTo {
 pub struct StreamingFrom {
     pub buffer: WriteableBuffer,
     pub pending: HashMap<usize, Timestamp>,
+    /// Highest `(batch_id, batch_pos)` packed seqno seen so far on this
+    /// session. Used only to compute the `ReorderDistance` data-collection
+    /// observation; not used by any protocol logic.
+    pub max_seen_seqno: u32,
+    /// Session this `StreamingFrom` belongs to. Stored only so the
+    /// retransmit-request emission path (site 5) can tag its observations
+    /// without threading `session_id` through three function signatures.
+    session_id: SessionId,
 }
 
 impl StreamingFrom {
@@ -108,10 +117,12 @@ impl StreamingFrom {
     pub const PENDING_TTL_MS: u64 = PACKET_DISCARD_TIME_MS;
 
     #[must_use]
-    pub fn new(buffer: WriteableBuffer) -> Self {
+    pub fn new(buffer: WriteableBuffer, session_id: SessionId) -> Self {
         Self {
             buffer,
             pending: HashMap::default(),
+            max_seen_seqno: 0,
+            session_id,
         }
     }
 
@@ -120,31 +131,97 @@ impl StreamingFrom {
     /// accepted ones as pending so subsequent calls (from the same or another
     /// decider) skip them. Sweeps stale pending markers first so a lost
     /// response from a previous round doesn't permanently block a chunk.
+    ///
+    /// Site 5: emits `HolesObserved` (count of *new* holes — positions that
+    /// weren't already pending and aren't filled), `RetransmitIssued` (the
+    /// post-filter accepted count, same as the returned `Vec` length), and
+    /// one `LossBurst` per terminated run of consecutive accepted chunks.
     #[allow(clippy::cast_possible_truncation)]
     pub fn reserve_for_request(&mut self, positions: Vec<BytePosition>) -> Vec<BytePosition> {
         self.pending
             .retain(|_, ts| !ts.been_longer_than(Self::PENDING_TTL_MS));
         let now = Timestamp::now();
-        positions
-            .into_iter()
-            .filter(|pos| {
-                let idx = (**pos as usize) / MAX_PAYLOAD_LENGTH;
-                if self.buffer.position_occupied(*pos).unwrap_or(true) {
-                    return false;
+        let session = self.session_id;
+        let dc = get_state!().data_collection.clone();
+
+        let mut accepted: Vec<BytePosition> = Vec::with_capacity(positions.len());
+        let mut new_holes: u32 = 0;
+        let mut current_burst: u32 = 0;
+        let mut last_idx: Option<usize> = None;
+
+        for pos in positions {
+            let idx = (*pos as usize) / MAX_PAYLOAD_LENGTH;
+            if self.buffer.position_occupied(pos).unwrap_or(true) {
+                continue;
+            }
+            // A fresh hole this caller can't yet have seen pending on.
+            new_holes = new_holes.saturating_add(1);
+            if self.pending.contains_key(&idx) {
+                // Don't re-issue, but the burst run still extends across
+                // consecutive missing chunks regardless of dedup state.
+                last_idx = Some(idx);
+                continue;
+            }
+            self.pending.insert(idx, now);
+            // Extend or restart the contiguous-run counter.
+            if last_idx.is_some_and(|prev| prev + 1 == idx) {
+                current_burst = current_burst.saturating_add(1);
+            } else {
+                if current_burst > 0 {
+                    dc.post(Observation::LossBurst {
+                        session,
+                        length: current_burst,
+                    });
                 }
-                if self.pending.contains_key(&idx) {
-                    return false;
-                }
-                self.pending.insert(idx, now);
-                true
-            })
-            .collect()
+                current_burst = 1;
+            }
+            last_idx = Some(idx);
+            accepted.push(pos);
+        }
+        if current_burst > 0 {
+            dc.post(Observation::LossBurst {
+                session,
+                length: current_burst,
+            });
+        }
+        if new_holes > 0 {
+            dc.post(Observation::HolesObserved {
+                session,
+                count: new_holes,
+            });
+        }
+        if let Ok(issued) = u32::try_from(accepted.len())
+            && issued > 0
+        {
+            dc.post(Observation::RetransmitIssued {
+                session,
+                count: issued,
+            });
+        }
+
+        accepted
     }
 
-    /// Clear the pending marker for a chunk that just arrived. No-op if not pending.
+    /// Clear the pending marker for a chunk that just arrived. No-op if not
+    /// pending.
+    ///
+    /// Site 6: if a pending marker was present, the chunk was previously
+    /// requested via retransmit. Subtract the local-clock stamp from `now`
+    /// to derive an RTT sample and post it. Local clock both ends — see
+    /// memory `project_per_peer_epoch.md`.
     pub fn clear_pending(&mut self, position: BytePosition) {
         let idx = (*position as usize) / MAX_PAYLOAD_LENGTH;
-        self.pending.remove(&idx);
+        if let Some(stamped) = self.pending.remove(&idx) {
+            let now = Timestamp::now();
+            let rtt = now.get().saturating_sub(stamped.get());
+            let rtt_ms = u32::try_from(rtt).unwrap_or(u32::MAX);
+            get_state!()
+                .data_collection
+                .post(Observation::RetransmitRtt {
+                    session: self.session_id,
+                    rtt_ms,
+                });
+        }
     }
 
     /// Run the chunk-level score policy: pick the highest-scoring holes that
@@ -321,6 +398,7 @@ impl ConnectionStates {
         &mut self,
         buffer: WriteableBuffer,
         sender: watch::Sender<StreamMessage>,
+        session_id: SessionId,
     ) {
         match self {
             Self::Established(established) => {
@@ -330,7 +408,7 @@ impl ConnectionStates {
                 } = established.as_mut()
                 {
                     *state = SessionStates::Streaming(StreamState {
-                        streaming: Streaming::From(StreamingFrom::new(buffer)),
+                        streaming: Streaming::From(StreamingFrom::new(buffer, session_id)),
                         stream: sender,
                         fec: SessionFecState::default(),
                     });
@@ -367,7 +445,12 @@ impl ConnectionStates {
     }
 
     /// # Panics
-    pub fn stream_to(&mut self, buffer: ReadableBuffer, sender: watch::Sender<StreamMessage>) {
+    pub fn stream_to(
+        &mut self,
+        buffer: ReadableBuffer,
+        sender: watch::Sender<StreamMessage>,
+        fec_config: FecConfig,
+    ) {
         match self {
             Self::Established(established) => {
                 if let EstablishedState {
@@ -381,6 +464,7 @@ impl ConnectionStates {
                             event: Arc::default(),
                             // First `next_batch_id()` call yields 1.
                             current_batch: AtomicU16::new(0),
+                            fec_config,
                         }),
                         stream: sender,
                         fec: SessionFecState::default(),
@@ -443,8 +527,7 @@ impl ConnectionStates {
                 false,
                 "Invariant broken in `close_stream`: function has been called on a session with no open stream"
             );
-            return;
-        };
+        }
     }
 
     // TODO:
@@ -472,6 +555,24 @@ impl ConnectionStates {
             debug!("received data: {}", packet.byte_range_start);
             fec.add_data(packet.batch_id, packet.fec_info, packet.byte_range_start);
 
+            // Site 3 (reorder): pack the packet's (batch_id, batch_pos) into a
+            // single monotone u32 seqno and compare with the max seen so far.
+            // If this packet arrives behind the running max, the gap is the
+            // reorder distance. Bumping the max otherwise costs one branch.
+            let seqno =
+                u32::from(*packet.batch_id) * 256 + u32::from(packet.fec_info.batch_pos);
+            if seqno < streaming_from.max_seen_seqno {
+                let distance = streaming_from.max_seen_seqno - seqno;
+                get_state!()
+                    .data_collection
+                    .post(Observation::ReorderDistance {
+                        session: packet.session_id,
+                        distance,
+                    });
+            } else {
+                streaming_from.max_seen_seqno = seqno;
+            }
+
             let payload = packet.payload.clone().take();
             match streaming_from
                 .buffer
@@ -494,6 +595,16 @@ impl ConnectionStates {
                 m.head = streaming_from.buffer.head();
                 m.approved.replace(true);
             });
+
+            // Site 3 (buffer state): emit current head/len snapshot. Fires
+            // once per received data packet; the collector keeps the latest.
+            get_state!()
+                .data_collection
+                .post(Observation::BufferState {
+                    session: packet.session_id,
+                    head: streaming_from.buffer.head() as u64,
+                    len: streaming_from.buffer.len() as u64,
+                });
 
             let complete_allow_partial = stream.borrow().complete.is_some_and(identity);
             let head_at_end = streaming_from.buffer.head_at_end();
@@ -576,6 +687,28 @@ impl ConnectionStates {
                 ..
             } = established.as_mut()
         {
+            // Site 7: emit recovery observations *before* eviction, since
+            // `batch_started_at` reads the mirror entry that `evict` removes.
+            // `recovered.packets.len()` is the count of reconstructed packets;
+            // latency is local-clock-only (peer epochs are not comparable).
+            let dc = get_state!().data_collection.clone();
+            if let Ok(recovered_count) = u32::try_from(recovered.packets.len())
+                && recovered_count > 0
+            {
+                dc.post(Observation::PacketsRecovered {
+                    session: *session_id,
+                    count: recovered_count,
+                });
+            }
+            if let Some(start) = fec.batch_started_at(recovered.batch_id) {
+                let now = Timestamp::now();
+                let latency = now.get().saturating_sub(start.get());
+                dc.post(Observation::BatchRecovered {
+                    session: *session_id,
+                    latency_ms: u32::try_from(latency).unwrap_or(u32::MAX),
+                });
+            }
+
             // Batch is settled — drop the manager-side mirror entry.
             fec.evict(recovered.batch_id);
 
@@ -680,11 +813,17 @@ pub struct ProtocolState {
     pub fingerprints: FingerprintWindow,
     pub address_session: AddressSessionIdTable,
     pub fec_prune: Arc<FecPruneTask>,
+    /// Fire-and-forget sender every layer can post observations to. Distributed
+    /// at init via `get_state!()`; cloned freely.
+    pub data_collection: DataCollectionChannel,
+    /// App-side handle used to pull accumulated entries.
+    pub data_drain: DrainHandle,
 }
 
 impl ProtocolState {
     #[must_use]
     pub fn new(port: Port, app_id: AppId, sender: ManagerToProcessor) -> Self {
+        let (data_collection, data_drain) = start_data_collector();
         Self {
             app_id,
             port,
@@ -697,6 +836,8 @@ impl ProtocolState {
             fingerprints: FingerprintWindow::default(),
             address_session: AddressSessionIdTable::default(),
             fec_prune: Arc::new(FecPruneTask::new(sender)),
+            data_collection,
+            data_drain,
         }
     }
 
@@ -921,6 +1062,12 @@ impl ProtocolState {
         }
     }
 
+    // `clippy::too_many_lines`: this is the sender-side stream driver — the
+    // top-level setup, a long-running `select!`, the per-event arms (pause,
+    // play, seek, retransmit, lifecycle), and the per-tick send dispatch all
+    // share the same async context. Splitting would force the long-lived
+    // local state (playing/extras/last_sent) into separate signatures.
+    #[allow(clippy::too_many_lines)]
     #[instrument(skip_all)]
     pub async fn send_on_session(
         &self,
@@ -928,6 +1075,7 @@ impl ProtocolState {
         buffer: ReadableBuffer,
         sender: watch::Sender<StreamMessage>,
         outbound_sender: ManagerToProcessor,
+        fec_config: FecConfig,
     ) {
         let event = {
             let mut lock = lock_write!(get_state!().connections);
@@ -936,7 +1084,7 @@ impl ProtocolState {
                 with ID {session_id}: session does not exist"
             )));
 
-            session.stream_to(buffer, sender);
+            session.stream_to(buffer, sender, fec_config);
 
             if let ConnectionStates::Established(established) = session
                 && let EstablishedState {
@@ -945,9 +1093,21 @@ impl ProtocolState {
                             streaming: Streaming::To(StreamingTo { event, .. }),
                             ..
                         }),
+                    address,
                     ..
                 } = established.as_ref()
             {
+                // Site 10 (open, sender side): we just transitioned this
+                // session to `StreamingTo`. Stamp the identity row.
+                let remote = *lock_read!(address);
+                get_state!()
+                    .data_collection
+                    .post(Observation::SessionOpened {
+                        session: session_id,
+                        local_addr_hash: hash_local_port(*get_state!().port()),
+                        remote_addr_hash: hash_addr(&remote),
+                        fec_config,
+                    });
                 event.clone()
             } else {
                 debug_assert!(
@@ -974,7 +1134,13 @@ impl ProtocolState {
                         }
                     }) => {
                         match event {
-                            StreamEvent::Playback(PlaybackControl::Pause) => playing = false,
+                            StreamEvent::Playback(PlaybackControl::Pause) => {
+                                playing = false;
+                                // Site 12: sender-side flag flip.
+                                get_state!()
+                                    .data_collection
+                                    .post(Observation::Paused { session: session_id });
+                            }
                             StreamEvent::Playback(PlaybackControl::Play) => {
                                 playing = true;
                             },
@@ -983,6 +1149,10 @@ impl ProtocolState {
                                 debug!("got seek request to position {to}");
                                 seek_action(session_id, to).await;
                                 add_seek_hole_indices(&mut extras, last_sent, to);
+                                // Site 12: sender-side flag flip.
+                                get_state!()
+                                    .data_collection
+                                    .post(Observation::Seeked { session: session_id });
                             }
 
                             StreamEvent::Playback(PlaybackControl::Done) => {
@@ -1007,12 +1177,24 @@ impl ProtocolState {
                         }
                     }
                 _ = interval.tick(), if playing => {
-                    last_sent = send_stream_action(
+                    // Site 9 (send tick): emit one observation per tick with
+                    // a flag for whether anything was actually shipped. The
+                    // sender-side `BatchFillLatency` documented at this site
+                    // collapses to the tick interval (each tick produces
+                    // exactly one batch in the current architecture), so we
+                    // don't emit it separately — derive it as
+                    // (window_ms / send_ticks_busy) post-hoc if needed.
+                    let result = send_stream_action(
                         session_id,
                         outbound_sender.clone(),
                         PACKET_COUNT_PER_BATCH,
                         &mut extras,
-                    ).await.unwrap_or(last_sent);
+                    ).await;
+                    get_state!().data_collection.post(Observation::SendTick {
+                        session: session_id,
+                        emitted: result.is_some(),
+                    });
+                    last_sent = result.unwrap_or(last_sent);
                 }
             }
         }
@@ -1033,6 +1215,15 @@ impl ProtocolState {
             }
             ConnectionStates::Established(established) => *lock_read!(established.address),
         };
+
+        // Site 10 (close): post SessionClosed regardless of how we exited.
+        // Harmless for sessions that never reached SessionOpened — the
+        // collector drops observations for unknown sessions.
+        get_state!()
+            .data_collection
+            .post(Observation::SessionClosed {
+                session: session_id,
+            });
 
         o_unwrap_or_return!(
             get_state!()
@@ -1074,6 +1265,15 @@ impl ProtocolState {
             }
 
             *state = SessionStates::Up;
+
+            // Site 10 (close, stream): the session lives on but its data-flow
+            // window has ended; emit so the collector flushes the open entry
+            // and frees its scratch state for this session.
+            get_state!()
+                .data_collection
+                .post(Observation::SessionClosed {
+                    session: session_id,
+                });
         }
     }
 
@@ -1105,6 +1305,14 @@ impl ProtocolState {
             .get_mut(&session_id)?
             .update_address(new)
             .await;
+
+        // Site 11: address actually changed (the `curr != new` guard above
+        // ruled out no-ops). One-bit flag for the entry.
+        get_state!()
+            .data_collection
+            .post(Observation::AddressRebind {
+                session: session_id,
+            });
 
         Some(new)
     }
@@ -1203,17 +1411,18 @@ async fn send_stream_action(
             }
 
             let addr = *lock_read!(address);
-            let current_batch = if let Streaming::To(streaming_to) = &mut stream.streaming {
-                streaming_to.next_batch_id()
-            } else {
-                debug!("session {session_id} not Streaming::To after check");
-                return None;
-            };
+            let (current_batch, fec_config) =
+                if let Streaming::To(streaming_to) = &mut stream.streaming {
+                    (streaming_to.next_batch_id(), streaming_to.fec_config)
+                } else {
+                    debug!("session {session_id} not Streaming::To after check");
+                    return None;
+                };
             debug!(
                 "session {session_id} batch {current_batch}: {} chunks ",
                 chunks.len(),
             );
-            Some((chunks, addr, current_batch))
+            Some((chunks, addr, current_batch, fec_config))
         } else {
             debug!(
                 "state is wrong or buffer has been fully sent for session {session_id} - no action"
@@ -1222,9 +1431,17 @@ async fn send_stream_action(
         }
     };
 
-    if let Some((chunks, addr, current_batch)) = action {
+    if let Some((chunks, addr, current_batch, fec_config)) = action {
         let last = chunks.last()?.0;
-        send_data_packets(chunks, &outbound_sender, session_id, addr, current_batch).await;
+        send_data_packets(
+            chunks,
+            &outbound_sender,
+            session_id,
+            addr,
+            current_batch,
+            fec_config,
+        )
+        .await;
         Some(last)
     } else {
         None
@@ -1247,6 +1464,7 @@ async fn send_data_packets(
     session_id: SessionId,
     address: SocketAddr,
     current_batch: BatchID,
+    fec_config: FecConfig,
 ) {
     let len = chunks.len() as u8;
     debug!("send_data_packets: session {session_id} batch {current_batch}: {len} packets");
@@ -1257,7 +1475,8 @@ async fn send_data_packets(
             FECInfo {
                 batch_size: len,
                 batch_pos: i as u8,
-                recovery_count: RECOVERY_COUNT.min(len),
+                recovery_count: fec_config.recovery_count.min(len),
+                scheme: fec_config.scheme,
             },
             session_id,
             position,
@@ -1630,6 +1849,7 @@ impl SessionFecState {
             batch_size,
             batch_pos,
             recovery_count,
+            ..
         } = fec_info;
         self.table
             .entry(batch_id)
@@ -1641,6 +1861,13 @@ impl SessionFecState {
     /// receiver knows the batch is settled (e.g. successful recovery).
     pub fn evict(&mut self, batch_id: BatchID) {
         self.table.remove(&batch_id);
+    }
+
+    /// Local-clock time the manager first observed this batch. Used by the
+    /// data-collection layer to compute recovery latency at site 7.
+    #[must_use]
+    pub fn batch_started_at(&self, batch_id: BatchID) -> Option<Timestamp> {
+        self.table.get(&batch_id).map(|b| b.created_at)
     }
 
     /// Byte ranges currently held in active batches — chunks the score
@@ -2045,6 +2272,20 @@ impl FecPruneTask {
             tokio::time::sleep(Self::SLEEP).await;
 
             let expired = fec::prune(Self::TTL_MS).await;
+
+            // Site 8: each expired tuple with non-empty missing_positions is
+            // a batch FEC couldn't reconstruct — emit one BatchUnrecoverable
+            // before merging positions for the retransmit-fallback path.
+            // Empty missing_positions means the batch pruned clean (already
+            // complete from data alone); not an unrecoverable event.
+            let dc = get_state!().data_collection.clone();
+            for (session_id, _batch_id, positions) in &expired {
+                if !positions.is_empty() {
+                    dc.post(Observation::BatchUnrecoverable {
+                        session: *session_id,
+                    });
+                }
+            }
 
             // Group by session so the connections write lock is acquired
             // once per session, regardless of how many batches expired for it.

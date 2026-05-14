@@ -498,3 +498,45 @@ fn multi_stream() {
         "server exited with: {server_status}"
     );
 }
+
+#[ignore = "requires single threaded"]
+#[test]
+fn data_collection() {
+    let client_port = free_port();
+    let server_port = free_port();
+    let server_address = format!("127.0.0.1:{server_port}");
+
+    let mut server = KillOnDrop::spawn(
+        std::process::Command::new(BIN_PATH)
+            .args(prep_server_args("data-collection", &server_port.to_string())),
+        "server",
+    );
+
+    // give the server time to bind and start listening
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut client = KillOnDrop::spawn(
+        std::process::Command::new(BIN_PATH).args(prep_client_args(
+            &client_port.to_string(),
+            "data-collection",
+            &server_address,
+        )),
+        "client",
+    );
+
+    // Client should finish well before the server's 15 s lifetime; give it
+    // generous headroom for CI machines.
+    let client_status = wait_timeout(&mut client, Duration::from_secs(20))
+        .expect("client timed out");
+    let server_status = wait_timeout(&mut server, Duration::from_secs(30))
+        .expect("server timed out");
+
+    assert!(
+        client_status.success(),
+        "client exited with: {client_status}"
+    );
+    assert!(
+        server_status.success(),
+        "server exited with: {server_status}"
+    );
+}

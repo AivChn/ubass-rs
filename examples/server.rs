@@ -59,5 +59,5 @@ pub async fn main() {
         }
     };
 
-    let _connection = stream.complete().await.unwrap();
+    let (_connection, _entries) = stream.complete().await.unwrap();
 }

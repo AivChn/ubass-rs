@@ -1,4 +1,10 @@
 mod core;
+#[cfg(feature = "data-collection-api")]
+mod dc_proto;
+#[cfg(feature = "data-collection-api")]
+mod dc_receiver;
+#[cfg(feature = "data-collection-api")]
+mod dc_sender;
 mod rust;
 mod types;
 mod uniffi;
@@ -19,3 +25,8 @@ pub use rust::*;
 
 #[cfg(feature = "uniffi-api")]
 pub use uniffi::*;
+
+#[cfg(feature = "data-collection-api")]
+pub use dc_receiver::{MAX_BUFFER_LEN, Receiver};
+#[cfg(feature = "data-collection-api")]
+pub use dc_sender::{Sender, SenderOptions};

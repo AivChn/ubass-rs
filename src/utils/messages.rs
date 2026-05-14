@@ -4,7 +4,7 @@ use std::ops::Range;
 use crate::api::{ReadableBuffer, WriteableBuffer};
 use crate::error::ApiErrors;
 use crate::manager::packets::{
-    BytePosition, ByteRange, PlaybackControlPacket, PlaybackControlType,
+    BytePosition, ByteRange, FecConfig, PlaybackControlPacket, PlaybackControlType,
 };
 
 use derive_more::Display;
@@ -75,7 +75,10 @@ pub enum ApiMessage {
 /// `RequestedStream<Output>` so the app gets a typed accept/reject handle.
 #[derive(Debug)]
 pub enum InnerConnectionEvent {
-    TrackRequest(Box<[u8]>),
+    /// `(track_id, fec_config)`. `fec_config` is the FEC strategy the
+    /// requesting peer wants for the response stream; the app should pass
+    /// it through to its `send_data` so the chosen scheme is honoured.
+    TrackRequest(Box<[u8]>, FecConfig),
     ProtocolClosed,
     ConnectionClosed,
 }
@@ -141,6 +144,10 @@ pub struct RequestDataRequest {
     pub id: Box<[u8]>,
     pub buffer: WriteableBuffer,
     pub sender: watch::Sender<StreamMessage>,
+    /// FEC strategy the requester wants the responding peer to use when
+    /// sending the requested data back. Travels in the body of the
+    /// outbound `TrackRequestPacket`.
+    pub fec_config: FecConfig,
 }
 
 #[derive(Debug)]
@@ -148,6 +155,9 @@ pub struct SendDataRequest {
     pub target: SendTarget,
     pub buffer: ReadableBuffer,
     pub sender: watch::Sender<StreamMessage>,
+    /// FEC strategy chosen by the sending app for this stream. Stamped on
+    /// each outbound data packet via `FECInfo`.
+    pub fec_config: FecConfig,
 }
 
 pub enum ApiCommand {
@@ -165,6 +175,11 @@ pub enum ApiCommand {
     StreamAction(OneShot<(SessionId, PlaybackControl), EmptyResult>),
     RequestTrack(OneShot<RequestDataRequest, core::result::Result<SessionId, ApiErrors>>),
     SendData(OneShot<SendDataRequest, core::result::Result<SessionId, ApiErrors>>),
+    /// Drain the data-collection entries accumulated for one session. The
+    /// reply contains every completed entry (including the open window,
+    /// flushed at drain time) since the last drain. Empty on unknown
+    /// sessions and on collector shutdown.
+    DrainData(OneShot<SessionId, Vec<crate::utils::DataEntry>>),
     Close,
 }
 

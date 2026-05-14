@@ -149,12 +149,27 @@ pub async fn received_retransmit_request(
                             buffer: _,
                             current_batch: _,
                             event,
+                            ..
                         }),
                     ..
                 }),
             ..
         } = established.as_ref()
     {
+        // Site 4: one served observation per inbound request. `payload.len()`
+        // is the number of byte ranges the peer asked us to retransmit;
+        // ranges get split into chunks downstream so the actual re-emit
+        // count is captured by the regular `DataPacketSent` at site 1.
+        if let Ok(served) = u32::try_from(packet.payload.len())
+            && served > 0
+        {
+            get_state!()
+                .data_collection
+                .post(Observation::RetransmitServed {
+                    session: packet.session_id,
+                    count: served,
+                });
+        }
         event.update(StreamEvent::Retransmit(packet.payload)).await;
     }
 }
@@ -174,14 +189,39 @@ pub async fn received_track_request_packet(packet: Box<TrackRequestPacket>) {
         .dispatch(update_last_activity(packet.session_id, packet.timestamp));
 
     let session_id = packet.session_id;
-    let track_id = packet.payload.take();
+    let raw = packet.payload.take();
+
+    // Payload layout (see `endpoints::request_track`):
+    //   [scheme:u8][recovery_count:u8][batch_size:u8][track_id..]
+    // A malformed/short payload is treated as a protocol error and dropped.
+    if raw.len() < 3 {
+        warn!(
+            "TrackRequestPacket on session {session_id} has truncated payload ({}B), dropping",
+            raw.len()
+        );
+        return;
+    }
+    let scheme = match raw[0] {
+        x if x == FecScheme::Xor as u8 => FecScheme::Xor,
+        x if x == FecScheme::ReedSolomon as u8 => FecScheme::ReedSolomon,
+        other => {
+            warn!("TrackRequestPacket on session {session_id} has unknown FecScheme {other}");
+            return;
+        }
+    };
+    let fec_config = FecConfig {
+        scheme,
+        recovery_count: raw[1],
+        batch_size: raw[2],
+    };
+    let track_id: Box<[u8]> = raw[3..].to_vec().into();
 
     if let Some(ConnectionStates::Established(established)) =
         lock_read!(get_state!().connections).get(&session_id)
         && let EstablishedState { connection, .. } = established.as_ref()
     {
         _ = connection
-            .send(InnerConnectionEvent::TrackRequest(track_id.into()))
+            .send(InnerConnectionEvent::TrackRequest(track_id, fec_config))
             .await;
     }
 }
@@ -236,12 +276,14 @@ pub async fn received_parity_packet(packet: ParityPacket, outbound_sender: Manag
     let session_id = packet.session_id;
 
     let batch_id = packet.batch_id;
+    let scheme = packet.fec_info.scheme;
     let fingerprint = PacketFingerprint::from(&packet);
 
     if fec::received(packet).await {
         let recovered_result = {
             let mut lock = lock_write!(get_state!().connections);
-            let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id).await);
+            let recovered =
+                o_unwrap_or_return!(fec::recover(batch_id, session_id, scheme).await);
             o_unwrap_or_return!(lock.get_mut(&session_id))
                 .recovered_packet(recovered, outbound_sender.clone())
                 .await
@@ -296,6 +338,7 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
     let fingerprint = PacketFingerprint::from(&packet);
     let session_id = packet.session_id;
     let batch_id = packet.batch_id;
+    let scheme = packet.fec_info.scheme;
 
     let result = {
         let mut guard = lock_write!(get_state!().connections);
@@ -309,7 +352,8 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
 
     match result {
         Ok(b) if b => {
-            let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id).await);
+            let recovered =
+                o_unwrap_or_return!(fec::recover(batch_id, session_id, scheme).await);
             let mut lock = lock_write!(get_state!().connections);
             if let Err(Error::FailedToDeref) = o_unwrap_or_return!(lock.get_mut(&session_id))
                 .recovered_packet(recovered, outbound_sender)

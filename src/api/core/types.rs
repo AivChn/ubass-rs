@@ -9,7 +9,7 @@ use crate::{
     },
     manager::{
         AppId, endpoints,
-        packets::{MAX_PAYLOAD_LENGTH, SessionId},
+        packets::{FecConfig, MAX_PAYLOAD_LENGTH, SessionId},
     },
     o_unwrap_or_return,
     prelude::{ApiCommand, ApiErrors, ApiMessage, AppResponse},
@@ -159,11 +159,13 @@ impl ApiInner {
         target: SendTarget,
         buffer: ReadableBuffer,
         sender: watch::Sender<StreamMessage>,
+        fec_config: FecConfig,
     ) -> Result<SessionId, ApiErrors> {
         let (request, reply) = OneShot::new(SendDataRequest {
             target,
             buffer,
             sender,
+            fec_config,
         });
         self.api_to_manager
             .send(ApiCommand::SendData(request))
@@ -179,6 +181,7 @@ impl ApiInner {
         track_id: impl Into<Box<[u8]>>,
         buffer: impl Into<WriteableBuffer>,
         sender: watch::Sender<StreamMessage>,
+        fec_config: FecConfig,
     ) -> ResponseReceiver<Result<SessionId, ApiErrors>> {
         let track_id = track_id.into();
         let (request, response) =
@@ -187,6 +190,7 @@ impl ApiInner {
                 id: track_id,
                 buffer: buffer.into(),
                 sender,
+                fec_config,
             });
         _ = self
             .api_to_manager
@@ -227,6 +231,22 @@ impl ApiInner {
             .send(ApiCommand::FindHoles(request))
             .await;
         response
+    }
+
+    /// Drain accumulated data-collection entries for one session. Empty on
+    /// protocol shutdown — the app should treat that as "no more data" and
+    /// stop polling.
+    async fn drain_session_data(&self, session_id: SessionId) -> Vec<crate::utils::DataEntry> {
+        let (request, response) = OneShot::new(session_id);
+        if self
+            .api_to_manager
+            .send(ApiCommand::DrainData(request))
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        response.recv().await.unwrap_or_default()
     }
 
     async fn send_playback_control(
@@ -507,11 +527,11 @@ impl api::types::Connection for Connection {
         };
 
         let event = match inner {
-            InnerConnectionEvent::TrackRequest(track_id) => {
+            InnerConnectionEvent::TrackRequest(track_id, fec_config) => {
                 let api = self.api.clone();
                 let session_id = self.session_id;
                 ConnectionEvent::TrackRequested(RequestedStream::new_output(
-                    api, session_id, track_id, self,
+                    api, session_id, track_id, fec_config, self,
                 ))
             }
             InnerConnectionEvent::ProtocolClosed => ConnectionEvent::ProtocolClosed,
@@ -524,6 +544,7 @@ impl api::types::Connection for Connection {
     async fn send(
         self,
         buffer: impl Into<ReadableBuffer>,
+        fec_config: FecConfig,
     ) -> Result<OutputStream, (Self::Error, Self)> {
         let Some(api) = self.api.upgrade() else {
             return Err((ConnectionError::ProtocolClosed, self));
@@ -532,7 +553,12 @@ impl api::types::Connection for Connection {
         let length = buffer.len();
         let (sender, receiver) = watch::channel(StreamMessage::default());
         match api
-            .send_data(SendTarget::Session(self.session_id), buffer, sender)
+            .send_data(
+                SendTarget::Session(self.session_id),
+                buffer,
+                sender,
+                fec_config,
+            )
             .await
         {
             Ok(_) => Ok(OutputStream::new(
@@ -550,6 +576,7 @@ impl api::types::Connection for Connection {
         self,
         identifier: impl Into<Box<[u8]>>,
         buffer: impl Into<WriteableBuffer>,
+        fec_config: FecConfig,
     ) -> Result<PendingStream<api::types::Input>, (Self::Error, Self)> {
         let Some(api) = self.api.upgrade() else {
             return Err((ConnectionError::ProtocolClosed, self));
@@ -558,7 +585,9 @@ impl api::types::Connection for Connection {
         let api: Arc<ApiInner> = api;
 
         let track_id = identifier.into();
-        if track_id.len() > MAX_PAYLOAD_LENGTH {
+        // Reserve 3 bytes at the head of the payload for the serialized FecConfig
+        // prefix (see `manager::routines::endpoints::request_track`).
+        if track_id.len() > MAX_PAYLOAD_LENGTH - 3 {
             return Err((ConnectionError::BufferTooLarge, self));
         }
 
@@ -573,6 +602,7 @@ impl api::types::Connection for Connection {
                 track_id,
                 buffer,
                 sender,
+                fec_config,
             )
             .await;
 
@@ -713,7 +743,16 @@ impl api::types::Stream for Stream<api::types::Input> {
         self.update.borrow().head == self.size || self.update.borrow().closed
     }
 
-    async fn complete(mut self) -> Result<Self::Connection, Self::Error> {
+    async fn drain_data(&self) -> Vec<crate::utils::DataEntry> {
+        let Some(api) = self.api.upgrade() else {
+            return Vec::new();
+        };
+        api.drain_session_data(self.session).await
+    }
+
+    async fn complete(
+        mut self,
+    ) -> Result<(Self::Connection, Vec<crate::utils::DataEntry>), Self::Error> {
         let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
         api.complete_stream(self.session, self.allow_partial).await;
 
@@ -727,7 +766,10 @@ impl api::types::Stream for Stream<api::types::Input> {
             // TODO: in the future just close stream
             Err(ConnectionError::BufferClosedUnexpectedly)
         } else {
-            Ok(self.connection)
+            // The stream is fully closed; drain captures the trailing
+            // partial window plus anything emitted post-last-drain.
+            let entries = api.drain_session_data(self.session).await;
+            Ok((self.connection, entries))
         }
     }
 
@@ -757,12 +799,26 @@ impl api::types::Stream for Stream<api::types::Output> {
         self.update.borrow().head == self.size
     }
 
-    async fn complete(mut self) -> Result<Self::Connection, Self::Error> {
+    async fn drain_data(&self) -> Vec<crate::utils::DataEntry> {
+        let Some(api) = self.api.upgrade() else {
+            return Vec::new();
+        };
+        api.drain_session_data(self.session).await
+    }
+
+    async fn complete(
+        mut self,
+    ) -> Result<(Self::Connection, Vec<crate::utils::DataEntry>), Self::Error> {
         self.update
             .wait_for(|message| message.closed)
             .await
             .map_err(|_| ConnectionError::ProtocolClosed)?;
-        Ok(self.connection)
+        let entries = if let Some(api) = self.api.upgrade() {
+            api.drain_session_data(self.session).await
+        } else {
+            Vec::new()
+        };
+        Ok((self.connection, entries))
     }
 
     async fn close(self) -> Result<Self::Connection, (Self::Error, Self::Connection)> {
@@ -794,6 +850,7 @@ pub struct RequestedStream<Direction: api::types::StreamDirection> {
     api: Weak<ApiInner>,
     session: SessionId,
     track_id: Box<[u8]>,
+    fec_config: FecConfig,
     connection: Connection,
     _marker: PhantomData<Direction>,
 }
@@ -803,12 +860,14 @@ impl RequestedStream<api::types::Output> {
         api: Weak<ApiInner>,
         session: SessionId,
         track_id: Box<[u8]>,
+        fec_config: FecConfig,
         connection: Connection,
     ) -> Self {
         Self {
             api,
             session,
             track_id,
+            fec_config,
             connection,
             _marker: PhantomData,
         }
@@ -844,7 +903,12 @@ impl api::types::RequestedStream for RequestedStream<api::types::Output> {
         let length = buffer.len();
         let (sender, receiver) = watch::channel(StreamMessage::default());
         match api
-            .send_data(SendTarget::Session(self.session), buffer, sender)
+            .send_data(
+                SendTarget::Session(self.session),
+                buffer,
+                sender,
+                self.fec_config,
+            )
             .await
         {
             Ok(_) => Ok(Stream::<api::types::Output>::new(

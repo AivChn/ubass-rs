@@ -11,8 +11,8 @@ use tokio::sync::Mutex;
 
 use crate::{
     manager::packets::{
-        BatchID, BytePosition, DataPacket, FECInfo, MAX_PAYLOAD_LENGTH, Options, PacketType,
-        SessionId,
+        BatchID, BytePosition, DataPacket, FECInfo, FecScheme, MAX_PAYLOAD_LENGTH, Options,
+        PacketType, SessionId,
     },
     packet_processor::serialize::Serialize,
 };
@@ -258,7 +258,7 @@ impl Xor {
             // prepare parity packet fields
             let payload = batch.product.0.clone();
             let opts = Options::construct(&[]);
-            let fec_info = FECInfo::new(packet.fec_info.batch_size, 0, 1);
+            let fec_info = FECInfo::new(packet.fec_info.batch_size, 0, 1, FecScheme::Xor);
             let session_id = packet.session_id;
 
             Some(vec![ParityPacket::new(
