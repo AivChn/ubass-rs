@@ -425,7 +425,7 @@ async fn seek(session_id: SessionId, pos: BytePosition) -> Option<bool> {
     {
         streaming_from.buffer.seek_head(pos)
     } else {
-        return None;
+        None
     }
 }
 

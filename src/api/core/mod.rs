@@ -1,5 +1,3 @@
-mod inbound;
-mod outbound;
 mod types;
 
 pub use types::{
@@ -15,7 +13,6 @@ use crate::{
 use std::sync::Arc;
 
 use crate::{DEFAULT_PORT, manager::AppId};
-
 
 pub struct Api {
     inner: Arc<ApiInner>,

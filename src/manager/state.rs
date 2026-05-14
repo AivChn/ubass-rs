@@ -443,8 +443,7 @@ impl ConnectionStates {
                 false,
                 "Invariant broken in `close_stream`: function has been called on a session with no open stream"
             );
-            return;
-        };
+        }
     }
 
     // TODO:
