@@ -314,15 +314,15 @@ impl TrackRequestPacket {
 
 #[derive(Debug, SendPacket, Headers, Payload, Serialize, Clone, PartialEq)]
 pub struct DataPacket {
-    pub version: Version,
-    pub opts: Options,
-    pub packet_type: PacketType,
-    pub batch_id: BatchID,
-    pub fec_info: FECInfo,
-    pub session_id: SessionId,
-    pub timestamp: Timestamp,
-    pub byte_range_start: BytePosition,
-    pub payload: PayloadField,
+    pub version: Version,               // 2B
+    pub opts: Options,                  // 2B
+    pub packet_type: PacketType,        // 1B
+    pub batch_id: BatchID,              // 2B
+    pub fec_info: FECInfo,              // 3B
+    pub session_id: SessionId,          // 8B
+    pub timestamp: Timestamp,           // 8B
+    pub byte_range_start: BytePosition, // 4B
+    pub payload: PayloadField,          // 0..1384B
 }
 
 impl DataPacket {

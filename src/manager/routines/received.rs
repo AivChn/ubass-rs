@@ -9,7 +9,7 @@ use crate::{
     packet_processor::fec,
     prelude::*,
 };
-use aes_gcm_siv::{Aes256GcmSiv, KeyInit};
+use aes_gcm::{Aes256Gcm, KeyInit};
 use tokio::sync::mpsc::{self, Receiver};
 use tracing::{debug, instrument, warn};
 
@@ -457,7 +457,7 @@ pub async fn received_hello_packet_as_receiver(
             let key = key_exchange::get_shared_secret(ephemeral_secret, packet.public_key);
             lock_write!(get_state!().encryption).insert(
                 session_id,
-                EncryptionWindow::new(Aes256GcmSiv::new((&key).into())),
+                EncryptionWindow::new(Aes256Gcm::new((&key).into())),
             );
 
             HelloPacket::new(
@@ -517,7 +517,7 @@ pub async fn received_hello_packet_as_initializer(
             .await
     );
     let key = key_exchange::get_shared_secret(secret, packet.public_key);
-    let cipher = Aes256GcmSiv::new(&key.into());
+    let cipher = Aes256Gcm::new(&key.into());
 
     // insert cipher to state for any future encryption
     lock_write!(get_state!().encryption)

@@ -4,7 +4,7 @@
 mod encryption {
     use std::sync::LazyLock;
 
-    use aes_gcm_siv::{Aes256GcmSiv, KeyInit, aead::OsRng};
+    use aes_gcm::{Aes256Gcm, KeyInit, aead::OsRng};
     use ubass::{
         manager::{
             EncryptionMonitor,
@@ -36,7 +36,7 @@ mod encryption {
     static ENCRYPTION: LazyLock<EncryptionTable> = LazyLock::new(EncryptionTable::default);
 
     fn get_window() -> EncryptionWindow {
-        EncryptionWindow::new(Aes256GcmSiv::new(&Aes256GcmSiv::generate_key(&mut OsRng)))
+        EncryptionWindow::new(Aes256Gcm::new(&Aes256Gcm::generate_key(&mut OsRng)))
     }
 
     #[tokio::test]

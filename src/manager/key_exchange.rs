@@ -1,4 +1,4 @@
-use aes_gcm_siv::aead::OsRng;
+use aes_gcm::aead::OsRng;
 use x25519_dalek::{EphemeralSecret, PublicKey};
 
 pub fn create() -> (EphemeralSecret, PublicKey) {

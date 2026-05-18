@@ -5,7 +5,7 @@ use crate::manager::packets::{
 };
 use crate::prelude::*;
 
-use aes_gcm_siv::{AeadInPlace, Nonce};
+use aes_gcm::{AeadInPlace, Nonce};
 
 pub trait Encryptable: Payload + Headers {}
 

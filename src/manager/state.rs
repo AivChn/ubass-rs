@@ -1,4 +1,4 @@
-use aes_gcm_siv::Aes256GcmSiv;
+use aes_gcm::Aes256Gcm;
 use derive_more::{Deref, Display};
 use tokio::{
     select,
@@ -456,6 +456,7 @@ impl ConnectionStates {
         let address_copy: SocketAddr;
         let declare_done: bool;
         let score_ranges: Vec<ByteRange>;
+
         if let ConnectionStates::Established(established) = self
             && let EstablishedState {
                 state:
@@ -499,20 +500,16 @@ impl ConnectionStates {
             declare_done =
                 streaming_from.buffer.is_done() || (complete_allow_partial && head_at_end);
 
-            let batch_end =
-                u16::from(packet.fec_info.batch_pos) + 1 == u16::from(packet.fec_info.batch_size);
+            let batch_end = packet.fec_info.batch_pos + 1 == packet.fec_info.batch_size;
 
             score_ranges = if declare_done {
                 vec![]
+            } else if head_at_end {
+                streaming_from.finalize_sweep_pick(&fec.active_byte_ranges())
+            } else if batch_end {
+                streaming_from.score_policy_pick(&fec.active_byte_ranges())
             } else {
-                let fec_active = fec.active_byte_ranges();
-                if head_at_end {
-                    streaming_from.finalize_sweep_pick(&fec_active)
-                } else if batch_end {
-                    streaming_from.score_policy_pick(&fec_active)
-                } else {
-                    vec![]
-                }
+                vec![]
             };
 
             address_copy = *lock_read!(address);
@@ -524,7 +521,6 @@ impl ConnectionStates {
         }
 
         if declare_done {
-            // TODO: key rotation
             debug!("buffer complete");
 
             Box::new(PlaybackControlPacket::done(
@@ -2181,27 +2177,27 @@ fn coalesce_byte_positions(positions: Vec<BytePosition>) -> Vec<ByteRange> {
 }
 
 pub struct EncryptionWindow {
-    cipher: Arc<Aes256GcmSiv>,
+    cipher: Arc<Aes256Gcm>,
     nonce: AtomicU64,
 }
 
 impl EncryptionWindow {
     #[must_use]
-    pub fn new(cipher: Aes256GcmSiv) -> Self {
+    pub fn new(cipher: Aes256Gcm) -> Self {
         Self {
             cipher: Arc::new(cipher),
             nonce: AtomicU64::new(0),
         }
     }
 
-    pub fn get(&self) -> (Arc<Aes256GcmSiv>, [u8; 8]) {
+    pub fn get(&self) -> (Arc<Aes256Gcm>, [u8; 8]) {
         let x = self
             .nonce
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         (self.cipher.clone(), x.to_be_bytes())
     }
 
-    pub fn get_cipher(&self) -> Arc<Aes256GcmSiv> {
+    pub fn get_cipher(&self) -> Arc<Aes256Gcm> {
         self.cipher.clone()
     }
 }
@@ -2220,7 +2216,7 @@ impl EncryptionMonitor {
     ///
     /// # Panics
     /// This function panics if the key is not yet created, which should be impossible
-    pub async fn get(&self, session_id: &SessionId) -> Option<(Arc<Aes256GcmSiv>, [u8; 8])> {
+    pub async fn get(&self, session_id: &SessionId) -> Option<(Arc<Aes256Gcm>, [u8; 8])> {
         Some(self.table.write().await.get(session_id)?.get())
     }
 
@@ -2228,7 +2224,7 @@ impl EncryptionMonitor {
     ///
     /// # Panics
     /// This function panics if the key is not yet created, which should be impossible
-    pub async fn get_cipher(&self, session_id: &SessionId) -> Option<Arc<Aes256GcmSiv>> {
+    pub async fn get_cipher(&self, session_id: &SessionId) -> Option<Arc<Aes256Gcm>> {
         Some(self.table.read().await.get(session_id)?.get_cipher())
     }
 }
