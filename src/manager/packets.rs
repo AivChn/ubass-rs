@@ -194,7 +194,6 @@ pub struct HelloPacket {
     pub handshake_id: HandshakeId,
     pub timestamp: Timestamp,
     pub public_key: PublicKey,
-    pub receiving_port: Port,
     pub app_id: AppId,
 }
 
@@ -232,7 +231,6 @@ impl HelloPacket {
             handshake_id,
             timestamp,
             public_key,
-            receiving_port,
             app_id,
         })
     }

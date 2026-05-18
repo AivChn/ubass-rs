@@ -45,7 +45,6 @@ const SEND_INTERVAL: Duration = Duration::from_millis(25);
 pub const PACKET_COUNT_PER_BATCH: usize = 28;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_millis(500);
 
-
 macro_rules! sessions_state_fields {
     ($($name:ident($key:ty => $value:ty)),*) => {
         $(
@@ -56,10 +55,7 @@ macro_rules! sessions_state_fields {
 }
 
 sessions_state_fields!(
-    GeneralStateTable(SessionId => GeneralSessionState),
     EncryptionTable(SessionId => EncryptionWindow),
-    FecStateTable(SessionId => SessionFecState),
-    SessionAppIdTable(SessionId => AppId),
     SessionAddressTable(SessionId => SocketAddr),
     HandshakeStateTable(HandshakeId => HandshakeState),
     AddressSessionIdTable(SocketAddr => Vec<SessionId>)
@@ -101,10 +97,6 @@ impl StreamingTo {
 pub struct StreamingFrom {
     pub buffer: WriteableBuffer,
     pub pending: HashMap<usize, Timestamp>,
-    /// Highest `(batch_id, batch_pos)` packed seqno seen so far on this
-    /// session. Used only to compute the `ReorderDistance` data-collection
-    /// observation; not used by any protocol logic.
-    pub max_seen_seqno: u32,
     /// Session this `StreamingFrom` belongs to. Stored only so the
     /// retransmit-request emission path (site 5) can tag its observations
     /// without threading `session_id` through three function signatures.
@@ -121,7 +113,6 @@ impl StreamingFrom {
         Self {
             buffer,
             pending: HashMap::default(),
-            max_seen_seqno: 0,
             session_id,
         }
     }
@@ -555,24 +546,6 @@ impl ConnectionStates {
             debug!("received data: {}", packet.byte_range_start);
             fec.add_data(packet.batch_id, packet.fec_info, packet.byte_range_start);
 
-            // Site 3 (reorder): pack the packet's (batch_id, batch_pos) into a
-            // single monotone u32 seqno and compare with the max seen so far.
-            // If this packet arrives behind the running max, the gap is the
-            // reorder distance. Bumping the max otherwise costs one branch.
-            let seqno =
-                u32::from(*packet.batch_id) * 256 + u32::from(packet.fec_info.batch_pos);
-            if seqno < streaming_from.max_seen_seqno {
-                let distance = streaming_from.max_seen_seqno - seqno;
-                get_state!()
-                    .data_collection
-                    .post(Observation::ReorderDistance {
-                        session: packet.session_id,
-                        distance,
-                    });
-            } else {
-                streaming_from.max_seen_seqno = seqno;
-            }
-
             let payload = packet.payload.clone().take();
             match streaming_from
                 .buffer
@@ -598,13 +571,11 @@ impl ConnectionStates {
 
             // Site 3 (buffer state): emit current head/len snapshot. Fires
             // once per received data packet; the collector keeps the latest.
-            get_state!()
-                .data_collection
-                .post(Observation::BufferState {
-                    session: packet.session_id,
-                    head: streaming_from.buffer.head() as u64,
-                    len: streaming_from.buffer.len() as u64,
-                });
+            get_state!().data_collection.post(Observation::BufferState {
+                session: packet.session_id,
+                head: streaming_from.buffer.head() as u64,
+                len: streaming_from.buffer.len() as u64,
+            });
 
             let complete_allow_partial = stream.borrow().complete.is_some_and(identity);
             let head_at_end = streaming_from.buffer.head_at_end();
@@ -1530,44 +1501,6 @@ impl AddressSessionIdTable {
         }
 
         Some(session_id)
-    }
-}
-
-pub struct GeneralSessionState {
-    last_key_rotation_time: Timestamp,
-    flags: SessionStateFlags,
-}
-
-impl GeneralStateTable {
-    pub async fn last_key_rotation_time(&self, session_id: SessionId) -> Option<Timestamp> {
-        Some(lock_read!(self).get(&session_id)?.last_key_rotation_time)
-    }
-
-    pub async fn key_rotation(&self, session_id: SessionId) -> Option<()> {
-        lock_write!(self)
-            .get_mut(&session_id)?
-            .last_key_rotation_time = Timestamp::now();
-        Some(())
-    }
-
-    pub async fn flags(&self, session_id: SessionId) -> Option<SessionStateFlags> {
-        Some(lock_read!(self).get(&session_id)?.flags)
-    }
-
-    pub async fn flags_then(
-        &self,
-        session_id: SessionId,
-        flag: <SessionStateFlags as Flags>::FlagType,
-        mut f: impl FnMut(
-            SessionStateFlags,
-            <SessionStateFlags as Flags>::FlagType,
-        ) -> SessionStateFlags,
-    ) -> Option<()> {
-        let mut lock = lock_write!(self);
-        let flags = lock.get(&session_id)?.flags;
-        let new = f(flags, flag);
-        lock.get_mut(&session_id)?.flags = new;
-        Some(())
     }
 }
 

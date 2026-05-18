@@ -282,8 +282,7 @@ pub async fn received_parity_packet(packet: ParityPacket, outbound_sender: Manag
     if fec::received(packet).await {
         let recovered_result = {
             let mut lock = lock_write!(get_state!().connections);
-            let recovered =
-                o_unwrap_or_return!(fec::recover(batch_id, session_id, scheme).await);
+            let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id, scheme).await);
             o_unwrap_or_return!(lock.get_mut(&session_id))
                 .recovered_packet(recovered, outbound_sender.clone())
                 .await
@@ -352,8 +351,7 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
 
     match result {
         Ok(b) if b => {
-            let recovered =
-                o_unwrap_or_return!(fec::recover(batch_id, session_id, scheme).await);
+            let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id, scheme).await);
             let mut lock = lock_write!(get_state!().connections);
             if let Err(Error::FailedToDeref) = o_unwrap_or_return!(lock.get_mut(&session_id))
                 .recovered_packet(recovered, outbound_sender)
@@ -418,12 +416,10 @@ async fn failed_to_deref_buffer(session_id: SessionId) {
 /// the two called functions panic on broken invariants, check their documentation for more information
 pub async fn received_hello_packet(
     packet: HelloPacket,
-    mut src_addr: SocketAddr,
+    src_addr: SocketAddr,
     outbound_sender: ManagerToProcessor,
     app_sender: ManagerToApi,
 ) {
-    // setting the address to the one saved in state
-    src_addr.set_port(*packet.receiving_port);
     if lock_read!(get_state!().handshakes).contains_key(&packet.handshake_id) {
         received_hello_packet_as_initializer(packet, src_addr, outbound_sender).await;
     } else {

@@ -2,14 +2,10 @@ mod inbound;
 mod outbound;
 pub mod types;
 
-use std::{
-    net::{Ipv4Addr, SocketAddr, SocketAddrV4},
-    sync::Arc,
-};
+use std::sync::Arc;
 
 use crate::{prelude::*, transport::types::InboundSender};
 
-use socket2::{Domain, Socket, Type};
 use tokio::{net::UdpSocket, sync::oneshot};
 use tracing::{debug, error, info, instrument};
 use types::TransportChannels;
@@ -27,7 +23,7 @@ pub async fn init(
     TransportChannels { receiver, sender }: TransportChannels,
     signal: oneshot::Sender<ErrResult>,
 ) -> ErrResult {
-    let listening_socket = match bind_listen_socket(port) {
+    let listening_socket = match bind_listen_socket(port).await {
         None => {
             _ = sender.send(Err(TransportError::FailedToBind.into())).await;
             return Err(TransportError::FailedToBind.into());
@@ -77,23 +73,12 @@ async fn send_to_processing_layer(
     })
 }
 
-fn bind_listen_socket(port: u16) -> Option<UdpSocket> {
+async fn bind_listen_socket(port: u16) -> Option<UdpSocket> {
     debug_assert!(
         !matches!(port, 1..=1024),
         "Invariant broken while initializing inbound transport: \
              system port was used ({port})"
     );
 
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, None).ok()?;
-
-    assert!(socket.set_reuse_address(true).is_ok());
-    assert!(socket.set_reuse_port(true).is_ok());
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
-    let addr = socket2::SockAddr::from(addr);
-
-    socket.bind(&addr).ok()?;
-
-    let std_socket: std::net::UdpSocket = socket.into();
-    _ = std_socket.set_nonblocking(true);
-    UdpSocket::from_std(std_socket).ok()
+    UdpSocket::bind(format!("127.0.0.1:{port}")).await.ok()
 }

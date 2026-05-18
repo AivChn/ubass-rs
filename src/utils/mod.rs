@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, Ordering},
     },
 };
 
@@ -324,46 +324,53 @@ pub fn not(b: bool) -> bool {
     !b
 }
 
+/// A struct for keeping track of dispatched tasks, allowing for the protocol to wait until they all
+/// finish before the protocol is closed.
+#[derive(Default)]
 pub struct HandleMonitor {
-    running: AtomicUsize,
+    /// number of tasks currently dispatched on this monitor
+    running: AtomicU64,
+    /// a notification mechanism for `flush()` to wait on becfore checking to close, used when
+    /// running == 0 after a task is done
     notify: Notify,
 }
 
 impl HandleMonitor {
-    pub fn size(&self) -> usize {
+    /// Number of currently dispatched tasks
+    pub fn size(&self) -> u64 {
         self.running.load(Ordering::Acquire)
     }
 
+    /// Dispatch a task on this monitor
     #[inline]
     pub fn dispatch<F>(self: &Arc<Self>, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        // increase counter
         self.running.fetch_add(1, Ordering::Relaxed);
+        // get local reference to the monitor
         let copy = self.clone();
         tokio::spawn(async move {
+            // execute task
             future.await;
+
+            // decrease counter, notify if was 1 before decrease
             if copy.running.fetch_sub(1, Ordering::AcqRel) == 1 {
                 copy.notify.notify_one();
             }
         });
     }
 
+    /// Wait for all tasks dispatched on this monitor to finish
     pub async fn flush(&self) {
         loop {
+            // check if no tasks running
             if self.running.load(Ordering::Acquire) == 0 {
                 return;
             }
+            // wait until last task notifies
             self.notify.notified().await;
-        }
-    }
-}
-
-impl Default for HandleMonitor {
-    fn default() -> Self {
-        Self {
-            running: AtomicUsize::new(0),
-            notify: Notify::new(),
         }
     }
 }

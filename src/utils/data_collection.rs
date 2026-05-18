@@ -278,13 +278,6 @@ pub struct DataEntry {
     /// when a burst of length ≥ 1 actually ends.
     pub longest_loss_burst: Option<NonZeroU32>,
 
-    /// Max gap between the highest-seen `batch_pos` and the current one,
-    /// taken across all batches active during the window. Useful for
-    /// distinguishing real loss from reorder: a packet arriving after others
-    /// from a later `batch_pos` was reordered, not lost. `NonZero` because a
-    /// distance of 0 is in-order and never emitted.
-    pub max_reorder_distance: Option<NonZeroU32>,
-
     // ============================================================
     // Latency samples (sum + count → app derives mean; sums plain
     // u64 because a single 0 ms sample is legal at ms resolution)
@@ -409,7 +402,6 @@ impl DataEntry {
             wasted_parity: None,
             holes_observed: None,
             longest_loss_burst: None,
-            max_reorder_distance: None,
             recovery_latency_ms_sum: None,
             recovery_latency_count: None,
             batch_fill_latency_ms_sum: None,
@@ -447,40 +439,87 @@ pub enum Observation {
     },
     /// Session has closed; flush its open window and stop accepting
     /// observations on this id.
-    SessionClosed { session: SessionId },
+    SessionClosed {
+        session: SessionId,
+    },
 
     // ---------- Throughput ----------
-    BytesSent { session: SessionId, bytes: u64 },
-    BytesReceived { session: SessionId, bytes: u64 },
+    BytesSent {
+        session: SessionId,
+        bytes: u64,
+    },
+    BytesReceived {
+        session: SessionId,
+        bytes: u64,
+    },
 
     // ---------- Packet counts ----------
-    DataPacketSent { session: SessionId },
-    DataPacketReceived { session: SessionId },
-    ParityPacketSent { session: SessionId },
-    ParityPacketReceived { session: SessionId },
+    DataPacketSent {
+        session: SessionId,
+    },
+    DataPacketReceived {
+        session: SessionId,
+    },
+    ParityPacketSent {
+        session: SessionId,
+    },
+    ParityPacketReceived {
+        session: SessionId,
+    },
 
     // ---------- Retransmit ----------
-    RetransmitIssued { session: SessionId, count: u32 },
-    RetransmitServed { session: SessionId, count: u32 },
-    RetransmitSent { session: SessionId, count: u32 },
+    RetransmitIssued {
+        session: SessionId,
+        count: u32,
+    },
+    RetransmitServed {
+        session: SessionId,
+        count: u32,
+    },
+    RetransmitSent {
+        session: SessionId,
+        count: u32,
+    },
 
     // ---------- FEC efficacy ----------
-    PacketsRecovered { session: SessionId, count: u32 },
-    BatchRecovered { session: SessionId, latency_ms: u32 },
-    BatchUnrecoverable { session: SessionId },
-    WastedParity { session: SessionId, count: u32 },
+    PacketsRecovered {
+        session: SessionId,
+        count: u32,
+    },
+    BatchRecovered {
+        session: SessionId,
+        latency_ms: u32,
+    },
+    BatchUnrecoverable {
+        session: SessionId,
+    },
+    WastedParity {
+        session: SessionId,
+        count: u32,
+    },
 
     // ---------- Loss characterization ----------
-    HolesObserved { session: SessionId, count: u32 },
+    HolesObserved {
+        session: SessionId,
+        count: u32,
+    },
     /// A burst of consecutive lost chunks ended; emitter reports its length.
-    LossBurst { session: SessionId, length: u32 },
-    ReorderDistance { session: SessionId, distance: u32 },
+    LossBurst {
+        session: SessionId,
+        length: u32,
+    },
 
     // ---------- Latency / jitter samples ----------
-    BatchFillLatency { session: SessionId, latency_ms: u32 },
+    BatchFillLatency {
+        session: SessionId,
+        latency_ms: u32,
+    },
     /// Local-clock RTT sample from retransmit-request emission to arrival.
     /// See memory `project_per_peer_epoch.md` for why this must stay local.
-    RetransmitRtt { session: SessionId, rtt_ms: u32 },
+    RetransmitRtt {
+        session: SessionId,
+        rtt_ms: u32,
+    },
 
     // ---------- Application state (latest wins within a window) ----------
     BufferState {
@@ -488,17 +527,29 @@ pub enum Observation {
         head: u64,
         len: u64,
     },
-    LastActivityGap { session: SessionId, gap_ms: u32 },
+    LastActivityGap {
+        session: SessionId,
+        gap_ms: u32,
+    },
 
     // ---------- Sender pacing ----------
     /// One iteration of the sender's tick loop. `emitted = true` if data was
     /// produced; otherwise the tick was a no-op (paused, no chunks, etc.).
-    SendTick { session: SessionId, emitted: bool },
+    SendTick {
+        session: SessionId,
+        emitted: bool,
+    },
 
     // ---------- Sticky single-window event flags ----------
-    Paused { session: SessionId },
-    Seeked { session: SessionId },
-    AddressRebind { session: SessionId },
+    Paused {
+        session: SessionId,
+    },
+    Seeked {
+        session: SessionId,
+    },
+    AddressRebind {
+        session: SessionId,
+    },
 }
 
 /// Cheap clone-and-fire channel handed to every layer that has something to
@@ -531,7 +582,12 @@ impl DrainHandle {
     /// and on collector shutdown.
     pub async fn drain(&self, session: SessionId) -> Vec<DataEntry> {
         let (tx, rx) = oneshot::channel();
-        if self.0.send(DrainRequest::Session(session, tx)).await.is_err() {
+        if self
+            .0
+            .send(DrainRequest::Session(session, tx))
+            .await
+            .is_err()
+        {
             return Vec::new();
         }
         rx.await.unwrap_or_default()
@@ -845,11 +901,6 @@ impl CollectorState {
                     max_nz32(&mut e.longest_loss_burst, length);
                 }
             }
-            Observation::ReorderDistance { session, distance } => {
-                if let Some(e) = self.entry_mut(session) {
-                    max_nz32(&mut e.max_reorder_distance, distance);
-                }
-            }
 
             Observation::BatchFillLatency {
                 session,
@@ -867,11 +918,7 @@ impl CollectorState {
                 }
             }
 
-            Observation::BufferState {
-                session,
-                head,
-                len,
-            } => {
+            Observation::BufferState { session, head, len } => {
                 if let Some(e) = self.entry_mut(session) {
                     // Latest snapshot wins; emitters fire on state changes.
                     e.buffer_head = Some(head);
@@ -1062,14 +1109,6 @@ mod tests {
             session: s,
             length: 5,
         });
-        chan.post(Observation::ReorderDistance {
-            session: s,
-            distance: 2,
-        });
-        chan.post(Observation::ReorderDistance {
-            session: s,
-            distance: 7,
-        });
         // latency samples — inter-arrival is synthesised in the collector
         // from `DataPacketReceived` arrival times, not posted explicitly.
         chan.post(Observation::BatchFillLatency {
@@ -1141,7 +1180,6 @@ mod tests {
 
         // max / latency
         assert_eq!(e.longest_loss_burst.map(NonZeroU32::get), Some(5));
-        assert_eq!(e.max_reorder_distance.map(NonZeroU32::get), Some(7));
         assert_eq!(e.recovery_latency_ms_sum, Some(20));
         assert_eq!(e.recovery_latency_count.map(NonZeroU32::get), Some(2));
         assert_eq!(e.batch_fill_latency_ms_sum, Some(20));

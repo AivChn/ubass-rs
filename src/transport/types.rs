@@ -2,18 +2,14 @@ use crate::{
     prelude::*,
     utils::messages::{PacketProcessingMessage, TransportMessage},
 };
-use std::{
-    fmt::Debug,
-    net::SocketAddr,
-    sync::Arc,
-};
+use std::{fmt::Debug, net::SocketAddr, sync::Arc};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 /// Maximum UDP packet size in bytes (1452).
 pub const MAX_PACKET_SIZE: usize = 1452;
 
-pub const MAX_CONCURRENT_SENDS: usize = 128;
+pub const MAX_CONCURRENT_SENDS: u64 = 128;
 pub const MAX_PACKET_BUFFER_SIZE: usize = 128;
 pub const BUFFER_TIMEOUT: u64 = 5;
 

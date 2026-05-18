@@ -8,7 +8,7 @@ use tokio::{
 };
 use tracing::{debug, error, instrument};
 
-use super::types::{BUFFER_TIMEOUT, MAX_CONCURRENT_SENDS, MAX_PACKET_BUFFER_SIZE, OutboundSockets};
+use super::types::{BUFFER_TIMEOUT, MAX_PACKET_BUFFER_SIZE, OutboundSockets};
 
 #[instrument]
 pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocket>) -> ErrResult {
@@ -96,8 +96,6 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
             }
         }
 
-        while monitor.size() > MAX_CONCURRENT_SENDS {}
-
         #[allow(clippy::cast_possible_truncation)]
         let _ = sockets
             .update(start_time.elapsed().as_millis() as u64)
@@ -177,8 +175,8 @@ mod test {
         PORT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
-    fn prepare_init() -> (OutboundSender, JoinHandle<ErrResult>) {
-        let socket = Arc::new(bind_listen_socket(next_port()).unwrap());
+    async fn prepare_init() -> (OutboundSender, JoinHandle<ErrResult>) {
+        let socket = Arc::new(bind_listen_socket(next_port()).await.unwrap());
         let (sender, receiver): (OutboundSender, _) = tokio::sync::mpsc::channel(1);
         (sender, tokio::spawn(outbound::init(receiver, socket)))
     }
@@ -198,7 +196,7 @@ mod test {
             }
         };
 
-        let (sender, _handle) = prepare_init();
+        let (sender, _handle) = prepare_init().await;
         let packet = ProcessedPacket {
             dest_addr: SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)),
             packet_type: PacketType::Data,
@@ -214,7 +212,7 @@ mod test {
 
     #[tokio::test]
     async fn graceful_close() {
-        let (sender, handle) = prepare_init();
+        let (sender, handle) = prepare_init().await;
         _ = sender.send(TransportMessage::Close).await;
         assert!(handle.await.unwrap().is_ok());
     }
@@ -237,7 +235,7 @@ mod test {
             Ok(())
         });
 
-        let (sender, _handle) = prepare_init();
+        let (sender, _handle) = prepare_init().await;
         let packets: Vec<_> = messages
             .iter()
             .map(|message| ProcessedPacket {
