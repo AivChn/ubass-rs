@@ -25,7 +25,7 @@ pub async fn main() {
     };
 
     let connection = incoming_connection
-        .approve_if_and_ready(|app_id| app_id == "example client", "Not example Client")
+        .approve_if(|app_id| app_id == "example client")
         .await
         .unwrap() // was not example client
         .unwrap(); // connection failed for some reason
@@ -39,7 +39,7 @@ pub async fn main() {
     let mut data = b"So long, and thanks for all the fish!".to_vec();
     data.resize(42, 0);
     let approval_status = requested_stream
-        .approve_if_and_ready(|track_id| track_id == b"some track ID".as_slice(), data)
+        .approve_if(|track_id| track_id == b"some track ID".as_slice(), data)
         .await;
 
     let stream = match approval_status {

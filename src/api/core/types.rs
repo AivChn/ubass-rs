@@ -1,6 +1,6 @@
 use crate::{
     api::{
-        self, SendTarget, StreamTrait,
+        self, SendTarget,
         types::{ReadableBuffer, WriteableBuffer},
     },
     error::{
@@ -27,6 +27,8 @@ use std::{
     sync::{Arc, Weak, atomic::AtomicBool},
     thread::JoinHandle,
 };
+
+use futures::executor;
 
 use tokio::sync::{
     Mutex,
@@ -281,7 +283,13 @@ type HandshakeDoneReceiver =
 pub struct PendingConnection {
     api: Weak<ApiInner>,
     peer_address: SocketAddr,
-    reply: HandshakeDoneReceiver,
+    reply: Option<HandshakeDoneReceiver>,
+}
+
+impl Drop for PendingConnection {
+    fn drop(&mut self) {
+        executor::block_on(self.inner_discard())
+    }
 }
 
 impl PendingConnection {
@@ -293,8 +301,20 @@ impl PendingConnection {
         Self {
             api,
             peer_address,
-            reply,
+            reply: Some(reply),
         }
+    }
+
+    async fn inner_discard(&mut self) {
+        let Ok(Ok((session_id, _))) = o_unwrap_or_return!(self.reply.take()).recv().await else {
+            return;
+        };
+
+        let Some(api) = self.api.upgrade() else {
+            return;
+        };
+
+        api.close_session(session_id).await;
     }
 }
 
@@ -302,9 +322,11 @@ impl api::types::PendingConnection for PendingConnection {
     type Connection = Connection;
     type Error = ConnectionError;
 
-    async fn ready(self) -> Result<Self::Connection, Self::Error> {
+    async fn ready(mut self) -> Result<Self::Connection, Self::Error> {
         let (session_id, receiver) = match self
             .reply
+            .take()
+            .expect("This is only removed on Drop or here")
             .recv()
             .await
             .map_err(|_| ConnectionError::ProtocolClosed)?
@@ -315,33 +337,14 @@ impl api::types::PendingConnection for PendingConnection {
             }
         };
         Ok(Connection::new(
-            self.api,
+            self.api.clone(),
             session_id,
             self.peer_address,
             receiver,
         ))
     }
 
-    // HACK: This is a temporary solution. idealy, the pending connection could tell the protocol to
-    // mark it as stale
-    async fn discard(self) -> Result<(), Self::Error> {
-        if self.api.strong_count() == 0 {
-            return Err(ConnectionError::ProtocolClosed);
-        }
-        tokio::spawn(async move {
-            let Ok(Ok((session_id, _))) = self.reply.recv().await else {
-                return;
-            };
-
-            let Some(api) = self.api.upgrade() else {
-                return;
-            };
-
-            api.close_session(session_id).await;
-        });
-
-        Ok(())
-    }
+    async fn discard(self) {}
 }
 
 #[derive(Debug)]
@@ -350,7 +353,13 @@ pub struct IncomingConnection {
     peer_address: SocketAddr,
     app_id: AppId,
     approve_channel: Option<oneshot::Sender<AppResponse>>,
-    reply: HandshakeDoneReceiver,
+    reply: Option<HandshakeDoneReceiver>,
+}
+
+impl Drop for IncomingConnection {
+    fn drop(&mut self) {
+        executor::block_on(self.inner_reject("Dropped By Peer"));
+    }
 }
 
 impl IncomingConnection {
@@ -367,8 +376,16 @@ impl IncomingConnection {
             peer_address,
             app_id,
             approve_channel: Some(approve_channel),
-            reply,
+            reply: Some(reply),
         }
+    }
+
+    async fn inner_reject(&mut self, reason: impl Into<String>) {
+        let sender = o_unwrap_or_return!(self.approve_channel.take());
+        let reason = reason.into();
+        _ = sender
+            .send(AppResponse::AppRejected(reason))
+            .panic_in_debug("ApiToManager channel failed sending in `reject`");
     }
 }
 
@@ -380,21 +397,9 @@ impl api::types::IncomingConnection for IncomingConnection {
         &self.app_id
     }
 
-    async fn reject(mut self, reason: impl Into<String>) -> Result<(), Self> {
-        let Some(sender) = self.approve_channel.take() else {
-            return Ok(());
-        };
-        let reason = reason.into();
-        if reason.len() > MAX_PAYLOAD_LENGTH || !reason.is_ascii() {
-            return Err(self);
-        }
-        _ = sender
-            .send(AppResponse::AppRejected(reason))
-            .panic_in_debug("ApiToManager channel failed sending in `reject`");
-        Ok(())
-    }
+    async fn reject(self) {}
 
-    async fn approve_and_ready(mut self) -> core::result::Result<Self::Connection, Self::Error> {
+    async fn approve(mut self) -> core::result::Result<Self::Connection, Self::Error> {
         let sender = self.approve_channel.take();
         debug_assert!(
             sender.is_some(),
@@ -407,11 +412,17 @@ impl api::types::IncomingConnection for IncomingConnection {
             .send(AppResponse::AppApproved)
             .map_err(|_| ConnectionError::ProtocolClosed)?;
 
-        match self.reply.recv().await {
+        match self
+            .reply
+            .take()
+            .expect("This is only removed on Drop or here")
+            .recv()
+            .await
+        {
             Err(e) => Err(ConnectionError::from_api(e)),
             Ok(Err(e)) => Err(e),
             Ok(Ok((session_id, receiver))) => Ok(Connection::new(
-                self.api,
+                self.api.clone(),
                 session_id,
                 self.peer_address,
                 receiver,
@@ -419,21 +430,15 @@ impl api::types::IncomingConnection for IncomingConnection {
         }
     }
 
-    async fn approve_if_and_ready(
+    async fn approve_if(
         self,
         condition: impl FnOnce(&str) -> bool,
-        rejection_reason: impl Into<String>,
     ) -> Option<core::result::Result<Self::Connection, Self::Error>> {
         if condition(&self.app_id) {
-            Some(self.approve_and_ready().await)
+            Some(self.approve().await)
         } else {
-            let reason = rejection_reason.into();
-            if !reason.is_ascii() || reason.len() > MAX_PAYLOAD_LENGTH {
-                Some(Err(ConnectionError::InvalidReason(self)))
-            } else {
-                _ = self.reject(reason).await;
-                None
-            }
+            self.reject().await;
+            None
         }
     }
 }
@@ -470,15 +475,16 @@ impl Connection {
     pub fn peer(&self) -> SocketAddr {
         self.peer_address
     }
+
+    async fn inner_close(&self) {
+        let api: Arc<ApiInner> = o_unwrap_or_return!(self.api.upgrade());
+        api.close_session(self.session_id).await;
+    }
 }
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        let api: Arc<ApiInner> = o_unwrap_or_return!(self.api.upgrade());
-        let session_id = self.session_id;
-        let tx = api.api_to_manager.clone();
-        _ = std::thread::spawn(move || _ = tx.blocking_send(ApiCommand::CloseSession(session_id)))
-            .join();
+        executor::block_on(self.inner_close());
     }
 }
 
@@ -564,7 +570,6 @@ impl api::types::Connection for Connection {
 
         let buffer = buffer.into();
         let buffer_len = buffer.len();
-        let _length = buffer.len();
         let (sender, receiver) = watch::channel(StreamMessage::default());
 
         let response = api
@@ -577,7 +582,7 @@ impl api::types::Connection for Connection {
             .await;
 
         match response.recv().await {
-            Ok(Ok(_s)) => Ok(PendingStream::new_input(
+            Ok(Ok(_)) => Ok(PendingStream::new_input(
                 self.api.clone(),
                 self.session_id,
                 buffer_len,
@@ -600,8 +605,7 @@ impl api::types::Connection for Connection {
     }
 
     async fn close(self) {
-        let api: Arc<ApiInner> = o_unwrap_or_return!(self.api.upgrade());
-        api.close_session(self.session_id).await;
+        self.inner_close().await;
     }
 }
 
@@ -616,7 +620,7 @@ pub struct Stream<Direction: api::types::StreamDirection> {
     api: Weak<ApiInner>,
     session: SessionId,
     size: usize,
-    connection: Connection,
+    connection: Option<Connection>,
     allow_partial: bool,
     update: watch::Receiver<StreamMessage>,
     _marker: PhantomData<Direction>,
@@ -624,6 +628,12 @@ pub struct Stream<Direction: api::types::StreamDirection> {
 
 pub type InputStream = Stream<api::types::Input>;
 pub type OutputStream = Stream<api::types::Output>;
+
+impl<Direction: api::types::StreamDirection> Drop for Stream<Direction> {
+    fn drop(&mut self) {
+        _ = executor::block_on(self.inner_close());
+    }
+}
 
 impl<Direction: api::types::StreamDirection> Stream<Direction> {
     pub(super) fn new(
@@ -637,11 +647,22 @@ impl<Direction: api::types::StreamDirection> Stream<Direction> {
             api,
             session: session_id,
             size,
-            connection,
+            connection: Some(connection),
             allow_partial: false,
             update: receiver,
             _marker: PhantomData,
         }
+    }
+
+    async fn inner_close(&mut self) -> Result<Option<Connection>, (ConnectionError, Connection)> {
+        let Some(conn) = self.connection.take() else {
+            return Ok(None);
+        };
+        let Some(api) = self.api.upgrade() else {
+            return Err((ConnectionError::ProtocolClosed, conn));
+        };
+        api.close_stream(self.session).await;
+        Ok(Some(conn))
     }
 }
 
@@ -727,16 +748,17 @@ impl api::types::Stream for Stream<api::types::Input> {
             // TODO: in the future just close stream
             Err(ConnectionError::BufferClosedUnexpectedly)
         } else {
-            Ok(self.connection)
+            Ok(self
+                .connection
+                .take()
+                .expect("This is only removed on Drop or here"))
         }
     }
 
-    async fn close(self) -> Result<Self::Connection, (Self::Error, Self::Connection)> {
-        let Some(api) = self.api.upgrade() else {
-            return Err((ConnectionError::ProtocolClosed, self.connection));
-        };
-        api.close_stream(self.session).await;
-        Ok(self.connection)
+    async fn close(mut self) -> Result<Self::Connection, (Self::Error, Self::Connection)> {
+        self.inner_close()
+            .await
+            .map(|c| c.expect("Explicit call to close() will never have an empty connection field"))
     }
 }
 
@@ -762,15 +784,16 @@ impl api::types::Stream for Stream<api::types::Output> {
             .wait_for(|message| message.closed)
             .await
             .map_err(|_| ConnectionError::ProtocolClosed)?;
-        Ok(self.connection)
+        Ok(self
+            .connection
+            .take()
+            .expect("This is only removed on Drop or here"))
     }
 
-    async fn close(self) -> Result<Self::Connection, (Self::Error, Self::Connection)> {
-        let Some(api) = self.api.upgrade() else {
-            return Err((ConnectionError::ProtocolClosed, self.connection));
-        };
-        api.close_stream(self.session).await;
-        Ok(self.connection)
+    async fn close(mut self) -> Result<Self::Connection, (Self::Error, Self::Connection)> {
+        self.inner_close()
+            .await
+            .map(|c| c.expect("Explicit call to close() will never have an empty connection field"))
     }
 }
 
@@ -794,8 +817,23 @@ pub struct RequestedStream<Direction: api::types::StreamDirection> {
     api: Weak<ApiInner>,
     session: SessionId,
     track_id: Box<[u8]>,
-    connection: Connection,
+    connection: Option<Connection>,
     _marker: PhantomData<Direction>,
+}
+
+impl<Direction: api::types::StreamDirection> Drop for RequestedStream<Direction> {
+    fn drop(&mut self) {
+        _ = executor::block_on(self.inner_reject());
+    }
+}
+
+impl<Direction: api::types::StreamDirection> RequestedStream<Direction> {
+    async fn inner_reject(&mut self) -> Result<Option<Connection>, ConnectionError> {
+        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
+        api.reject_track_request(self.session, std::mem::take(&mut self.track_id))
+            .await;
+        Ok(self.connection.take())
+    }
 }
 
 impl RequestedStream<api::types::Output> {
@@ -809,7 +847,7 @@ impl RequestedStream<api::types::Output> {
             api,
             session,
             track_id,
-            connection,
+            connection: Some(connection),
             _marker: PhantomData,
         }
     }
@@ -825,20 +863,24 @@ impl api::types::RequestedStream for RequestedStream<api::types::Output> {
         &self.track_id
     }
 
-    async fn reject(self) -> Result<Connection, Self::Error> {
-        let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
-        api.reject_track_request(self.session, self.track_id).await;
-        Ok(self.connection)
+    async fn reject(mut self) -> Result<Connection, Self::Error> {
+        self.inner_reject()
+            .await
+            .map(|c| c.expect("Explicit call to reject() will always have a connection"))
     }
 
-    async fn approve_and_ready(
-        self,
+    async fn approve(
+        mut self,
         buffer: impl Into<ReadableBuffer>,
     ) -> Result<Stream<api::types::Output>, (Self::Error, Connection)> {
+        let conn = self
+            .connection
+            .take()
+            .expect("This is only removed on Drop or here");
+
         let Some(api) = self.api.upgrade() else {
-            return Err((ConnectionError::ProtocolClosed, self.connection));
+            return Err((ConnectionError::ProtocolClosed, conn));
         };
-        let api: Arc<ApiInner> = api;
 
         let buffer = buffer.into();
         let length = buffer.len();
@@ -850,11 +892,11 @@ impl api::types::RequestedStream for RequestedStream<api::types::Output> {
             Ok(_) => Ok(Stream::<api::types::Output>::new(
                 self.api.clone(),
                 self.session,
-                self.connection,
+                conn,
                 length,
                 receiver,
             )),
-            Err(e) => Err((ConnectionError::from_api(e), self.connection)),
+            Err(e) => Err((ConnectionError::from_api(e), conn)),
         }
     }
 }
@@ -877,7 +919,7 @@ impl api::types::RequestedStream for RequestedStream<api::types::Input> {
         todo!("RequestedStream<Input> not yet wired")
     }
 
-    async fn approve_and_ready(
+    async fn approve(
         self,
         _buffer: impl Into<WriteableBuffer>,
     ) -> Result<Stream<api::types::Input>, (Self::Error, Connection)> {
@@ -892,8 +934,60 @@ pub struct PendingStream<Direction: api::types::StreamDirection> {
     session: SessionId,
     stream_size: usize,
     update: watch::Receiver<StreamMessage>,
-    connection: Connection,
+    connection: Option<Connection>,
     _marker: PhantomData<Direction>,
+}
+
+impl<Direction: api::types::StreamDirection> PendingStream<Direction> {
+    async fn inner_discard(
+        &mut self,
+    ) -> Result<Option<Connection>, (ConnectionError, Option<Connection>)> {
+        let Some(_) = self.api.upgrade() else {
+            return Err((ConnectionError::ProtocolClosed, self.connection.take()));
+        };
+        let Some(conn) = self.connection.take() else {
+            return Ok(None);
+        };
+        let Some(conn) = self
+            .inner_ready(conn)
+            .await
+            .map_err(|(e, c)| (e, Some(c)))?
+            .inner_close()
+            .await
+            .map_err(|(e, c)| (e, Some(c)))?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(conn))
+    }
+
+    async fn inner_ready(
+        &mut self,
+        conn: Connection,
+    ) -> Result<Stream<Direction>, (ConnectionError, Connection)> {
+        let Ok(r) = self.update.wait_for(|e| e.approved.is_some()).await else {
+            return Err((ConnectionError::ProtocolClosed, conn));
+        };
+
+        if r.approved.is_some_and(identity) {
+            drop(r);
+            Ok(Stream::<Direction>::new(
+                self.api.clone(),
+                self.session,
+                conn,
+                self.stream_size,
+                self.update.clone(),
+            ))
+        } else {
+            Err((ConnectionError::PeerRejected(None), conn))
+        }
+    }
+}
+
+impl<Direction: api::types::StreamDirection> Drop for PendingStream<Direction> {
+    fn drop(&mut self) {
+        todo!()
+    }
 }
 
 impl PendingStream<api::types::Input> {
@@ -909,7 +1003,7 @@ impl PendingStream<api::types::Input> {
             session,
             stream_size,
             update,
-            connection,
+            connection: Some(connection),
             _marker: PhantomData,
         }
     }
@@ -921,30 +1015,21 @@ impl api::types::PendingStream for PendingStream<api::types::Input> {
     type OwningConnection = Connection;
 
     async fn ready(mut self) -> Result<Stream<api::types::Input>, (Self::Error, Connection)> {
-        let Ok(r) = self.update.wait_for(|e| e.approved.is_some()).await else {
-            return Err((ConnectionError::ProtocolClosed, self.connection));
-        };
-
-        if r.approved.is_some_and(identity) {
-            drop(r);
-            Ok(Stream::<api::types::Input>::new(
-                self.api,
-                self.session,
-                self.connection,
-                self.stream_size,
-                self.update,
-            ))
-        } else {
-            Err((ConnectionError::PeerRejected(None), self.connection))
-        }
+        let conn = self
+            .connection
+            .take()
+            .expect("This is only removed on Drop or here");
+        self.inner_ready(conn).await
     }
 
-    async fn discard(self) -> Result<Connection, (Self::Error, Connection)> {
-        let Some(_api) = self.api.upgrade() else {
-            return Err((ConnectionError::ProtocolClosed, self.connection));
-        };
-        let stream = self.ready().await?;
-        stream.close().await
+    async fn discard(mut self) -> Result<Connection, (Self::Error, Connection)> {
+        match self.inner_discard().await {
+            Ok(c) => Ok(c.expect("Explicit call to discard always has a connection")),
+            Err((e, c)) => Err((
+                e,
+                c.expect("Explicit call to discard always has a connection"),
+            )),
+        }
     }
 }
 

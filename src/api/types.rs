@@ -472,12 +472,12 @@ pub trait RequestedStream: Sized {
     fn track_id(&self) -> &[u8];
 
     async fn reject(self) -> core::result::Result<Self::OwningConnection, Self::Error>;
-    async fn approve_and_ready(
+    async fn approve(
         self,
         buffer: impl Into<Self::ApprovalBuffer>,
     ) -> core::result::Result<Self::Stream, (Self::Error, Self::OwningConnection)>;
 
-    async fn approve_if_and_ready(
+    async fn approve_if(
         self,
         f: impl FnOnce(&[u8]) -> bool,
         buffer: impl Into<Self::ApprovalBuffer>,
@@ -490,7 +490,7 @@ pub trait RequestedStream: Sized {
     {
         {
             if f(self.track_id()) {
-                ApprovalStatus::Approved(self.approve_and_ready(buffer).await)
+                ApprovalStatus::Approved(self.approve(buffer).await)
             } else {
                 ApprovalStatus::Rejected(self.reject().await)
             }
@@ -521,12 +521,11 @@ pub trait IncomingConnection: Sized {
     type Error: std::error::Error;
 
     fn app_id(&self) -> &str;
-    async fn reject(self, reason: impl Into<String>) -> Result<(), Self>;
-    async fn approve_and_ready(self) -> core::result::Result<Self::Connection, Self::Error>;
-    async fn approve_if_and_ready(
+    async fn reject(self);
+    async fn approve(self) -> core::result::Result<Self::Connection, Self::Error>;
+    async fn approve_if(
         self,
         f: impl FnOnce(&str) -> bool,
-        reject_reason: impl Into<String>,
     ) -> Option<core::result::Result<Self::Connection, Self::Error>>;
 }
 
@@ -535,7 +534,7 @@ pub trait PendingConnection {
     type Error: std::error::Error;
 
     async fn ready(self) -> core::result::Result<Self::Connection, Self::Error>;
-    async fn discard(self) -> core::result::Result<(), Self::Error>;
+    async fn discard(self);
 }
 
 pub trait Connection: Sized {
