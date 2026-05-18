@@ -2,14 +2,18 @@ use crate::prelude::*;
 use std::net::{Ipv4Addr, SocketAddrV4};
 
 pub trait Serialize: Sized {
+    /// Serialize self into the buffer occupying 0 to sized()
+    ///
     /// # Errors
-    /// This errors if buffer not big enough
-    #[allow(clippy::result_unit_err)]
+    /// Returns an error if the buffer is not big enough
     fn serialize(&self, buf: &mut [u8]) -> EmptyResult;
+    /// Deserialize the next sized() bytes into an instance of this type
     /// # Errors
-    /// this errors if deserialization fails
-    #[allow(clippy::result_unit_err)]
+    /// this errors if deserialization fails, usually caused by the buffer being too small but can
+    /// be caused by arbitrary type specific limitations (like value not matching any variants for
+    /// an enum)
     fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()>;
+    /// The on-the-wire size of the type, requires an instance of Self for dynamically sized types
     fn sized(&self) -> usize;
 }
 

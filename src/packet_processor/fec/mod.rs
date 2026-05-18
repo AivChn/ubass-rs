@@ -155,19 +155,22 @@ compile_error!("cannot enable both fec_rs and fec_xor, disable fec_xor to use Re
 #[cfg(feature = "fec_xor")]
 type FECImpl = xor::Xor;
 
-#[cfg(all(feature = "fec_rs", not(feature = "fec_xor")))]
+#[cfg(feature = "fec_rs")]
 type FECImpl = reed_solomon::RS;
 
 static FEC: LazyLock<FECImpl> = LazyLock::new(FECImpl::new);
 
+/// Processes the sent packet, returning a vector of parity packets to send if the batch is done.
 pub async fn sent(packet: impl FECCompatible) -> Option<Vec<ParityPacket>> {
     FEC.sent(packet.into()).await
 }
 
+/// Processes the received packet, returns `true` if the batch is ready for recovery.
 pub async fn received(packet: impl FECCompatible) -> bool {
     FEC.received(packet.into()).await
 }
 
+/// Recovers a packet for the given batch, returning `None` if the batch is not ready for recovery
 pub async fn recover(batch_id: BatchID, session_id: SessionId) -> Option<Recovered> {
     let packets = FEC.recover(batch_id, session_id).await?;
     Some(Recovered {
@@ -177,6 +180,7 @@ pub async fn recover(batch_id: BatchID, session_id: SessionId) -> Option<Recover
     })
 }
 
+/// executes a prune routine, returns all the missing byte ranges for every batch
 pub async fn prune(ttl_ms: u64) -> Vec<(SessionId, BatchID, Vec<BytePosition>)> {
     FEC.prune(ttl_ms).await
 }

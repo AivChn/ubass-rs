@@ -54,7 +54,13 @@ struct InboundBatchData {
     data_received: u8,
     batch_mask: [u128; 2],
     created_at: Timestamp,
+    // Set on first received data packet from `byte_range_start - batch_pos * MPL`.
+    // Used to enumerate missing positions for pruned batches; only meaningful
+    // when `is_contiguous` is true.
     base_byte_pos: Option<BytePosition>,
+    // True when every received packet's byte position matches
+    // `base_byte_pos + batch_pos * MPL`. Retransmit batches break this; for
+    // those we can't enumerate the missing positions on prune.
     is_contiguous: bool,
 }
 
