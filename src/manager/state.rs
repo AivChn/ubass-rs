@@ -1719,32 +1719,6 @@ impl PendingAckMonitor {
     }
 }
 
-#[derive(Eq, Deref)]
-struct FingerprintPtr(*const PacketFingerprint);
-
-unsafe impl Send for FingerprintPtr {}
-unsafe impl Sync for FingerprintPtr {}
-
-impl FingerprintPtr {
-    fn from_ref(value: &PacketFingerprint) -> Self {
-        Self(std::ptr::from_ref(value))
-    }
-}
-
-impl PartialEq for FingerprintPtr {
-    fn eq(&self, other: &Self) -> bool {
-        unsafe { (*self.0) == (*other.0) }
-    }
-}
-
-impl core::hash::Hash for FingerprintPtr {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        unsafe {
-            (*self.0).hash(state);
-        }
-    }
-}
-
 #[derive(Clone, Copy)]
 pub struct FingerprintMonitor {
     table: &'static FingerprintWindow,
@@ -1929,8 +1903,8 @@ impl PendingAckWindow {
 }
 
 pub struct FingerprintWindow {
-    fingerprints: RwLock<HashSet<Box<PacketFingerprint>>>,
-    queue: Mutex<VecDeque<(Timestamp, FingerprintPtr)>>,
+    fingerprints: RwLock<HashSet<PacketFingerprint>>,
+    queue: Mutex<VecDeque<(Timestamp, PacketFingerprint)>>,
     canceled: AtomicBool,
 }
 
@@ -1957,18 +1931,15 @@ impl FingerprintWindow {
         lock_read!(self.fingerprints).contains(fingerprint)
     }
 
-    pub async fn add(&self, fingerprint: Box<PacketFingerprint>) -> bool {
-        let ptr = {
+    pub async fn add(&self, fingerprint: PacketFingerprint) -> bool {
+        {
             let mut fingerprints = lock_write!(self.fingerprints);
-            let ptr = FingerprintPtr::from_ref(&fingerprint);
             if !fingerprints.insert(fingerprint) {
                 return false;
             }
+        }
 
-            ptr
-        };
-
-        lock!(self.queue).push_back((Timestamp::now(), ptr));
+        lock!(self.queue).push_back((Timestamp::now(), fingerprint));
 
         true
     }
@@ -1982,8 +1953,8 @@ impl FingerprintWindow {
                     .front()
                     .is_some_and(|(ts, _)| ts.been_longer_than(Self::PRUNE_INTERVAL))
                 {
-                    if let Some((_, ptr)) = queue.pop_front() {
-                        expired.push(ptr);
+                    if let Some((_, fingerprint)) = queue.pop_front() {
+                        expired.push(fingerprint);
                     }
                 }
                 match queue.front() {
@@ -1996,7 +1967,7 @@ impl FingerprintWindow {
                 let mut fingerprints = self.fingerprints.write().await;
                 expired
                     .drain(..)
-                    .for_each(|ptr| _ = fingerprints.remove(unsafe { &**ptr }));
+                    .for_each(|fingerprint| _ = fingerprints.remove(&fingerprint));
             }
 
             tokio::time::sleep(Duration::from_millis(top_timestamp + Self::BUFFERING_TIME)).await;

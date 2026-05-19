@@ -1070,7 +1070,7 @@ impl From<ErrorType> for SecondaryType {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Hash, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct PacketFingerprint([u8; 16]);
 
