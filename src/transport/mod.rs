@@ -103,7 +103,7 @@ fn bind_listen_socket(port: u16) -> Option<UdpSocket> {
 
     assert!(socket.set_reuse_address(true).is_ok());
     assert!(socket.set_reuse_port(true).is_ok());
-    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+    let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port));
     let addr = socket2::SockAddr::from(addr);
 
     socket.bind(&addr).ok()?;
