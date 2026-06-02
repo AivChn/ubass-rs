@@ -9,12 +9,7 @@ pub mod types;
 use std::sync::OnceLock;
 
 use crate::{
-    lock_read,
-    manager::{
-        self,
-        packets::SessionId,
-        state::{Port, ProtocolState},
-    },
+    manager::{self, state::ProtocolState},
     packet_processor::{self, types::PacketProcessorChannels},
     prelude::*,
     transport::{self, types::TransportChannels},
@@ -83,15 +78,12 @@ pub async fn init(
         _,
     ) = mpsc::channel(CHANNEL_BUFFER_SIZE);
 
-    _ = STATE.set(ProtocolState::new(
-        Port::new(port),
-        app_id,
-        manager_to_processor.clone(),
-    ));
+    _ = STATE.set(ProtocolState::new(app_id, manager_to_processor.clone()));
     _ = PROTOCOL_EPOCH.set(Instant::now());
 
     get_state!().ack.clone().init();
     get_state!().fec_prune.clone().init();
+    get_state!().fingerprints.clone().init();
 
     let (transport_handle, processor_handle) =
         setup_layers(port, processor_to_manager, processor_from_manager)
@@ -137,10 +129,6 @@ pub async fn init(
             }
         },
     }
-}
-
-pub async fn session_exists(session_id: SessionId) -> bool {
-    lock_read!(get_state!().connections).contains_key(&session_id)
 }
 
 async fn setup_layers(

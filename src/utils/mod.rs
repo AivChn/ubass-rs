@@ -86,18 +86,13 @@ pub struct Shared<T: Send + Sync> {
 }
 
 impl<T: Send + Sync> Shared<T> {
-    pub fn new(value: T) -> Self {
-        Self {
-            value: RwLock::new(value),
-            signal: Notify::default(),
-        }
-    }
-
+    #[allow(unused)]
     pub async fn with<R>(&self, f: impl FnOnce(&T) -> R) -> R {
         let val = lock_read!(self.value);
         f(&*val)
     }
 
+    #[allow(unused)]
     pub async fn with_async<R>(&self, f: impl AsyncFnOnce(&T) -> R) -> R {
         let val = lock_read!(self.value);
         f(&*val).await
@@ -109,6 +104,7 @@ impl<T: Send + Sync> Shared<T> {
         f(&mut *val)
     }
 
+    #[allow(unused)]
     pub async fn listen(&self) {
         self.signal.notified().await;
     }
@@ -127,16 +123,19 @@ impl<T: Send + Sync> Shared<T> {
 }
 
 impl<T: Send + Sync + Clone> Shared<T> {
+    #[allow(unused)]
     pub async fn read_cloned(&self) -> T {
         lock_read!(self.value).clone()
     }
 }
 
 impl<T: Send + Sync + Clone + Copy> Shared<T> {
+    #[allow(unused)]
     pub async fn read(&self) -> T {
         *lock_read!(self.value)
     }
 
+    #[allow(unused)]
     pub async fn get_next(&self) -> T {
         self.signal.notified().await;
         *lock_read!(self.value)
@@ -176,6 +175,7 @@ pub trait LogFail {
     #[must_use]
     fn log_error(self, msg: &str) -> Self;
 
+    #[allow(unused)]
     #[must_use]
     fn log_info(self, msg: &str) -> Self;
 
@@ -291,16 +291,26 @@ impl<T, E: Debug> LogFail for Result<T, E> {
     }
 }
 
+/// Trait to add an ergonomic interface for managing bitflag types
 pub trait Flags {
+    /// An associated flag type, the representation of any flag
     type FlagType;
+    /// Construct the bitflags from a list of flags
     fn construct(flags: &[Self::FlagType]) -> Self;
+    /// Deconstruct the bitflags representation to a list of all flags
+    #[allow(unused)]
     fn deconstruct(self) -> Vec<Self::FlagType>;
+    /// Instance of the bitflags with no flag set
     fn none() -> Self;
+    /// Set the given flag
     #[must_use]
     fn set(self, flag: Self::FlagType) -> Self;
+    /// Unset the given flag
     #[must_use]
     fn unset(self, flag: Self::FlagType) -> Self;
-    fn contains(self, flag: Self::FlagType) -> bool;
+    /// Check if the flag is set in the bitflags
+    fn contains(&self, flag: Self::FlagType) -> bool;
+    /// Debug only check to make sure that all the set flags are valid
     #[cfg(debug_assertions)]
     fn valid_flag(self) -> bool;
 }
@@ -311,8 +321,6 @@ pub trait SendPacket {
 
     async fn send(self: Box<Self>, sender: Self::Sender, address: SocketAddr);
 }
-
-pub struct W<T>(pub T);
 
 #[must_use]
 pub fn not(b: bool) -> bool {
@@ -325,14 +333,10 @@ pub struct HandleMonitor {
 }
 
 impl HandleMonitor {
-    pub fn size(&self) -> usize {
-        self.running.load(Ordering::Acquire)
-    }
-
     #[inline]
-    pub fn dispatch<F>(self: &Arc<Self>, future: F)
+    pub fn dispatch<F, O>(self: &Arc<Self>, future: F)
     where
-        F: Future<Output = ()> + Send + 'static,
+        F: Future<Output = O> + Send + 'static,
     {
         self.running.fetch_add(1, Ordering::Relaxed);
         let copy = self.clone();

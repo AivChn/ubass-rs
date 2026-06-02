@@ -281,9 +281,9 @@ impl WriteableBuffer {
             .collect()
     }
 
-    // Filter `score_areas` by `SCORE_THRESHOLD`, sort descending by score, and
-    // truncate to `MAX_REQUESTS_PER_TICK`. The returned slice is the policy's
-    // current ask list.
+    /// Filter `score_areas` by `SCORE_THRESHOLD`, sort descending by score, and
+    /// truncate to `MAX_REQUESTS_PER_TICK`. The returned slice is the policy's
+    /// current ask list.
     #[must_use]
     pub fn requestable_areas(&self) -> Vec<&Area> {
         let mut scored = self.score_areas();
@@ -506,6 +506,7 @@ pub trait Stream {
     fn current_position(&self) -> Self::Idx;
     fn is_playing(&self) -> bool;
     async fn is_done(&self) -> bool;
+    async fn wait_until_done(&mut self) -> Result<(), Self::Error>;
     async fn complete(self) -> Result<Self::Connection, Self::Error>;
     async fn close(self) -> Result<Self::Connection, (Self::Error, Self::Connection)>;
 }

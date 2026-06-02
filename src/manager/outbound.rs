@@ -36,6 +36,7 @@ pub async fn init(
                 _ = manager_to_processor
                     .send(PacketProcessingMessage::Close)
                     .await;
+                get_state!().join_layers().await;
                 return Ok(());
             }
             Some(ApiCommand::Connect(request)) => {

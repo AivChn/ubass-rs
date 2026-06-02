@@ -201,14 +201,12 @@ pub async fn received_handshake_rejected_packet(packet: Box<HandshakeRejection>)
             if let Some(handshake) =
                 lock_write!(get_state!().handshakes).remove(&packet.handshake_id)
             {
-                let reason = if packet.payload.len() == 1 && packet.payload[0] == 0 {
-                    None
-                } else {
-                    String::from_utf8(packet.payload.take()).ok()
-                };
+                // TODO: meaningful reason when support is readded
                 _ = handshake
                     .response
-                    .send(Err(ConnectionError::PeerRejected(reason)));
+                    .send(Err(ConnectionError::PeerRejected(Some(
+                        "Rejected By Peer".to_string(),
+                    ))));
             }
         }
         HandshakeRejectionReason::IdCollision => {
@@ -250,7 +248,7 @@ pub async fn received_parity_packet(packet: ParityPacket, outbound_sender: Manag
         match recovered_result {
             Err(Error::FailedToDeref) => failed_to_deref_buffer(session_id).await,
             Err(Error::StateMismatch { .. }) => {
-                UnexpectedPacketErrorPacket::unexpected(
+                UnexpectedPacketErrorPacket::new(
                     Options::none(),
                     session_id,
                     PacketType::Data,
@@ -270,24 +268,34 @@ pub async fn received_parity_packet(packet: ParityPacket, outbound_sender: Manag
     }
 }
 
+/// Routine to handle receiving a data packet
 pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerToProcessor) {
     get_state!()
         .global_handle_monitor
         .dispatch(update_last_activity(packet.session_id, packet.timestamp));
 
-    if let ConnectionStates::Handshake { signal, .. } =
-        o_unwrap_or_return!(lock_read!(get_state!().connections).get(&packet.session_id))
+    // scope lock
     {
-        let mut listener = signal.subscribe();
-        _ = r_unwrap_or_return!(
-            tokio::time::timeout(
-                Duration::from_secs(BUFFERING_TIME_FOR_HANDSHAKE),
-                listener.wait_for(|val| *val),
-            )
-            .await
-        );
+        let lock = lock_read!(get_state!().connections);
+        // if the connection is still in handshake,  wait for `BUFFERING_TIME_FOR_HANDSHAKE` and
+        // drop if not done by then
+        if let ConnectionStates::Handshake { signal, .. } =
+            o_unwrap_or_return!(lock.get(&packet.session_id))
+        {
+            let mut listener = signal.subscribe();
+            // make sure to not hold lock during await
+            drop(lock);
+            _ = r_unwrap_or_return!(
+                tokio::time::timeout(
+                    Duration::from_secs(BUFFERING_TIME_FOR_HANDSHAKE),
+                    listener.wait_for(|b| *b),
+                )
+                .await
+            );
+        }
     }
 
+    // ack the packet if needed
     if packet.opts.contains(OptionFlags::RequireAck) {
         received_packet_that_requires_ack(packet.session_id, &packet, outbound_sender.clone())
             .await;
@@ -297,20 +305,19 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
     let session_id = packet.session_id;
     let batch_id = packet.batch_id;
 
-    let result = {
-        let mut guard = lock_write!(get_state!().connections);
-        let Some(state) = guard.get_mut(&packet.session_id) else {
-            return;
-        };
-        state
-            .received_data_packet(packet, outbound_sender.clone())
-            .await
-    };
+    // update internal state, bail if session lookup failed
+    let result = o_unwrap_or_return!(lock_write!(get_state!().connections).get_mut(&session_id))
+        .received_data_packet(packet, outbound_sender.clone())
+        .await;
 
     match result {
-        Ok(b) if b => {
+        // if the process succeeded and the batch is recovery ready, recover eagerly
+        Ok(true) => {
+            // get recovered data
             let recovered = o_unwrap_or_return!(fec::recover(batch_id, session_id).await);
+            // lock outside of condition so that lock could be dropped explicitly
             let mut lock = lock_write!(get_state!().connections);
+            // if writing failed to dereference the buffer, it was dropped. App error.
             if let Err(Error::FailedToDeref) = o_unwrap_or_return!(lock.get_mut(&session_id))
                 .recovered_packet(recovered, outbound_sender)
                 .await
@@ -319,8 +326,10 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
                 failed_to_deref_buffer(session_id).await;
             }
         }
+        // if writing failed because of a state mismatch, this session did not expect to be
+        // receiving data. Send unexpected packet error.
         Err(Error::StateMismatch { .. }) => {
-            UnexpectedPacketErrorPacket::unexpected(
+            UnexpectedPacketErrorPacket::new(
                 Options::none(),
                 session_id,
                 PacketType::Data,
@@ -335,13 +344,16 @@ pub async fn received_data_packet(packet: DataPacket, outbound_sender: ManagerTo
             )
             .await;
         }
+        // if writing failed to dereference the buffer, it was dropped. App error.
         Err(Error::FailedToDeref) => {
             failed_to_deref_buffer(session_id).await;
         }
+        // some unexpected error occured, cant handle what shouldnt happen
         Err(e) => {
             warn!("received_data_packet: unexpected error for session {session_id}: {e:?}");
         }
-        _ => {}
+        // wrote successfully but recovery isnt ready - noop
+        Ok(false) => {}
     }
 }
 
@@ -374,12 +386,11 @@ async fn failed_to_deref_buffer(session_id: SessionId) {
 /// the two called functions panic on broken invariants, check their documentation for more information
 pub async fn received_hello_packet(
     packet: HelloPacket,
-    mut src_addr: SocketAddr,
+    src_addr: SocketAddr,
     outbound_sender: ManagerToProcessor,
     app_sender: ManagerToApi,
 ) {
     // setting the address to the one saved in state
-    src_addr.set_port(*packet.receiving_port);
     if lock_read!(get_state!().handshakes).contains_key(&packet.handshake_id) {
         received_hello_packet_as_initializer(packet, src_addr, outbound_sender).await;
     } else {
@@ -418,13 +429,12 @@ pub async fn received_hello_packet_as_receiver(
 
     match r_unwrap_or_return!(app_id_response.recv().await) {
         // send back app rejected error
-        AppResponse::AppRejected(message) => {
+        AppResponse::AppRejected(_ /* ignored until support is readded */) => {
             Box::new(HandshakeRejection::new(
                 Options::none(),
                 packet.proposed_session_id,
                 HandshakeRejectionReason::App,
                 packet.handshake_id,
-                PayloadField::from(message),
             ))
             .send(outbound_sender, src_addr)
             .await;
@@ -460,14 +470,13 @@ pub async fn received_hello_packet_as_receiver(
                 EncryptionWindow::new(Aes256Gcm::new((&key).into())),
             );
 
-            HelloPacket::new(
+            Box::new(HelloPacket::new(
                 Options::construct(&[OptionFlags::RequireAck]),
                 session_id,
                 packet.handshake_id,
                 public_key,
                 get_state!().app_id(),
-                get_state!().port(),
-            )
+            ))
             .send(outbound_sender, src_addr)
             .await;
         }
@@ -530,8 +539,14 @@ pub async fn received_hello_packet_as_initializer(
         packet.proposed_session_id,
         packet.handshake_id,
     ))
-    .send(outbound_sender, src_addr)
+    .send(outbound_sender.clone(), src_addr)
     .await;
+
+    // spawned and not dispatched because the stop condition cannot happen when the monitor is
+    // flushed
+    tokio::spawn(
+        get_state!().send_keep_alive_on_session(packet.proposed_session_id, outbound_sender),
+    );
 }
 
 async fn session_id_collided(
@@ -544,7 +559,6 @@ async fn session_id_collided(
         packet.proposed_session_id,
         HandshakeRejectionReason::IdCollision,
         packet.handshake_id,
-        PayloadField::empty(),
     ))
     .send(outbound_sender.clone(), src_addr)
     .await;
@@ -566,7 +580,6 @@ async fn session_id_collided(
         handshake_id,
         public_key,
         get_state!().app_id(),
-        get_state!().port(),
     ))
     .send(outbound_sender, src_addr)
     .await;

@@ -17,6 +17,7 @@ use crate::{DEFAULT_PORT, manager::AppId};
 pub struct Api {
     inner: Arc<ApiInner>,
 }
+
 impl Api {
     /// Opens the protocol, returning the Api singleton or an error if its already open.
     ///
@@ -44,6 +45,8 @@ impl Api {
             inner: Arc::new(ApiInner::new(port, app_id)?),
         })
     }
+
+    pub fn close(self) {}
 
     /// connects to the given address. This function will return a `PendingConnection` struct that
     /// can be awaited to get a ready connection at any point.

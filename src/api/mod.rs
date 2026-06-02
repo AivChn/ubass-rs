@@ -9,9 +9,9 @@ pub use core::{
 };
 pub use types::{
     ApprovalStatus, Connection as ConnectionTrait, IncomingConnection as IncomingConnectionTrait,
-    PendingConnection as PendingConnectionTrait, PendingStream as PendingStreamTrait,
-    PlaybackControl, ReadableBuffer, RequestedStream as RequestedStreamTrait,
-    Stream as StreamTrait, WriteableBuffer,
+    Input, Output, PendingConnection as PendingConnectionTrait,
+    PendingStream as PendingStreamTrait, PlaybackControl, ReadableBuffer,
+    RequestedStream as RequestedStreamTrait, Stream as StreamTrait, WriteableBuffer,
 };
 
 #[cfg(feature = "rust-api")]

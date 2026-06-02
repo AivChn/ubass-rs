@@ -16,3 +16,4 @@ target/
 /tests/song.flac
 /tests/logs
 /instructions.md
+/src/tests/logs

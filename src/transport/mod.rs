@@ -10,7 +10,10 @@ use std::{
 use crate::{prelude::*, transport::types::InboundSender};
 
 use socket2::{Domain, Socket, Type};
-use tokio::{net::UdpSocket, sync::oneshot};
+use tokio::{
+    net::UdpSocket,
+    sync::{Notify, oneshot},
+};
 use tracing::{debug, error, info, instrument};
 use types::TransportChannels;
 
@@ -35,9 +38,19 @@ pub async fn init(
         Some(s) => Arc::new(s),
     };
 
+    let stop_signal = Arc::new(Notify::new());
+
     info!("listening on {port}");
-    let mut recv_handle = tokio::spawn(inbound::init(listening_socket.clone(), sender.clone()));
-    let mut send_handle = tokio::spawn(outbound::init(receiver, listening_socket.clone()));
+    let mut recv_handle = tokio::spawn(inbound::init(
+        listening_socket.clone(),
+        sender.clone(),
+        stop_signal.clone(),
+    ));
+    let mut send_handle = tokio::spawn(outbound::init(
+        receiver,
+        listening_socket.clone(),
+        stop_signal.clone(),
+    ));
     debug!("initializing the transport layer");
     _ = signal.send(Ok(()));
 
@@ -54,9 +67,11 @@ pub async fn init(
         res = &mut send_handle, if !send_handle.is_finished() => {
             if let Ok(res) = res {
                 debug!("send transport returned as a result of graceful shutdown");
+                _ = recv_handle.await;
                 res
             } else {
                 error!("send task failed");
+                recv_handle.abort();
                 Err(TaskError::TaskFailed.into())
             }
         }

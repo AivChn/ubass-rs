@@ -100,14 +100,6 @@ impl ConnectionError {
     }
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum StreamErrors {
-    #[error("{0}")]
-    Connection(ConnectionError),
-    #[error("Stream was paused by peer")]
-    PausedByPeer,
-}
-
 pub use PipeDirection::*;
 use derive_more::Display;
 

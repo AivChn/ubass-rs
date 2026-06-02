@@ -15,18 +15,13 @@ pub type ManagerFromProcessor = Receiver<Result<ManagerMessage>>;
 pub type ManagerToApi = Sender<Result<ApiMessage>>;
 pub type ManagerFromApi = Receiver<ApiCommand>;
 
+/// Represents the number of ms since PROTOCOL_EPOCH at point of construction
 #[derive(Serialize, Clone, Copy, PartialEq, Debug)]
 #[repr(transparent)]
 pub struct Timestamp(pub u64);
 
-impl From<&ForeignTimestamp> for Timestamp {
-    fn from(value: &ForeignTimestamp) -> Self {
-        Self(value.get())
-    }
-}
-
 impl Timestamp {
-    /// returns the current time since `PROTOCOL_EPOCH`
+    /// Returns the current time since `PROTOCOL_EPOCH`
     ///
     /// # Panics
     /// This function panics if `PROTOCOL_EPOCH` is not yet initialized - an invariant
@@ -41,18 +36,16 @@ impl Timestamp {
                 .as_millis() as u64,
         )
     }
+
+    /// Set the timestamp to `Timestamp::now()` in place
     pub fn set_again(&mut self) {
         *self = Timestamp::now();
     }
 
+    /// check if it has been longer than `millis` since the timestamp to now.
     #[must_use]
     pub fn been_longer_than(&self, millis: u64) -> bool {
         Self::now().0 - self.0 > millis
-    }
-
-    #[must_use]
-    pub fn none() -> Self {
-        Timestamp(0)
     }
 
     #[must_use]
@@ -61,16 +54,17 @@ impl Timestamp {
     }
 }
 
+impl From<&ForeignTimestamp> for Timestamp {
+    fn from(value: &ForeignTimestamp) -> Self {
+        Self(value.get())
+    }
+}
+
 #[derive(Debug, Default)]
 #[repr(transparent)]
 pub struct ForeignTimestamp(AtomicU64);
 
 impl ForeignTimestamp {
-    #[must_use]
-    pub fn new(value: u64) -> Self {
-        Self(AtomicU64::new(value))
-    }
-
     pub fn update(&mut self, value: u64) {
         self.0.store(value, Ordering::Relaxed);
     }

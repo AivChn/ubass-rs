@@ -4,6 +4,8 @@ use crate::prelude::*;
 use crate::transport::types::InboundSender;
 
 use tokio::net::UdpSocket;
+use tokio::select;
+use tokio::sync::Notify;
 use tracing::{debug, error, instrument, warn};
 
 use super::send_to_processing_layer;
@@ -12,7 +14,7 @@ use super::types::{MAX_PACKET_SIZE, ReceivedPacket};
 const MAX_ALLOWED_FAILS: u32 = 10;
 
 #[instrument(skip_all)]
-pub async fn init(socket: Arc<UdpSocket>, sender: InboundSender) -> ErrResult {
+pub async fn init(socket: Arc<UdpSocket>, sender: InboundSender, signal: Arc<Notify>) -> ErrResult {
     let mut fail_count = 0u32;
 
     debug!("listening...");
@@ -20,7 +22,17 @@ pub async fn init(socket: Arc<UdpSocket>, sender: InboundSender) -> ErrResult {
         let mut buffer = vec![0u8; MAX_PACKET_SIZE];
 
         let addr = loop {
-            if let Ok((read, addr)) = socket.recv_from(&mut buffer).await {
+            let res = select! {
+                res = socket.recv_from(&mut buffer) => {
+                    res
+                }
+                _ = signal.notified() => {
+                    _ = sender.send(Ok(PacketProcessingMessage::Closed)).await;
+                    return Ok(());
+                }
+            };
+
+            if let Ok((read, addr)) = res {
                 fail_count = 0;
                 buffer.truncate(read);
                 break addr;
@@ -56,7 +68,7 @@ pub async fn init(socket: Arc<UdpSocket>, sender: InboundSender) -> ErrResult {
 mod test {
     use std::sync::{Arc, atomic::AtomicU16};
 
-    use tokio::{net::UdpSocket, task::JoinHandle};
+    use tokio::{net::UdpSocket, sync::Notify, task::JoinHandle};
 
     use crate::{
         error::{ChannelError, ErrResult, Error},
@@ -77,7 +89,11 @@ mod test {
     fn init_inbound(socket: Arc<UdpSocket>) -> (InboundReceiver, JoinHandle<ErrResult>) {
         let (sender, receiver): (InboundSender, _) = tokio::sync::mpsc::channel(1);
 
-        (receiver, tokio::spawn(inbound::init(socket, sender)))
+        let signal = Arc::new(Notify::new());
+        (
+            receiver,
+            tokio::spawn(inbound::init(socket, sender, signal)),
+        )
     }
 
     #[tokio::test]

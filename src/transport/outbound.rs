@@ -2,16 +2,22 @@ use crate::prelude::*;
 use crate::transport::types::OutboundReceiver;
 use crate::{manager::packets::PacketType, packet_processor::types::ProcessedPacket};
 use std::sync::Arc;
+use tokio::sync::Notify;
 use tokio::{
     net::UdpSocket,
     time::{Duration, Instant, timeout},
 };
 use tracing::{debug, error, instrument};
 
-use super::types::{BUFFER_TIMEOUT, MAX_CONCURRENT_SENDS, MAX_PACKET_BUFFER_SIZE, OutboundSockets};
+use super::types::{BUFFER_TIMEOUT, MAX_PACKET_BUFFER_SIZE, OutboundSockets};
 
-#[instrument]
-pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocket>) -> ErrResult {
+/// Main outbound transport loop
+#[instrument(skip_all)]
+pub async fn init(
+    mut receiver: OutboundReceiver,
+    listening_socket: Arc<UdpSocket>,
+    signal: Arc<Notify>,
+) -> ErrResult {
     // set up handle monitor
     let monitor = Arc::from(HandleMonitor::default());
 
@@ -24,19 +30,22 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
     // packet buffer
     let mut buffer = Vec::with_capacity(MAX_PACKET_BUFFER_SIZE);
 
-    #[cfg(test)]
+    #[cfg(debug_assertions)]
     let mut total_received: usize = 0;
 
     debug!("listening for packets to send...");
     loop {
         let start_time = Instant::now();
 
+        // collect until window ends or buffer full
         while start_time.elapsed() < Duration::from_millis(BUFFER_TIMEOUT)
             && buffer.len() < MAX_PACKET_BUFFER_SIZE
         {
             #[allow(clippy::cast_possible_truncation)]
+            // time left until the window ends
             let remaining = BUFFER_TIMEOUT.saturating_sub(start_time.elapsed().as_millis() as u64);
 
+            // listen for messages until window ends
             let data = match timeout(Duration::from_millis(remaining), receiver.recv()).await {
                 // timeout ended
                 Err(_) => break,
@@ -49,9 +58,9 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
                     )
                     .into());
                 }
-                // close pipeline
+                // graceful close
                 Ok(Some(TransportMessage::Close)) => {
-                    #[cfg(test)]
+                    #[cfg(debug_assertions)]
                     debug!(
                         "outbound transport begins graceful shutdown: \
                         buffer={} total_received={}",
@@ -59,34 +68,43 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
                         total_received
                     );
 
-                    #[cfg(not(test))]
+                    #[cfg(not(debug_assertions))]
                     debug!("outbound transport begins graceful shutdown");
 
+                    // if there are packets to send, send all before closing
                     if !buffer.is_empty() {
                         monitor
                             .dispatch(send_packets(buffer.drain(..).collect(), sockets.retrieve()));
                     }
+
+                    // wait for all tasks to finish
                     monitor.flush().await;
                     debug!("graceful shutdown done");
+                    signal.notify_one();
                     return Ok(());
                 }
                 // get data
                 Ok(Some(TransportMessage::SendPacket(data))) => data,
             };
 
-            #[cfg(test)]
+            #[cfg(debug_assertions)]
             {
                 total_received += 1;
             }
 
             match data.packet_type {
+                // data pushed to buffer
                 PacketType::Data | PacketType::Metadata | PacketType::Parity => buffer.push(data),
+                // Host control and KeepAlive sent through listening socket
                 PacketType::Host | PacketType::KeepAlive => {
                     let copy = listening_socket.clone();
+                    // function wrapped in async block because send_to takes a ref and is not
+                    // guaranteed to live long enough on its own
                     monitor.dispatch(async move {
                         _ = copy.send_to(&data.data, data.dest_addr).await;
                     });
                 }
+                // everything else sent immediately through a regular socket
                 _ => {
                     let socket = sockets.retrieve();
                     monitor.dispatch(async move {
@@ -96,17 +114,18 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
             }
         }
 
-        while monitor.size() > MAX_CONCURRENT_SENDS {}
-
+        // update `OutboundSockets`
         #[allow(clippy::cast_possible_truncation)]
         let _ = sockets
             .update(start_time.elapsed().as_millis() as u64)
             .await;
 
+        // if buffer is still empty go next
         if buffer.is_empty() {
             continue;
         }
 
+        #[cfg(debug_assertions)]
         debug!(
             "packets being sent, first: type {} content {:?}",
             buffer[0].packet_type,
@@ -114,6 +133,8 @@ pub async fn init(mut receiver: OutboundReceiver, listening_socket: Arc<UdpSocke
         );
 
         debug!("sending packet buffer with {} packets", buffer.len(),);
+
+        // send packets. `drain()` instead of `mem::take()` to keep the buffers capacity
         #[allow(clippy::drain_collect)]
         monitor.dispatch(send_packets(buffer.drain(..).collect(), sockets.retrieve()));
     }
@@ -161,7 +182,7 @@ mod test {
         sync::{Arc, atomic::AtomicU16},
     };
 
-    use tokio::{net::UdpSocket, task::JoinHandle};
+    use tokio::{net::UdpSocket, sync::Notify, task::JoinHandle};
 
     use crate::{
         error::ErrResult,
@@ -180,7 +201,11 @@ mod test {
     fn prepare_init() -> (OutboundSender, JoinHandle<ErrResult>) {
         let socket = Arc::new(bind_listen_socket(next_port()).unwrap());
         let (sender, receiver): (OutboundSender, _) = tokio::sync::mpsc::channel(1);
-        (sender, tokio::spawn(outbound::init(receiver, socket)))
+        let signal = Arc::new(Notify::new());
+        (
+            sender,
+            tokio::spawn(outbound::init(receiver, socket, signal)),
+        )
     }
 
     #[tokio::test]

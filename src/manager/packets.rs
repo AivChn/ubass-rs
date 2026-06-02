@@ -1,9 +1,6 @@
 #![allow(clippy::unnecessary_box_returns)]
 use crate::{
-    manager::{
-        ManagerToProcessor,
-        state::{HandshakeId, Port},
-    },
+    manager::{ManagerToProcessor, state::HandshakeId},
     prelude::*,
 };
 
@@ -194,7 +191,6 @@ pub struct HelloPacket {
     pub handshake_id: HandshakeId,
     pub timestamp: Timestamp,
     pub public_key: PublicKey,
-    pub receiving_port: Port,
     pub app_id: AppId,
 }
 
@@ -205,13 +201,7 @@ impl HelloPacket {
         handshake_id: HandshakeId,
         public_key: impl Into<PublicKey>,
         app_id: AppId,
-        receiving_port: Port,
-    ) -> Box<Self> {
-        debug_assert!(
-            *receiving_port > 1024,
-            "Invariant broken while constructing a `HelloPacket`: \
-                This hosts port is below 1024 ({receiving_port:?})"
-        );
+    ) -> Self {
         #[cfg(debug_assertions)]
         assert_opts_valid(opts, "HelloPacket");
 
@@ -222,7 +212,7 @@ impl HelloPacket {
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
-        Box::new(Self {
+        Self {
             version,
             opts,
             packet_type,
@@ -232,9 +222,8 @@ impl HelloPacket {
             handshake_id,
             timestamp,
             public_key,
-            receiving_port,
             app_id,
-        })
+        }
     }
 }
 
@@ -275,6 +264,7 @@ impl TrackRequestPacket {
     }
 
     #[must_use]
+    #[allow(unused)]
     pub fn request_metadata(
         opts: Options,
         session_id: SessionId,
@@ -326,9 +316,6 @@ pub struct DataPacket {
 }
 
 impl DataPacket {
-    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<PayloadField>();
-    pub const MIN_SIZE: usize = Self::HEADER_SIZE + 1;
-
     #[must_use]
     pub fn new(
         opts: Options,
@@ -376,6 +363,7 @@ pub struct MetadataPacket {
 
 impl MetadataPacket {
     #[allow(clippy::too_many_arguments)]
+    #[allow(unused)]
     pub fn new(
         opts: Options,
         batch_id: BatchID,
@@ -430,8 +418,6 @@ pub struct ParityPacket {
 impl ParityPacket {
     pub const LOCAL_MAX_PAYLOAD_LENGTH: usize =
         MAX_PAYLOAD_LENGTH + size_of::<BytePosition>() + size_of::<u16>();
-    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<PayloadField>();
-    pub const MIN_SIZE: usize = Self::HEADER_SIZE + size_of::<BytePosition>() + 1;
 
     #[must_use]
     pub fn new(
@@ -506,18 +492,6 @@ impl PlaybackControlPacket {
 
     #[inline]
     #[must_use]
-    pub fn play(opts: Options, session_id: SessionId) -> Self {
-        Self::new(opts, session_id, PlaybackControlType::Play, None)
-    }
-
-    #[inline]
-    #[must_use]
-    pub fn pause(opts: Options, session_id: SessionId) -> Self {
-        Self::new(opts, session_id, PlaybackControlType::Pause, None)
-    }
-
-    #[inline]
-    #[must_use]
     pub fn close(opts: Options, session_id: SessionId) -> Self {
         Self::new(opts, session_id, PlaybackControlType::Close, None)
     }
@@ -527,12 +501,6 @@ impl PlaybackControlPacket {
     pub fn done(opts: Options, session_id: SessionId) -> Self {
         Self::new(opts, session_id, PlaybackControlType::Done, None)
     }
-
-    #[inline]
-    #[must_use]
-    pub fn seek(opts: Options, session_id: SessionId, seek_pos: BytePosition) -> Self {
-        Self::new(opts, session_id, PlaybackControlType::Done, Some(seek_pos))
-    }
 }
 
 #[derive(Debug, SendPacket, Clone, Serialize)]
@@ -540,16 +508,13 @@ pub struct AckPacket {
     pub version: Version,
     pub opts: Options,
     pub packet_type: PacketType,
-    reserved: Reserved<3>,
+    pub reserved: Reserved<3>,
     pub session_id: SessionId,
     pub timestamp: Timestamp,
     pub fingerprint: PacketFingerprint,
 }
 
 impl AckPacket {
-    pub const HEADER_SIZE: usize = size_of::<AckPacket>();
-    pub const MIN_SIZE: usize = AckPacket::HEADER_SIZE;
-
     #[must_use]
     pub fn new(opts: Options, session_id: SessionId, fingerprint: PacketFingerprint) -> Box<Self> {
         debug_assert!(
@@ -604,6 +569,7 @@ pub struct KeepAlivePacket {
 }
 
 impl KeepAlivePacket {
+    #[allow(unused)] // allowed because its wrong
     #[must_use]
     pub fn new(opts: Options, session_id: SessionId) -> Self {
         let version = Version::CURRENT_VERSION;
@@ -707,6 +673,7 @@ impl RetransmitPacket {
         }
     }
 
+    #[allow(unused)]
     #[must_use]
     pub fn metadata(
         opts: Options,
@@ -798,7 +765,6 @@ pub struct HandshakeRejection {
     pub timestamp: Timestamp,
     pub handshake_id: HandshakeId,
     pub reason: HandshakeRejectionReason,
-    pub payload: PayloadField,
 }
 
 impl HandshakeRejection {
@@ -808,7 +774,6 @@ impl HandshakeRejection {
         session_id: SessionId,
         reason: HandshakeRejectionReason,
         handshake_id: HandshakeId,
-        payload: impl Into<PayloadField>,
     ) -> Self {
         let version = Version::CURRENT_VERSION;
         let opts = opts.unset(OptionFlags::RequireAck);
@@ -816,7 +781,6 @@ impl HandshakeRejection {
         let control_type = ControlType::Host(HostControlType::HandshakeReject);
         let reserved = Reserved;
         let timestamp = Timestamp::now();
-        let payload = payload.into();
 
         Self {
             version,
@@ -828,7 +792,6 @@ impl HandshakeRejection {
             timestamp,
             handshake_id,
             reason,
-            payload,
         }
     }
 }
@@ -845,8 +808,7 @@ pub struct SessionDoesNotExistErrorPacket {
 }
 
 impl SessionDoesNotExistErrorPacket {
-    pub const HEADER_SIZE: usize = size_of::<Self>();
-
+    #[allow(unused)]
     #[must_use]
     pub fn new(opts: Options, session_id: SessionId) -> Box<Self> {
         #[cfg(debug_assertions)]
@@ -884,8 +846,6 @@ pub struct UnexpectedPacketErrorPacket {
 }
 
 impl UnexpectedPacketErrorPacket {
-    pub const HEADER_SIZE: usize = size_of::<Self>();
-
     #[must_use]
     pub fn new(
         opts: Options,
@@ -893,7 +853,6 @@ impl UnexpectedPacketErrorPacket {
         received_packet_type: PacketType,
         received_secondary_type: SecondaryType,
         received_fingerprint: PacketFingerprint,
-        incomprehensible: bool,
     ) -> Box<Self> {
         #[cfg(debug_assertions)]
         debug_assert!(
@@ -907,11 +866,7 @@ impl UnexpectedPacketErrorPacket {
 
         let version = Version::CURRENT_VERSION;
         let packet_type = PacketType::Error;
-        let error_type = if incomprehensible {
-            ErrorType::IncomprehensiblePacket
-        } else {
-            ErrorType::UnexpectedPacket
-        };
+        let error_type = ErrorType::UnexpectedPacket;
         let reserved = Reserved;
         let timestamp = Timestamp::now();
 
@@ -928,42 +883,6 @@ impl UnexpectedPacketErrorPacket {
             received_fingerprint,
         })
     }
-
-    #[must_use]
-    pub fn unexpected(
-        opts: Options,
-        session_id: SessionId,
-        received_packet_type: PacketType,
-        received_secondary_type: SecondaryType,
-        received_fingerprint: PacketFingerprint,
-    ) -> Box<Self> {
-        Self::new(
-            opts,
-            session_id,
-            received_packet_type,
-            received_secondary_type,
-            received_fingerprint,
-            false,
-        )
-    }
-
-    #[must_use]
-    pub fn incomprehensible(
-        opts: Options,
-        session_id: SessionId,
-        received_packet_type: PacketType,
-        received_secondary_type: SecondaryType,
-        received_fingerprint: PacketFingerprint,
-    ) -> Box<Self> {
-        Self::new(
-            opts,
-            session_id,
-            received_packet_type,
-            received_secondary_type,
-            received_fingerprint,
-            true,
-        )
-    }
 }
 
 #[derive(Debug, SendPacket, Clone, Serialize, Headers, Payload)]
@@ -979,8 +898,6 @@ pub struct TrackRejectionPacket {
 }
 
 impl TrackRejectionPacket {
-    pub const HEADER_SIZE: usize = size_of::<Self>() - size_of::<PayloadField>();
-
     #[must_use]
     pub fn new(
         opts: Options,
@@ -1018,8 +935,6 @@ pub struct IncompatibleVersionPacket {
 }
 
 impl IncompatibleVersionPacket {
-    pub const HEADER_SIZE: usize = size_of::<Self>();
-
     #[must_use]
     pub fn packet() -> Box<Self> {
         Box::new(Self {
@@ -1203,6 +1118,7 @@ impl Serialize for Option<BufferId> {
 #[repr(transparent)]
 pub struct BufferSize(u32);
 
+#[allow(unused)] // allowed because its wrong
 impl BufferSize {
     const MAX_MB: usize = 10;
     const MAX_BUFFER_SIZE: usize = Self::MAX_MB * 1024 * 1024;
@@ -1270,10 +1186,16 @@ impl From<usize> for BytePosition {
     }
 }
 
+/// Represents a "hole" in the on-the-wire format of the packet. size of the hole is based on the const
+/// generic N.
 #[derive(PartialEq, Debug, Clone, Copy)]
 pub struct Reserved<const N: usize>;
 
 impl<const N: usize> Serialize for Reserved<N> {
+    /// Serialize into the buffer N bytes of 0
+    ///
+    /// # Errors
+    /// This function returns `Err(())` if the buffer is not big enough
     fn serialize(&self, buf: &mut [u8]) -> EmptyResult {
         if buf.len() < N {
             Err(())
@@ -1283,6 +1205,10 @@ impl<const N: usize> Serialize for Reserved<N> {
         }
     }
 
+    /// Deserializes N bytes, regardless of their contents.
+    ///
+    /// # Errors
+    /// This function returns `Err(())` if the buffer is not big enough
     fn deserialize(bytes: &[u8]) -> core::result::Result<Self, ()> {
         if bytes.len() < N {
             Err(())
@@ -1291,25 +1217,31 @@ impl<const N: usize> Serialize for Reserved<N> {
         }
     }
 
+    /// The on-the-wire size of the buffer
     fn sized(&self) -> usize {
         N
     }
 }
 
+/// The version of the protocol, packed as (with bit counts) |4 major|4 minor|8 patch|
 #[derive(Debug, Serialize, Clone, Copy, Eq, PartialOrd, Ord, PartialEq)]
 #[repr(transparent)]
 pub struct Version(u16);
 
 impl Version {
+    /// The current version of the protocol
     pub const CURRENT_VERSION: Version = Version::new(0, 0, 1);
+    /// The minimum version this version is is compatible with
     pub const MIN_COMPATIBLE_VERSION: Version = Version::new(0, 0, 1);
 
+    /// Constructor for `Version`
     #[inline]
     #[must_use]
     pub const fn new(major: u8, minor: u8, patch: u8) -> Self {
         Self((major as u16) << 12 | (minor as u16) << 8 | patch as u16)
     }
 
+    /// Parse a version to its 3 components in order (major, minor, patch)
     #[inline]
     #[must_use]
     pub const fn parse(&self) -> (u8, u8, u8) {
@@ -1320,15 +1252,17 @@ impl Version {
         )
     }
 
+    /// checks if the version is compatible with this builds minimum version
     #[inline]
     #[must_use]
-    pub fn is_compatible(&self) -> bool {
-        *self >= Version::MIN_COMPATIBLE_VERSION
+    pub const fn is_compatible(&self) -> bool {
+        self.0 >= Version::MIN_COMPATIBLE_VERSION.0
     }
 
+    /// Simply checks if the version is zero
     #[inline]
     #[must_use]
-    pub fn is_zero(&self) -> bool {
+    pub const fn is_zero(&self) -> bool {
         self.0 == 0
     }
 }
@@ -1464,6 +1398,7 @@ impl BatchID {
     }
 }
 
+/// Wrapper to hold the options for a packet. Holds an int representation of the bitmap.
 #[derive(Debug, Flags, Serialize, PartialEq, Clone, Copy)]
 #[repr(transparent)]
 #[flagtype(OptionFlags)]
@@ -1479,29 +1414,37 @@ fn assert_opts_valid(opts: Options, contructing: &'static str) {
     );
 }
 
+/// The different options the protocool supports
 #[derive(Debug, Clone, Copy, Display)]
 #[repr(u16)]
 #[variants_array]
 pub enum OptionFlags {
+    // packet with this flag must be acked
     RequireAck = 1 << 0,
+    // future feature
     Metadata = 1 << 1,
+    // internal, marks a packet resent because of a missed ack. resend flag is removed by the
+    // processing layer and used to determine whether the packet should be added to the PendingAcks
     Resend = 1 << 2,
 }
 
+/// A session ID for a session.
 #[repr(transparent)]
 #[derive(Debug, Serialize, Deref, PartialEq, Eq, Hash, Clone, Copy, Display)]
 pub struct SessionId(u64);
 
 impl SessionId {
+    /// Generates a new random u64
     #[inline]
     #[must_use]
     pub fn generate() -> Self {
         Self(rand::random::<u64>())
     }
-}
 
-impl SessionId {
+    /// Test/debug exclusive direct value constructor
     #[must_use]
+    #[inline]
+    #[cfg(any(test, debug_assertions))]
     pub fn new(id: u64) -> Self {
         Self(id)
     }
@@ -1516,15 +1459,6 @@ pub struct FECInfo {
 }
 
 impl FECInfo {
-    #[must_use]
-    pub const fn const_new(batch_size: u8, batch_pos: u8, recovery_count: u8) -> Self {
-        Self {
-            batch_size,
-            batch_pos,
-            recovery_count,
-        }
-    }
-
     #[must_use]
     pub fn new(batch_size: u8, batch_pos: u8, recovery_count: u8) -> Self {
         debug_assert!(

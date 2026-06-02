@@ -8,13 +8,14 @@
 #![warn(clippy::todo)]
 
 pub mod api;
-pub mod error;
-pub mod manager;
-pub mod packet_processor;
-pub mod prelude;
-pub mod transport;
-pub mod utils;
 
-pub use api::Api;
+pub(crate) mod error;
+pub(crate) mod manager;
+pub(crate) mod packet_processor;
+pub(crate) mod prelude;
+pub(crate) mod transport;
+pub(crate) mod utils;
+
+pub use api::*;
 
 pub const DEFAULT_PORT: u16 = 8455;

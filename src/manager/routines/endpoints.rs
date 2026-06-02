@@ -11,7 +11,6 @@ use tokio::{
     runtime::Builder as RuntimeBuilder,
     sync::{mpsc::Receiver, oneshot},
 };
-#[cfg(debug_assertions)]
 use tracing::info;
 use tracing::{debug, instrument, warn};
 
@@ -117,14 +116,13 @@ pub async fn connect(
         )
         .await;
 
-    HelloPacket::new(
+    Box::new(HelloPacket::new(
         Options::none(),
         session_id,
         handshake_id,
         public_key,
         get_state!().app_id(),
-        get_state!().port(),
-    )
+    ))
     .send(outbound_sender, address)
     .await;
 }
@@ -193,16 +191,6 @@ async fn resolve_target(
             .map(|s| (s, *address)),
     }
     .log_warn(&format!("could not resolve target {target:?}"))
-}
-
-#[instrument(skip_all)]
-pub fn close() {
-    todo!()
-}
-
-#[instrument(skip_all)]
-pub fn listen() {
-    todo!()
 }
 
 #[instrument(skip_all)]

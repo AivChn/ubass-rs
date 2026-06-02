@@ -7,7 +7,6 @@ use crate::manager::packets::{
     BytePosition, ByteRange, PlaybackControlPacket, PlaybackControlType,
 };
 
-use derive_more::Display;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{oneshot, watch};
 
@@ -178,9 +177,6 @@ pub enum ManagerMessage {
     Packet(PacketWrapper),
     Closed,
 }
-
-#[derive(thiserror::Error, Debug, Display)]
-pub struct CouldNotRecover;
 
 #[derive(Debug)]
 pub enum PacketProcessingMessage {

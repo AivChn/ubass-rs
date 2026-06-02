@@ -31,7 +31,7 @@ use std::{
     collections::{BTreeSet, HashSet, VecDeque, hash_map::Entry},
     convert::identity,
     fmt::Display,
-    net::{SocketAddr, SocketAddrV4, SocketAddrV6},
+    net::SocketAddr,
     ops::Range,
     sync::{
         Arc,
@@ -60,17 +60,10 @@ macro_rules! sessions_state_fields {
 }
 
 sessions_state_fields!(
-    GeneralStateTable(SessionId => GeneralSessionState),
     EncryptionTable(SessionId => EncryptionWindow),
-    FecStateTable(SessionId => SessionFecState),
-    SessionAppIdTable(SessionId => AppId),
-    SessionAddressTable(SessionId => SocketAddr),
     HandshakeStateTable(HandshakeId => HandshakeState),
     AddressSessionIdTable(SocketAddr => Vec<SessionId>)
 );
-
-#[derive(Default)]
-pub struct LastActivityTable(HashMap<SessionId, ForeignTimestamp>);
 
 #[derive(Default, Debug, Deref)]
 pub struct ConnectionStatesTable(RwLock<HashMap<SessionId, ConnectionStates>>);
@@ -129,10 +122,9 @@ impl StreamingFrom {
             .into_iter()
             .filter(|pos| {
                 let idx = (**pos as usize) / MAX_PAYLOAD_LENGTH;
-                if self.buffer.position_occupied(*pos).unwrap_or(true) {
-                    return false;
-                }
-                if self.pending.contains_key(&idx) {
+                if self.buffer.position_occupied(*pos).is_none_or(identity)
+                    || self.pending.contains_key(&idx)
+                {
                     return false;
                 }
                 self.pending.insert(idx, now);
@@ -249,23 +241,12 @@ impl StreamState {
             None
         }
     }
-
-    pub fn close(&mut self) {
-        self.stream.send_modify(|s| s.closed = true);
-    }
-
-    pub fn start(&mut self) {
-        self.stream.send_modify(|s| s.paused = false);
-    }
-
-    pub fn pause(&mut self) {
-        self.stream.send_modify(|s| s.paused = true);
-    }
 }
 
 #[derive(Debug)]
 pub enum SessionStates {
     Up,
+    #[allow(unused)] // allowed since its a future feature
     Down,
     Streaming(StreamState),
 }
@@ -653,18 +634,10 @@ impl ConnectionStates {
             ConnectionStates::Established(established) => *lock_write!(established.address) = new,
         }
     }
-
-    pub fn session_id(&self) -> SessionId {
-        match self {
-            ConnectionStates::Handshake { session_id, .. } => *session_id,
-            ConnectionStates::Established(established) => established.session_id,
-        }
-    }
 }
 
 pub struct ProtocolState {
     app_id: AppId,
-    port: Port,
     // this is a mutex because the compiler hates me specifically
     handles: Mutex<Option<LayerHandles>>,
     pub global_handle_monitor: Arc<HandleMonitor>,
@@ -672,31 +645,30 @@ pub struct ProtocolState {
     pub handshakes: HandshakeStateTable,
     pub ack: Arc<PendingAckWindow>,
     pub encryption: EncryptionTable,
-    pub fingerprints: FingerprintWindow,
+    pub fingerprints: Arc<FingerprintWindow>,
     pub address_session: AddressSessionIdTable,
     pub fec_prune: Arc<FecPruneTask>,
 }
 
 impl ProtocolState {
     #[must_use]
-    pub fn new(port: Port, app_id: AppId, sender: ManagerToProcessor) -> Self {
+    pub fn new(app_id: AppId, sender: ManagerToProcessor) -> Self {
         Self {
             app_id,
-            port,
             handles: Mutex::default(),
             global_handle_monitor: Arc::default(),
             connections: ConnectionStatesTable::default(),
             handshakes: HandshakeStateTable::default(),
             ack: Arc::new(PendingAckWindow::new(sender.clone())),
             encryption: EncryptionTable::default(),
-            fingerprints: FingerprintWindow::default(),
+            fingerprints: Arc::default(),
             address_session: AddressSessionIdTable::default(),
             fec_prune: Arc::new(FecPruneTask::new(sender)),
         }
     }
 
     /// Joins both layer threads.
-    pub async fn join_layers(&mut self) {
+    pub async fn join_layers(&self) {
         let handles = o_unwrap_or_return!(lock!(self.handles).take().panic_in_debug(
             "Invariant broken while joining the layer threads: \
             function was called more than once",
@@ -707,10 +679,6 @@ impl ProtocolState {
 
     pub fn app_id(&self) -> AppId {
         self.app_id.clone()
-    }
-
-    pub fn port(&self) -> Port {
-        self.port
     }
 
     pub async fn session_exists(&self, session_id: SessionId) -> bool {
@@ -916,6 +884,7 @@ impl ProtocolState {
         }
     }
 
+    /// Routine responsible for managing sending a stream on a session.
     #[instrument(skip_all)]
     pub async fn send_on_session(
         &self,
@@ -924,15 +893,19 @@ impl ProtocolState {
         sender: watch::Sender<StreamMessage>,
         outbound_sender: ManagerToProcessor,
     ) {
+        // get the Shared buffer for event receiving
         let event = {
-            let mut lock = lock_write!(get_state!().connections);
+            // get session
+            let mut lock = lock_write!(self.connections);
             let session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
                 "Invariant broken in `send_on_session` \
                 with ID {session_id}: session does not exist"
             )));
 
+            // set session state to `StreamingTo`
             session.stream_to(buffer, sender);
 
+            // get the shared event buffer, panic in debug if state is incorrect since it was just set
             if let ConnectionStates::Established(established) = session
                 && let EstablishedState {
                     state:
@@ -954,60 +927,96 @@ impl ProtocolState {
             }
         };
 
+        // set loop global state
         let mut playing = true;
         let mut interval = interval(SEND_INTERVAL);
-        let mut extras: BTreeSet<usize> = std::collections::BTreeSet::new();
+        // BTreeSet used for easy range ordering
+        let mut extras: BTreeSet<usize> = BTreeSet::new();
         let mut last_sent = BytePosition(0);
 
+        // main event loop
         loop {
+            // wait for one of the two actions to trigger
             select! {
+                // got an event
                 event = event.listen_then(|m| {
+                        // if the event is a retransmit, replace the vector of ranges in place so to
+                        // not need to clone the whole list
                         if let StreamEvent::Retransmit(v) = m {
                             StreamEvent::Retransmit(std::mem::take(v))
                         } else {
+                            // for everything else clone is acceptable
                             m.clone()
                         }
                     }) => {
-                        match event {
-                            StreamEvent::Playback(PlaybackControl::Pause) => playing = false,
-                            StreamEvent::Playback(PlaybackControl::Play) => {
-                                playing = true;
-                            },
-
-                            StreamEvent::Playback(PlaybackControl::Seek(to)) => {
-                                debug!("got seek request to position {to}");
-                                seek_action(session_id, to).await;
-                                add_seek_hole_indices(&mut extras, last_sent, to);
-                            }
-
-                            StreamEvent::Playback(PlaybackControl::Done) => {
-                                debug!("stream done for session {session_id}");
-                                self.close_stream(session_id, outbound_sender.clone()).await;
-                                return;
-                            }
-
-                            StreamEvent::Playback(PlaybackControl::Close) => {
-                                debug!("Close received for session {session_id}");
-                                close_outgoing_stream_action(session_id).await;
-                                return;
-                            }
-
-                            StreamEvent::Retransmit(byte_ranges) => {
-                                for r in byte_ranges.into_iter()
-                                    .flat_map(split_range_into_chunks)
-                                {
-                                    extras.insert((*r.start as usize) / MAX_PAYLOAD_LENGTH);
-                                }
-                            }
-                        }
+                        self.handle_stream_event(
+                            event,
+                            session_id,
+                            &mut playing,
+                            &mut extras,
+                            &mut last_sent,
+                            outbound_sender.clone()
+                        ).await;
                     }
+                // interval ticked - send time
                 _ = interval.tick(), if playing => {
+                    // send data and update last_sent
                     last_sent = send_stream_action(
                         session_id,
                         outbound_sender.clone(),
                         PACKET_COUNT_PER_BATCH,
                         &mut extras,
                     ).await.unwrap_or(last_sent);
+                }
+            }
+        }
+    }
+
+    /// Handles the stream events received for a session in `StreamingTo` state
+    pub async fn handle_stream_event(
+        &self,
+        event: StreamEvent,
+        session_id: SessionId,
+        playing: &mut bool,
+        extras: &mut BTreeSet<usize>,
+        last_sent: &mut BytePosition,
+        outbound_sender: ManagerToProcessor,
+    ) {
+        match event {
+            // set playing
+            StreamEvent::Playback(PlaybackControl::Pause) => *playing = false,
+            StreamEvent::Playback(PlaybackControl::Play) => *playing = true,
+            StreamEvent::Playback(PlaybackControl::Seek(to)) => {
+                debug!("got seek request to position {to}");
+                // seek and make sure to track parts of the buffer that will be
+                // potentially missing later as a result of a seek forward
+                seek_action(session_id, to).await;
+                add_seek_hole_indices(extras, *last_sent, to);
+            }
+
+            // stream done - client got all that it needed close
+            StreamEvent::Playback(PlaybackControl::Done) => {
+                debug!("stream done for session {session_id}");
+                self.close_stream(session_id, outbound_sender.clone()).await;
+                return;
+            }
+
+            // stream closed by client or app
+            StreamEvent::Playback(PlaybackControl::Close) => {
+                debug!("Close received for session {session_id}");
+                self.close_stream(session_id, outbound_sender.clone()).await;
+                return;
+            }
+
+            // retransmit requested
+            StreamEvent::Retransmit(byte_ranges) => {
+                // go over all chunks requested
+                for r in byte_ranges
+                    .into_iter()
+                    // split the given ranges to chunk sized ranges
+                    .flat_map(split_range_into_chunks)
+                {
+                    extras.insert((*r.start as usize) / MAX_PAYLOAD_LENGTH);
                 }
             }
         }
@@ -1039,7 +1048,9 @@ impl ProtocolState {
         lock_write!(get_state!().encryption).remove(&session_id);
     }
 
+    /// Closes an ongoing stream, noop if no stream is open
     pub async fn close_stream(&self, session_id: SessionId, _outbound_sender: ManagerToProcessor) {
+        // get session state
         let mut lock = lock_write!(self.connections);
         let session = o_unwrap_or_return!(lock.get_mut(&session_id));
 
@@ -1047,6 +1058,7 @@ impl ProtocolState {
             && let EstablishedState { state, .. } = established.as_mut()
         {
             match state {
+                // Session is `StreamingTo`
                 SessionStates::Streaming(
                     StreamState {
                         streaming: Streaming::To(StreamingTo { event, .. }),
@@ -1055,19 +1067,23 @@ impl ProtocolState {
                     },
                     ..,
                 ) => {
+                    // update shared event buffer
                     event
                         .update_with(|e| *e = StreamEvent::Playback(PlaybackControl::Close))
                         .await;
+                    // update user facing `Stream` struct
                     stream.send_modify(|m| m.closed = true);
                 }
+                // Session is `StreamingFrom`
                 SessionStates::Streaming(StreamState { stream, .. }) => {
+                    // update user facing struct
                     stream.send_modify(|m| m.closed = true);
                 }
-                _ => {
-                    return;
-                }
+                // other states - bail
+                _ => return,
             }
 
+            // set state to Up
             *state = SessionStates::Up;
         }
     }
@@ -1143,16 +1159,20 @@ async fn seek_action(session_id: SessionId, pos: BytePosition) {
     }
 }
 
+/// Send data for the given stream, send extras if no data left to send
+/// returns `Some(last_sent)` if data was sent successfully, if there is nothing left to send
+/// returns `None`
 #[instrument(skip_all)]
 async fn send_stream_action(
     session_id: SessionId,
     outbound_sender: ManagerToProcessor,
     n: usize,
-    extras: &mut std::collections::BTreeSet<usize>,
+    extras: &mut BTreeSet<usize>,
 ) -> Option<BytePosition> {
     let action = {
         let mut lock = lock_write!(get_state!().connections);
         let session = lock.get_mut(&session_id)?;
+        // try to get the next n chunks from the buffer
         if let ConnectionStates::Established(established) = session
             && let EstablishedState {
                 state:
@@ -1167,17 +1187,19 @@ async fn send_stream_action(
             } = established.as_mut()
             && let Some(chunks) = stream.get_chunks(n)
         {
-            // Head sends always win the tick budget. Only fall through to
-            // extras (seek-skipped + retransmit-requested chunk indices)
-            // when fresh data is fully exhausted, and even then drain at
-            // most `n` chunks so retransmits inherit the same pacing.
+            // Head sends always win the tick budget. Only fall through to extras
+            // (seek-skipped + retransmit-requested chunk indices) when fresh data is fully exhausted,
+            // and even then drain at most `n` chunks so retransmits inherit the same pacing.
             let chunks = if chunks.is_empty() && !extras.is_empty() {
                 debug!("draining {} extras (budget {})", extras.len().min(n), n);
+                // take the next n positions to send
                 let take_idxs: Vec<usize> = extras.iter().take(n).copied().collect();
+                // remove the positions
                 for i in &take_idxs {
                     extras.remove(i);
                 }
                 #[allow(clippy::cast_possible_truncation)]
+                // map positions to a range
                 let to_send: Vec<ByteRange> = take_idxs
                     .into_iter()
                     .map(|i| {
@@ -1187,27 +1209,33 @@ async fn send_stream_action(
                         )
                     })
                     .collect();
+                // send for retransmission
                 stream.retransmit(to_send)?
             } else {
                 chunks
             };
 
+            // bail if the buffer is complete
             if chunks.is_empty() {
                 debug!("buffer complete, nothing to send");
                 return None;
             }
 
+            // get sessions address from the lock
             let addr = *lock_read!(address);
+            // get the batch ID for this batch
             let current_batch = if let Streaming::To(streaming_to) = &mut stream.streaming {
                 streaming_to.next_batch_id()
             } else {
                 debug!("session {session_id} not Streaming::To after check");
                 return None;
             };
+
             debug!(
                 "session {session_id} batch {current_batch}: {} chunks ",
                 chunks.len(),
             );
+
             Some((chunks, addr, current_batch))
         } else {
             debug!(
@@ -1217,22 +1245,15 @@ async fn send_stream_action(
         }
     };
 
+    // if there is something left, send the data given
     if let Some((chunks, addr, current_batch)) = action {
         let last = chunks.last()?.0;
         send_data_packets(chunks, &outbound_sender, session_id, addr, current_batch).await;
+        // return the last position sent
         Some(last)
     } else {
         None
     }
-}
-
-async fn close_outgoing_stream_action(session_id: SessionId) {
-    debug!("close_outgoing_stream_action: session {session_id}");
-    let mut lock = lock_write!(get_state!().connections);
-    let _session = o_unwrap_or_return!(lock.get_mut(&session_id).panic_in_debug(&format!(
-        "Invariant broken while trying to send on a session \
-                            with ID {session_id}: session does not exist"
-    )));
 }
 
 #[allow(clippy::cast_possible_truncation)]
@@ -1309,69 +1330,6 @@ impl AddressSessionIdTable {
     }
 }
 
-pub struct GeneralSessionState {
-    last_key_rotation_time: Timestamp,
-    flags: SessionStateFlags,
-}
-
-impl GeneralStateTable {
-    pub async fn last_key_rotation_time(&self, session_id: SessionId) -> Option<Timestamp> {
-        Some(lock_read!(self).get(&session_id)?.last_key_rotation_time)
-    }
-
-    pub async fn key_rotation(&self, session_id: SessionId) -> Option<()> {
-        lock_write!(self)
-            .get_mut(&session_id)?
-            .last_key_rotation_time = Timestamp::now();
-        Some(())
-    }
-
-    pub async fn flags(&self, session_id: SessionId) -> Option<SessionStateFlags> {
-        Some(lock_read!(self).get(&session_id)?.flags)
-    }
-
-    pub async fn flags_then(
-        &self,
-        session_id: SessionId,
-        flag: <SessionStateFlags as Flags>::FlagType,
-        mut f: impl FnMut(
-            SessionStateFlags,
-            <SessionStateFlags as Flags>::FlagType,
-        ) -> SessionStateFlags,
-    ) -> Option<()> {
-        let mut lock = lock_write!(self);
-        let flags = lock.get(&session_id)?.flags;
-        let new = f(flags, flag);
-        lock.get_mut(&session_id)?.flags = new;
-        Some(())
-    }
-}
-
-impl LastActivityTable {
-    pub fn update(&mut self, session_id: SessionId, ts: Timestamp) {
-        self.0
-            .entry(session_id)
-            .and_modify(|v| v.update(ts.get()))
-            .or_insert(ForeignTimestamp::new(ts.get()));
-    }
-
-    pub fn read(&self, session_id: SessionId) -> Option<Timestamp> {
-        self.0.get(&session_id).map(Timestamp::from)
-    }
-}
-
-#[derive(Flags, Clone, Copy)]
-#[repr(transparent)]
-#[flagtype(AppOptionFlag)]
-pub struct AppOptions(u32);
-
-#[derive(Clone, Copy)]
-#[repr(u32)]
-#[variants_array]
-pub enum AppOptionFlag {
-    ApproveAllApps = 1 << 0,
-}
-
 struct LayerHandles {
     transport: JoinHandle<ErrResult>,
     processor: JoinHandle<ErrResult>,
@@ -1389,52 +1347,6 @@ impl LayerHandles {
         Ok(())
     }
 }
-
-#[derive(Debug, Serialize, Deref, Clone, Copy)]
-#[repr(transparent)]
-pub struct Port(u16);
-
-impl Port {
-    #[must_use]
-    pub fn new(port: u16) -> Self {
-        Port(port)
-    }
-}
-
-impl From<SocketAddr> for Port {
-    fn from(value: SocketAddr) -> Self {
-        match value {
-            SocketAddr::V4(socket_addr_v4) => Port(socket_addr_v4.port()),
-            SocketAddr::V6(socket_addr_v6) => Port(socket_addr_v6.port()),
-        }
-    }
-}
-
-impl From<SocketAddrV4> for Port {
-    fn from(value: SocketAddrV4) -> Self {
-        Port(value.port())
-    }
-}
-
-impl From<SocketAddrV6> for Port {
-    fn from(value: SocketAddrV6) -> Self {
-        Port(value.port())
-    }
-}
-
-#[derive(PartialEq, Clone, Copy)]
-#[repr(u32)]
-#[variants_array]
-pub enum SessionStateFlag {
-    Handshake = 1 << 1,
-    CurrentlyStreamingFrom = 1 << 5,
-    CurrentlyStreamingTo = 1 << 6,
-}
-
-#[derive(Flags, Serialize, Debug, PartialEq, Clone, Copy)]
-#[repr(transparent)]
-#[flagtype(SessionStateFlag)]
-pub struct SessionStateFlags(u32);
 
 #[derive(Display, Hash, Eq, PartialEq, Debug, Clone, Copy, Serialize)]
 #[repr(transparent)]
@@ -1577,23 +1489,6 @@ impl HandshakeStateTable {
 
     pub async fn take(&self, id: HandshakeId) -> Option<HandshakeState> {
         lock_write!(self).remove(&id)
-    }
-}
-
-impl SessionAddressTable {
-    pub async fn contains(&self, id: SessionId) -> bool {
-        self.read().await.contains_key(&id)
-    }
-
-    pub async fn address_changed(&self, id: SessionId, address: SocketAddr) -> bool {
-        !matches!(lock_read!(self).get(&id), Some(addr) if *addr == address)
-    }
-
-    pub async fn update(&self, id: SessionId, address: SocketAddr) -> SocketAddr {
-        let mut lock = lock_write!(self);
-        let addr = lock.entry(id).or_insert(address);
-        addr.set_ip(address.ip());
-        *addr
     }
 }
 
@@ -1902,9 +1797,14 @@ impl PendingAckWindow {
     }
 }
 
+/// Used for deduplication of packets, stores a set of all the fingerprints and removes from it
+/// periodically based on popping out of the queue until the time has not passed
 pub struct FingerprintWindow {
+    // set of all fingerprints to dedup by
     fingerprints: RwLock<HashSet<PacketFingerprint>>,
+    // queue roughly temporally ordered of the fingerprints
     queue: Mutex<VecDeque<(Timestamp, PacketFingerprint)>>,
+    // close signal for the prune routine
     canceled: AtomicBool,
 }
 
@@ -1919,58 +1819,66 @@ impl Default for FingerprintWindow {
 }
 
 impl FingerprintWindow {
+    /// Time to wait between prunes
     const PRUNE_INTERVAL: u64 = PACKET_DISCARD_TIME_MS;
-    const BUFFERING_TIME: u64 = 2 * 1000;
 
+    /// Start the prune routine
     pub fn init(self: Arc<Self>) {
         get_state!().global_handle_monitor.dispatch(self.prune());
     }
 
+    /// Check if the set contains the packet
     #[must_use]
     pub async fn contains(&self, fingerprint: &PacketFingerprint) -> bool {
         lock_read!(self.fingerprints).contains(fingerprint)
     }
 
+    /// Add the given fingerprint - also functions as a `contains()` call, but holds a write lock to
+    /// the set
     pub async fn add(&self, fingerprint: PacketFingerprint) -> bool {
-        {
-            let mut fingerprints = lock_write!(self.fingerprints);
-            if !fingerprints.insert(fingerprint) {
-                return false;
-            }
+        // Insert fingerprint, return false if the fingerprint was already in
+        if !lock_write!(self.fingerprints).insert(fingerprint) {
+            return false;
         }
 
+        // Insert the fingerprint to the queue with the current time
         lock!(self.queue).push_back((Timestamp::now(), fingerprint));
 
         true
     }
 
+    /// Prune routine for the fingerprints window. Runs every `Self::PRUNE_INTERVAL` and removes any
+    /// fingerprint older than `Self::PRUNE_INTERVAL`
     pub async fn prune(self: Arc<Self>) {
+        // initialize an expired Vec with some space
         let mut expired = Vec::with_capacity(256);
+        // run while the struct isnt closing
         while !self.canceled.load(Ordering::Relaxed) {
-            let top_timestamp = {
-                let mut queue = self.queue.lock().await;
+            // scope lock
+            {
+                let mut queue = lock!(self.queue);
+                // while there is a next element and its older than `Self::PRUNE_INTERVAL`
                 while queue
                     .front()
                     .is_some_and(|(ts, _)| ts.been_longer_than(Self::PRUNE_INTERVAL))
                 {
+                    // get the element and add to expired
                     if let Some((_, fingerprint)) = queue.pop_front() {
                         expired.push(fingerprint);
                     }
                 }
-                match queue.front() {
-                    Some(top) => Timestamp::now().get() - top.0.get(),
-                    None => Self::PRUNE_INTERVAL - Self::BUFFERING_TIME,
-                }
-            };
+            }
 
+            // scope lock
             {
-                let mut fingerprints = self.fingerprints.write().await;
+                let mut fingerprints = lock_write!(self.fingerprints);
+                // remove all elements in the vec from the set
                 expired
                     .drain(..)
                     .for_each(|fingerprint| _ = fingerprints.remove(&fingerprint));
             }
 
-            tokio::time::sleep(Duration::from_millis(top_timestamp + Self::BUFFERING_TIME)).await;
+            tokio::time::sleep(Duration::from_millis(Self::PRUNE_INTERVAL)).await;
         }
     }
 }
@@ -2066,11 +1974,7 @@ impl FecPruneTask {
 /// Insert chunk indices covering `[low, high)` into `extras`. Duplicate
 /// indices are absorbed by the set.
 #[allow(clippy::cast_possible_truncation)]
-fn add_seek_hole_indices(
-    extras: &mut std::collections::BTreeSet<usize>,
-    last_sent: BytePosition,
-    to: BytePosition,
-) {
+fn add_seek_hole_indices(extras: &mut BTreeSet<usize>, last_sent: BytePosition, to: BytePosition) {
     let (lo, hi) = if to.0 > last_sent.0 {
         (last_sent.0 as usize, to.0 as usize)
     } else {

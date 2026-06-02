@@ -342,9 +342,7 @@ pub fn payload_derive_macro(item: TokenStream) -> TokenStream {
 
 #[proc_macro_derive(SendPacket)]
 pub fn send_packet_derive_macro(item: TokenStream) -> TokenStream {
-    let input = syn::parse::<DeriveInput>(item)
-        .map_err(|e| panic!("{}", e.to_string()))
-        .unwrap();
+    let input = parse_macro_input!(item as syn::DeriveInput);
 
     let ident = input.ident;
     match input.data {
@@ -427,7 +425,7 @@ pub fn flags_derive_macro(item: TokenStream) -> TokenStream {
             }
 
             #[inline]
-            fn contains(self, flag: Self::FlagType) -> bool {
+            fn contains(&self, flag: Self::FlagType) -> bool {
                 self.0 & (flag as #flag_size) != 0
             }
 
@@ -436,7 +434,7 @@ pub fn flags_derive_macro(item: TokenStream) -> TokenStream {
                 Self::FlagType::VARIANTS
                     .iter()
                     .copied()
-                    .filter(|e| (*e as #flag_size) & self.0 != 0)
+                    .filter(|e| self.contains(*e))
                     .collect()
             }
 
@@ -452,21 +450,27 @@ pub fn flags_derive_macro(item: TokenStream) -> TokenStream {
     .into()
 }
 
+/// Proc macro to generate a const array of all the variants of an enum
 #[proc_macro_attribute]
 pub fn variants_array(_attrs: TokenStream, item: TokenStream) -> TokenStream {
+    // get a copy of the item, to extend the code instead of replacing it
     let mut item_copy = item.clone();
+    // parse to an item
     let enum_item = parse_macro_input!(item as syn::Item);
+    // if the item isnt an enum, panic at compile time
     let Item::Enum(rep) = enum_item else {
         panic!("This attribute is for enums only");
     };
 
+    // get a list of all the variants in the form `Self::VariantName` as tokens
     let ident = rep.ident;
     let variants_size = rep.variants.len();
     let variants = rep.variants.into_iter().map(|e| {
         let e = e.ident;
-        quote! {#ident::#e,}
+        quote! {Self::#e,}
     });
 
+    // extend the token stream with the impl block
     item_copy.extend(TokenStream::from(quote! {
         impl #ident {
             pub const VARIANTS: [Self; #variants_size] = [#(#variants)*];

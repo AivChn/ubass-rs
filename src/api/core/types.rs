@@ -24,7 +24,10 @@ use std::{
     marker::PhantomData,
     net::SocketAddr,
     ops::Range,
-    sync::{Arc, Weak, atomic::AtomicBool},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::JoinHandle,
 };
 
@@ -53,12 +56,7 @@ pub struct ApiInner {
 
 impl Drop for ApiInner {
     fn drop(&mut self) {
-        let tx = self.api_to_manager.clone();
-        _ = std::thread::spawn(move || _ = tx.blocking_send(ApiCommand::Close)).join();
-        if let Some(handle) = self.manager_handle.take() {
-            _ = handle.join();
-        }
-        PROTOCOL_OPEN.store(false, std::sync::atomic::Ordering::Relaxed);
+        executor::block_on(self.inner_close());
     }
 }
 
@@ -82,21 +80,27 @@ impl ApiInner {
             })
         }
     }
+
+    pub(crate) async fn inner_close(&mut self) {
+        if PROTOCOL_OPEN.load(Ordering::Relaxed) {
+            let tx = self.api_to_manager.clone();
+            _ = tx.send(ApiCommand::Close);
+            if let Some(handle) = self.manager_handle.take() {
+                _ = handle.join();
+            }
+            PROTOCOL_OPEN.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 impl ApiInner {
-    pub fn close(mut self) -> Result<(), ApiErrors> {
-        let sender = self.api_to_manager.clone();
-        // blocking_send panics from within a tokio runtime — spawn a plain OS thread to avoid that
-        _ = std::thread::spawn(move || _ = sender.blocking_send(ApiCommand::Close)).join();
+    pub fn close(mut self) {
+        let tx = self.api_to_manager.clone();
+        _ = tx.send(ApiCommand::Close);
         if let Some(handle) = self.manager_handle.take() {
-            match handle.join() {
-                Ok(res) => res?,
-                Err(_) => return Err(ApiErrors::ThreadFailed("Manager")),
-            }
+            _ = handle.join();
         }
-        PROTOCOL_OPEN.store(false, std::sync::atomic::Ordering::Relaxed);
-        Ok(())
+        PROTOCOL_OPEN.store(false, Ordering::Relaxed);
     }
 
     pub async fn connect(
@@ -734,6 +738,14 @@ impl api::types::Stream for Stream<api::types::Input> {
         self.update.borrow().head == self.size || self.update.borrow().closed
     }
 
+    async fn wait_until_done(&mut self) -> Result<(), Self::Error> {
+        self.update
+            .wait_for(|message| message.closed)
+            .await
+            .map_err(|_| ConnectionError::ProtocolClosed)
+            .map(|_| ())
+    }
+
     async fn complete(mut self) -> Result<Self::Connection, Self::Error> {
         let api: Arc<ApiInner> = self.api.upgrade().ok_or(ConnectionError::ProtocolClosed)?;
         api.complete_stream(self.session, self.allow_partial).await;
@@ -777,6 +789,14 @@ impl api::types::Stream for Stream<api::types::Output> {
 
     async fn is_done(&self) -> bool {
         self.update.borrow().head == self.size
+    }
+
+    async fn wait_until_done(&mut self) -> Result<(), Self::Error> {
+        self.update
+            .wait_for(|message| message.closed)
+            .await
+            .map_err(|_| ConnectionError::ProtocolClosed)
+            .map(|_| ())
     }
 
     async fn complete(mut self) -> Result<Self::Connection, Self::Error> {
@@ -986,7 +1006,7 @@ impl<Direction: api::types::StreamDirection> PendingStream<Direction> {
 
 impl<Direction: api::types::StreamDirection> Drop for PendingStream<Direction> {
     fn drop(&mut self) {
-        todo!()
+        _ = executor::block_on(self.inner_discard());
     }
 }
 
