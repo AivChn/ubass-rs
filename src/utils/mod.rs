@@ -155,6 +155,8 @@ impl<T, E: Debug> PanicInDebug for Result<T, E> {
             panic!("{msg}: {e:?}");
         }
 
+        _ = msg;
+
         self
     }
 }
