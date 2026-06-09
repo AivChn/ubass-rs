@@ -433,18 +433,6 @@ impl api::types::IncomingConnection for IncomingConnection {
             )),
         }
     }
-
-    async fn approve_if(
-        self,
-        condition: impl FnOnce(&str) -> bool,
-    ) -> Option<core::result::Result<Self::Connection, Self::Error>> {
-        if condition(&self.app_id) {
-            Some(self.approve().await)
-        } else {
-            self.reject().await;
-            None
-        }
-    }
 }
 
 #[derive(Debug)]

@@ -60,9 +60,12 @@ impl Area {
     // urgency alone.
     #[allow(clippy::cast_precision_loss)]
     fn urgency(&self, head_chunk: usize) -> f64 {
-        if self.0.start >= head_chunk {
+        if self.0.contains(&head_chunk) {
+            return 0.;
+        }
+        if self.0.start > head_chunk {
             let distance = (self.0.start - head_chunk) as f64;
-            1.0 / (1.0 + distance / Self::URGENCY_DECAY_CHUNKS)
+            1.0 / (distance / Self::URGENCY_DECAY_CHUNKS)
         } else {
             let size = (self.0.end - self.0.start) as f64;
             (size / Self::BEFORE_HEAD_SIZE_DENOM).min(Self::BEFORE_HEAD_URGENCY_CAP)
@@ -524,10 +527,18 @@ pub trait IncomingConnection: Sized {
     fn app_id(&self) -> &str;
     async fn reject(self);
     async fn approve(self) -> core::result::Result<Self::Connection, Self::Error>;
+
     async fn approve_if(
         self,
-        f: impl FnOnce(&str) -> bool,
-    ) -> Option<core::result::Result<Self::Connection, Self::Error>>;
+        condition: impl FnOnce(&str) -> bool,
+    ) -> Option<core::result::Result<Self::Connection, Self::Error>> {
+        if condition(self.app_id()) {
+            Some(self.approve().await)
+        } else {
+            self.reject().await;
+            None
+        }
+    }
 }
 
 pub trait PendingConnection {
