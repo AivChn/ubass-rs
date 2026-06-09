@@ -1,4 +1,5 @@
 use crate::{
+    manager::{AppId, packets::*},
     prelude::*,
     utils::messages::{PacketProcessingMessage, TransportMessage},
 };
@@ -6,8 +7,38 @@ use std::{fmt::Debug, net::SocketAddr, sync::Arc};
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::{Receiver, Sender};
 
-/// Maximum UDP packet size in bytes (1452).
-pub const MAX_PACKET_SIZE: usize = 1452;
+/// Maximum UBASS packet size in bytes.
+pub const MAX_PACKET_SIZE: usize = 1500 - 60 - 8;
+
+// Check if all packets are below max size. Packets with no payload dont have an accurate
+// calculation yet, since they are guaranteed to be smaller than ones with a payload, and those are
+// accurate.
+const _SIZES_FIT: () = {
+    assert!(
+        size_of::<HelloPacket>() + size_of::<Reserved<2>>() + AppId::MAX_LENGTH <= MAX_PACKET_SIZE
+    );
+    assert!(
+        size_of::<TrackRequestPacket>() + size_of::<Reserved<2>>() + MAX_PAYLOAD_LENGTH
+            <= MAX_PACKET_SIZE
+    );
+    assert!(size_of::<DataPacket>() + MAX_PAYLOAD_LENGTH <= MAX_PACKET_SIZE);
+    assert!(size_of::<MetadataPacket>() + MAX_PAYLOAD_LENGTH <= MAX_PACKET_SIZE);
+    assert!(size_of::<ParityPacket>() + ParityPacket::LOCAL_MAX_PAYLOAD_LENGTH <= MAX_PACKET_SIZE);
+    assert!(size_of::<AckPacket>() <= MAX_PACKET_SIZE);
+    assert!(size_of::<KeepAlivePacket>() <= MAX_PACKET_SIZE);
+    assert!(size_of::<HandshakeAckPacket>() <= MAX_PACKET_SIZE);
+    assert!(
+        size_of::<RetransmitPacket>() + RetransmitPacket::LOCAL_MAX_PAYLOAD_LENGTH
+            <= MAX_PACKET_SIZE
+    );
+    assert!(size_of::<PlaybackControlPacket>() <= MAX_PACKET_SIZE);
+    assert!(size_of::<IncompatibleVersionPacket>() <= MAX_PACKET_SIZE);
+    assert!(size_of::<SessionDoesNotExistErrorPacket>() <= MAX_PACKET_SIZE);
+    assert!(size_of::<UnexpectedPacketErrorPacket>() <= MAX_PACKET_SIZE);
+    assert!(size_of::<TrackRejectionPacket>() + MAX_PAYLOAD_LENGTH <= MAX_PACKET_SIZE);
+    assert!(size_of::<CloseSessionPacket>() <= MAX_PACKET_SIZE);
+    assert!(size_of::<HandshakeRejection>() <= MAX_PACKET_SIZE);
+};
 
 pub const MAX_PACKET_BUFFER_SIZE: usize = 128;
 pub const BUFFER_TIMEOUT: u64 = 5;

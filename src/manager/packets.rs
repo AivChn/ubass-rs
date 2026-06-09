@@ -14,7 +14,8 @@ use derive_more::{Deref, DerefMut, Display};
 use crate::manager::AppId;
 use crate::packet_processor::fingerprint::{Fingerprint, Headers, Payload};
 
-pub const MAX_PAYLOAD_LENGTH: usize = 1384;
+// keep all packets below 1500 with full IP headers (1500 - 60 - 8 - biggest headers for packet with payload)
+pub const MAX_PAYLOAD_LENGTH: usize = 1368;
 
 #[derive(Debug, Clone)]
 pub struct PacketWrapper {
@@ -416,6 +417,7 @@ pub struct ParityPacket {
 }
 
 impl ParityPacket {
+    // pos + payload length
     pub const LOCAL_MAX_PAYLOAD_LENGTH: usize =
         MAX_PAYLOAD_LENGTH + size_of::<BytePosition>() + size_of::<u16>();
 
